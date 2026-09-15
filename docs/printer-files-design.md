@@ -575,7 +575,7 @@ pub fn free_bytes(dir: &Path) -> io::Result<u64>;
 
 ### 5.7 `src/threemf.rs` and `src/gcode.rs` (new)
 
-`threemf.rs` replaces the parsing in `files.rs` and keeps the phase 0 rules (section 10.1): plate choice, object ids from `slice_info`, boxes paired by unique name.
+`threemf.rs` replaces the parsing in `files.rs` and keeps the phase 0 rules (section 10.1): plate choice, object ids from `slice_info`, boxes from `pick_N.png` with name pairing as the fallback.
 
 ```rust
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -592,7 +592,7 @@ pub struct ThreeMfInfo {
     pub slicer_version: String,
     pub filaments: Vec<Filament>,   // type, color, used_g, used_m
     pub objects: Vec<(i64, String)>, // slice_info identify_id = gcode OBJECT_ID
-    pub bboxes: HashMap<i64, [f32; 4]>, // from plate_N.json, paired by unique name
+    pub bboxes: HashMap<i64, [f32; 4]>, // pick_N.png colours, else plate_N.json by name
     pub warnings: Vec<String>,      // e.g. not_support_traditional_timelapse
 }
 /// Also returns Metadata/plate_N.png for the sliced plate.
@@ -838,7 +838,7 @@ Phase 0 fixes -> TLS spike (<= 1 d) -> owner reviews numbers -> gates G3, G4 -> 
 
 ### 10.1 Phase 0: fix now, separately
 
-Status: **done** on branch `printer-files` (6 commits, 24 unit tests, synthetic zips only; no printer files as fixtures). Two adversarial reviews ran on the first three commits: a mutation check (old code put back under the new tests) and a replay of the matcher on the printers' real file lists (1245 cases) and on the real job 3mf files. Their findings became the last three commits.
+Status: **done** on branch `printer-files` (8 commits, 40 unit tests on synthetic zips; no printer files as fixtures). Adversarial reviews ran in rounds, each a mutation check (old code put back under the new tests) plus a replay on the printers' real file lists (1245 cases) and real job 3mf files. Round 1, on the first three commits, produced `dfe5597`, `25f313b` and `56bb586`; round 2, on those, produced `90ba8c0` and `eb4e6cc`.
 
 | Commit | Fix |
 |---|---|
@@ -848,10 +848,14 @@ Status: **done** on branch `printer-files` (6 commits, 24 unit tests, synthetic 
 | `dfe5597` | No `X.3mf` for an `X_plate_N` job: a job 3mf holds one plate; on real data this rule fired twice, both times wrong |
 | `25f313b` | Skip-object ids: objects keep `slice_info` `identify_id`s (the ids in the gcode's `; OBJECT_ID` and in Studio's skip dialog). `plate_N.json` ids differ in every real file (484/506, 408/410, 91/107, 82/109), so its boxes are paired with objects by unique name. Only the chosen plate's `<plate>` block is read. The plate comes from the file's single `plate_N.gcode`, else the reported plate number (`gcode_file` / job name), else a lone `slice_info` index; when the file can't tell, no picture, box or object list is shown |
 | `56bb586` | Match follow-ups: root uploads before `/cache` copies (with `gcode_file` empty the root copy was the newer one in all 5 real pairs); a `/` in a job name is `_` on the card, not a path separator; shortened names count only at exactly 100 characters (97 + `...`, like all 17 on the cards) and match on the kept prefix |
+| `90ba8c0` | Round 2 follow-ups. Boxes come from `Metadata/pick_N.png`, which fills each object with its `identify_id` as the colour (on the four real jobs within 0.5 mm of the plate json boxes, wider only where there is a brim), so identical copies get boxes too; name pairing is the fallback. Copies are labelled `part #2`. XML-escaped names are decoded. `model_settings` is a fallback only without `slice_info` and only for the chosen plate; `<plate>` blocks match by index number; `Nameplate_3` is not plate 3. File choice: folder order by the MQTT `print_type` (`cloud` looks in `/cache` first, everything else in the root); no `X.3mf` derived from `X.gcode.3mf`; an X1 ramdisk `gcode_file` is not a job name; names are also compared as Studio sanitises uploads; shortened names count by characters or bytes |
+| `eb4e6cc` | The plate map numbers boxes by their position in the skip list (they diverged as soon as one object had no box) |
 
-**Matching rules now in `pick_3mf`** (the MVP's `JobBundle` keeps them): the exact `gcode_file` basename, then its derived `<stem>.3mf`; then the same stem as the job name (extension, case and surrounding spaces ignored); then a shortened upload name whose 97 kept characters start the job name. Root uploads come before `/cache` copies; anything else is no match.
+**Matching rules now in `pick_3mf`** (the MVP's `JobBundle` keeps them): the exact `gcode_file` basename; then, by rank, the same stem as the job name (extension, case and surrounding spaces ignored), the same name after Studio's upload sanitising, and a shortened upload name (100 characters or bytes ending in `...`) whose kept part starts the job name. A job name taken from an X1 ramdisk `gcode_file` is ignored. Within a rank, `cloud` jobs prefer `/cache` and all others the root; anything else is no match.
 
-Not in phase 0: JobFetch timeouts, cancel and error display (the MVP worker replaces JobFetch), and choosing between a root upload and a `/cache` copy by date, which needs LIST dates (the MVP worker has them).
+**Skip data in `read_3mf`:** the plate is the file's single `plate_N.gcode`, else the reported plate, else a lone `slice_info` index; objects and skip ids come from that plate's `slice_info` block (or its `model_settings` instances when there is no `slice_info`); boxes come from `pick_N.png`, else by unique name from `plate_N.json`.
+
+Not in phase 0: JobFetch timeouts, cancel and error display (the MVP worker replaces JobFetch); choosing between a root upload and a `/cache` copy by date when `print_type` is missing, which needs LIST dates (the MVP worker has them); and a live check of a skip command, which has not been sent to a printer.
 
 ### 10.2 Phase 1: TLS session-resumption spike (at most 1 dev-day)
 
@@ -884,8 +888,8 @@ The MVP starts only after the owner has reviewed these numbers.
 | Gate | What | Status |
 |---|---|---|
 | G1 | Phase 0 fixes committed (branch `printer-files`, not merged yet) | done |
-| G2 | TLS spike run and numbers reviewed by the owner (section 11) | pending |
-| G3 | Full RETR of `/timelapse/video_2026-05-29_15-43-43.avi` (~86.5 MB) on the P1S through the Rust stack chosen in G2, with the planned timeouts. Log the rate every 5 s, idle-control behaviour, `226` latency and the SIZE match. P1S not printing | approved by owner, not yet run |
+| G2 | TLS spike run and numbers reviewed by the owner (section 11) | run; owner review and X.509 v1 decision pending |
+| G3 | Full RETR of `/timelapse/video_2026-05-29_15-43-43.avi` (~86.5 MB) on the P1S through the Rust stack chosen in G2, with the planned timeouts. Log the rate every 5 s, idle-control behaviour, `226` latency and the SIZE match. P1S not printing | done in the spike: 86,527,810 B in 410 s over rustls, SIZE and SHA-256 match (section 11) |
 | G4 | Studio send while the app is browsing (listing and loading thumbnails on the same printer): small test file, printer not printing; the owner cancels the print if it starts. Pass: Studio's upload succeeds; record whether the app's session survives | approved by owner, not yet run |
 | G5 | Read-only `AVBL` / `STAT` probe for free space | proposed; non-blocking |
 | - | 1-layer timelapse print on the A1 Combo, then list, download, probe and walk the file | not a gate; the owner runs it later. Until then the player relies on header sniffing with an "Open in player" fallback |
@@ -942,18 +946,35 @@ eframe 0.35 + opener + dirs + chrono + suppaftp 10.0.2 (native-tls) + image + zi
 
 ## 11. Spike results
 
-Pending: filled in after the TLS spike.
+Run on 2026-09-15 against the three printers (A1 #1 idle, A1 Combo #1 and P1S finished, re-checked before each run), release build. Baseline: the app's native-tls stack. Candidate: suppaftp 10.0.2 + rustls 0.23 (ring) with session resumption and certificate pinning. Backends alternated per printer. An adversarial verifier then re-measured the P1S independently (all medians within 6 %), attacked the pinning with a local man-in-the-middle, and inspected the handshakes on the wire.
 
-| Printer | Stack | Connect + login | LIST setup (median) | RETR small file (median) | Data handshake kind | Pin mismatch refused | Notes |
+| Printer | Stack | Connect + login | LIST | RETR thumbnail | RETR icon | 100 thumbnails (est.) | Full handshakes |
 |---|---|---|---|---|---|---|---|
-| A1 #1 | native-tls | | | | Full | n/a | |
-| A1 #1 | rustls | | | | | | |
-| A1 Combo #1 | native-tls | | | | Full | n/a | |
-| A1 Combo #1 | rustls | | | | | | |
-| P1S | native-tls | | | | Full | n/a | |
-| P1S | rustls | | | | | | |
+| P1S | native-tls | 893 ms | 803 ms | 922 ms (20-22 KB) | 809 ms | 93 s | 70 of 70 |
+| P1S | rustls | 860-895 ms | **150 ms** | **238 ms** | **158 ms** | **25 s** | 7 of 71 |
+| A1 Combo #1 | native-tls | 845 ms | 801 ms | 1192 ms (76-116 KB) | 804 ms | 120 s | 66 of 66 |
+| A1 Combo #1 | rustls | 836-861 ms | **150 ms** | **513 ms** | **137 ms** | **52 s** | 7 of 67 |
+| A1 #1 | native-tls | 857 ms | 882 ms | n/a (damaged card) | 828 ms | 84 s (100 icons) | 56 of 56 |
+| A1 #1 | rustls | 872-933 ms | **205 ms** | n/a | **162 ms** | **17 s** (100 icons) | 7 of 57 |
 
-Decision: (resumption into MVP / native-tls fallback, and why)
+Medians; n = 3 connects, 10 LISTs, 10-40 RETRs per backend; the estimate is connect + 100 x median RETR. SHA-256 of every file matched between backends.
+
+**What the spike established**
+- **Resumption works inside an FTP session:** every rustls data connection resumed (abbreviated handshake, no Certificate message, confirmed on the wire). Control connections never resume across FTP sessions, so connect + login stays at ~0.85 s: keep one session open while a grid loads.
+- **Gain:** LIST and icons 4.3-5.9x faster; thumbnails 2.3-3.9x (bigger files spend more of the time transferring). Bulk throughput is unchanged at ~206 KiB/s.
+- **Gate G3 passed:** full RETR of the 86,527,810-byte P1S timelapse over rustls in 410 s; SIZE and SHA-256 match; clean close_notify then `226`; no stalls.
+- **Cancel** mid-RETR kills the control session with rustls as well; reconnect ~0.8 s.
+- **Pinning:** a tampered pin, another printer's pin and a wrong serial were all refused with clear messages before the access code was sent. A local man-in-the-middle presenting a different certificate with the right CN was refused. A changed pin cannot be bypassed through cached sessions (the config is rebuilt without them).
+- **Trust on first use:** a man-in-the-middle present on the very first connection gets pinned. Show the stored fingerprint in the printer settings for comparison, and keep "Re-trust certificate".
+
+**X.509 v1 certificates (owner decision needed).** The printers present v1 certificates, which rustls (webpki) rejects with `UnsupportedCertVersion` before looking at the signature; without a workaround rustls cannot connect to them at all. The spike's verifier first runs rustls' standard check and, only on that exact error, verifies the same handshake signature against the certificate's public key with the provider's algorithms. It never accepts a handshake whose signature was not verified; a replayed certificate without its private key is refused.
+
+**Implementation notes for the MVP**
+- Dependencies: `suppaftp` 10.0.2 (`native-tls`, `rustls-ring`), `rustls` 0.23 (`ring`, `std`, `tls12`), `rustls-webpki` 0.103 (must stay the version rustls resolves: add a test that a v1 certificate takes the fallback path), `ring` 0.17. The app already compiles ring, rustls and aws-lc-rs through ureq and rumqttc, so nothing new has to be installed; always use `ClientConfig::builder_with_provider`, since two providers are compiled in.
+- `Resumption::in_memory_sessions(N)` needs N > 8 (N <= 8 stores nothing in rustls 0.23.45).
+- One `PrinterTls` per printer for the app's lifetime, configs only through `config_for_new_session`; one shared pin store with unique temp file names; optionally persist a new pin only after login succeeds.
+
+**Decision:** pending the owner's review. Recommended: rustls with resumption and pinning in the MVP, if the X.509 v1 signature path is approved; otherwise native-tls with pinning (section 5.3), and thumbnail grids stay 2-5x slower.
 
 ---
 
@@ -971,7 +992,7 @@ Decision: (resumption into MVP / native-tls fallback, and why)
 | Video wrongly shown as recording, or blank AVIs | name = start, thumbnail at end; blank AVIs reported by users | Size-growth check; "empty recording" when 0 frames |
 | A1 timelapse format differs from the inference | no A1 timelapse video available | Header sniff; "Open in player" fallback; owner's test print later |
 | Damaged SD (`?` / U+FFFD entries, directory loops) | A1 #1 | Flag and never address unreadable names; no recursion in the MVP; banner advising a card check |
-| Wrong 3mf thumbnail, objects or skip ids | `plate_1` hard-coded; plate json ids used as object ids | Fixed in phase 0 (`47d015f`, `25f313b`) with regression tests; skip ids not yet confirmed with a live skip command |
+| Wrong 3mf thumbnail, objects or skip ids | `plate_1` hard-coded; plate json ids used as object ids | Fixed in phase 0 (`47d015f`, `25f313b`, `90ba8c0`, `eb4e6cc`) with regression tests; skip ids not yet confirmed with a live skip command |
 | Printer interference while printing | not measured | One download at a time while printing; small prefetches only; hint in the UI |
 | Cache eviction deletes a file in use, or fills the disk | Windows sharing violations; 100+ MB files | Open-file set in `Cache`; 5 GB cap; free-space check before downloads |
 | Texture memory from A1 1536x1080 thumbnails | 6.6 MB RGBA each | Downscale to 320 px on the lane thread; LRU of 150 textures; drop on view close |
@@ -989,7 +1010,7 @@ Decision: (resumption into MVP / native-tls fallback, and why)
 1. **Serial prefix swap** in `config.rs:67-75`: `01P` and `01S` are swapped (01P = P1S, 01S = P1P; the owner's P1S reports prefix 01P). **Fixed (`8d0227b`).** Not scheduled: missing prefixes (03W X1E, 22E P2S, 26A A2L, 093 H2S, 239 H2D Pro, 31B H2C, 20P X2D; `00W` X1 exists only in community code), the X1E key in `firmware.rs:29` that can never match, and using `info.get_version` `product_name` or SSDP `DevModel` as a more reliable model source.
 2. **`files.rs` hard-codes `plate_1.png` and `plate_1.json`**: plate-N jobs show the wrong plate image and lose bounding boxes (seen on A1 #1's plate-2 job). **Fixed (`47d015f`, `25f313b`).**
 3. **`files.rs` has no connect or read timeouts, JobFetch has no cancel**, a superseded fetch keeps downloading, `JobBundle.error` is never shown and failed fetches are never retried. **Absorbed by the MVP worker** (no separate fix).
-4. **The fuzzy 3mf match in `files.rs:147-158` can pick the wrong file**: an empty stem matches every job, and a shorter unrelated stem can win. **Fixed (`820ed12`, `dfe5597`, `56bb586`).**
+4. **The fuzzy 3mf match in `files.rs:147-158` can pick the wrong file**: an empty stem matches every job, and a shorter unrelated stem can win. **Fixed (`820ed12`, `dfe5597`, `56bb586`, `90ba8c0`).**
 5. **The FTPS stack never resumes TLS sessions**: ~0.65 s extra per data command on A1/P1, and a likely `522` on vsftpd printers. Addressed by the spike (10.2).
 6. **suppaftp quirks:** `pwd()` fails on `257 /`; `File::from_str` never fails (garbage lines become entries); a failing data command costs a full TLS handshake; LIST lines are decoded lossily (invalid UTF-8 becomes U+FFFD).
 7. **`camera.rs:2` doc says "64-byte auth packet"** while the code sends 80 bytes; `A1_LAN_MAP.md` repeats the error.
@@ -1000,7 +1021,7 @@ Decision: (resumption into MVP / native-tls fallback, and why)
 12. **Newer firmware reports SD state in `print.aux` bits 12-13**, which override `home_flag` bits 8-9; Studio also allows timelapse without an SD card when a timelapse kit is present (`aux` bit 26).
 13. **Studio's P1S printer profile lists only a remote (cloud) route for SD files**, consistent with the absence of a LAN port-6000 file browser on A1/P1.
 14. **X1 firmware 01.11.x** reportedly keeps caching print files to the SD card even with "Cache remote print files to external storage" off, so X1 `/cache` fills regardless.
-15. **Skip-object ids were wrong before phase 0**: `files.rs` replaced `slice_info` `identify_id`s with `plate_N.json` ids whenever that json was present (a code comment claimed they were the printer's ids). They differ in all four real job files, so the skip dialog sent ids the printer does not label objects with. **Fixed (`25f313b`).** Not confirmed live: no skip command was sent during the investigation.
+15. **Skip-object ids were wrong before phase 0**: `files.rs` replaced `slice_info` `identify_id`s with `plate_N.json` ids whenever that json was present (a code comment claimed they were the printer's ids). They differ in all four real job files, so the skip dialog sent ids the printer does not label objects with. **Fixed (`25f313b`; boxes for identical copies in `90ba8c0`).** Not confirmed live: no skip command was sent during the investigation.
 16. **`gcode_file` is empty once a print ends** on all three printers (`subtask_name` is kept); its value during a print was not observed. The matcher does not depend on it.
 
 ---
