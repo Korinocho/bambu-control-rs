@@ -32,11 +32,7 @@ pub fn config_path() -> PathBuf {
 
 /// Candidate locations of the legacy Python config.json.
 fn legacy_paths() -> Vec<PathBuf> {
-    vec![
-        exe_dir().join("config.json"),
-        // sibling checkout of the Python app (dev convenience)
-        exe_dir().join("../../../bambu-handy-clone/config.json"),
-    ]
+    vec![exe_dir().join("config.json")]
 }
 
 pub fn load() -> Config {

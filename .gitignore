@@ -1,1 +1,57 @@
-/target
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock is tracked on purpose: this is a binary crate.
+
+# Local config written next to the executable.
+# Holds printer IP, serial and LAN access code in plain text — never commit it.
+/config.toml
+/config.json
+*.local.toml
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Agent / tooling state
+/.claude/
+CLAUDE.local.md
+
+# Release packaging
+/dist/
+/release/
+*.zip
+*.exe
+*.msi
+
+# Logs, dumps, profiling
+*.log
+*.dmp
+perf.data*
+flamegraph.svg
+*.profraw
+*.profdata
+
+# Test prints
+*.3mf
+*.gcode
+
+# IDEs
+.vscode/
+.idea/
+*.iml
+.vs/
+.fleet/
+.zed/
+*.swp
+*~
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
