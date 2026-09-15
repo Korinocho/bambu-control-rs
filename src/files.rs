@@ -125,39 +125,7 @@ fn fetch_inner(ip: &str, access_code: &str, job_name: &str,
         }
     }
 
-    let job_lower = job_name.to_lowercase();
-    let mut exact: HashSet<String> = HashSet::new();
-    if !file_name.is_empty() {
-        let fname = file_name.rsplit('/').next().unwrap_or("").to_lowercase();
-        if let Some(stem) = fname.strip_suffix(".gcode.3mf") {
-            exact.insert(format!("{stem}.3mf"));
-        }
-        exact.insert(fname);
-    }
-    exact.insert(format!("{job_lower}.3mf"));
-
-    let basename =
-        |p: &str| p.rsplit('/').next().unwrap_or("").to_lowercase();
-    let mut target = candidates.iter()
-        .find(|p| exact.contains(&basename(p)))
-        .cloned();
-    if target.is_none() {
-        // fuzzy fallback — prefer the longest (most specific) stem
-        let mut best: Option<(usize, String)> = None;
-        for path in &candidates {
-            let stem = basename(path);
-            let stem = stem.strip_suffix(".3mf").unwrap_or(&stem).to_string();
-            if stem == job_lower || job_lower.contains(&stem)
-                || stem.contains(&job_lower)
-            {
-                if best.as_ref().is_none_or(|(len, _)| stem.len() > *len) {
-                    best = Some((stem.len(), path.clone()));
-                }
-            }
-        }
-        target = best.map(|(_, p)| p);
-    }
-    let Some(target) = target else {
+    let Some(target) = pick_3mf(&candidates, job_name, file_name) else {
         bundle.error = format!("no 3mf matching '{job_name}' on SD");
         return Ok(bundle);
     };
@@ -183,6 +151,92 @@ fn fetch_inner(ip: &str, access_code: &str, job_name: &str,
     let _ = ftp.quit();
 
     read_3mf(data)
+}
+
+/// Shortest name left by the slicer's "...." truncation that is still
+/// trusted to identify a job.
+const MIN_TRUNCATED_PREFIX: usize = 8;
+
+fn file_basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or("").to_lowercase()
+}
+
+/// Lowercase name without .gcode.3mf / .3mf / .gcode.
+fn name_stem(name: &str) -> String {
+    let lower = name.trim().to_lowercase();
+    for ext in [".gcode.3mf", ".3mf", ".gcode"] {
+        if let Some(stem) = lower.strip_suffix(ext) {
+            return stem.trim_end().to_string();
+        }
+    }
+    lower
+}
+
+/// "long project na...." -> "long project na"
+fn truncated_prefix(stem: &str) -> Option<&str> {
+    let cut = stem.strip_suffix("...").or_else(|| stem.strip_suffix('…'))?;
+    Some(cut.trim_end_matches('.').trim_end())
+}
+
+/// Picks the job's 3mf among `candidates` (full paths, /cache first).
+/// Exact names go first, most trusted first: the gcode_file the printer
+/// reports, the .3mf derived from it, then the job name. The fallback only
+/// accepts the same stem (also for a `<job>_plate_N` job name) or a name
+/// the slicer truncated with "...". A wrong file would show another print
+/// and send skip commands for the wrong objects, so a loose match is no
+/// match.
+fn pick_3mf(candidates: &[String], job_name: &str,
+            file_name: &str) -> Option<String> {
+    let fname = file_basename(file_name);
+    let job = file_basename(job_name);
+    let mut exact: Vec<String> = Vec::new();
+    if !fname.is_empty() {
+        exact.push(fname.clone());
+        if let Some(stem) = fname.strip_suffix(".gcode.3mf")
+            && !stem.is_empty()
+        {
+            exact.push(format!("{stem}.3mf"));
+        }
+    }
+    if !job.is_empty() {
+        exact.push(format!("{job}.3mf"));
+    }
+    for name in &exact {
+        if let Some(path) =
+            candidates.iter().find(|p| file_basename(p) == *name)
+        {
+            return Some(path.clone());
+        }
+    }
+
+    let job = name_stem(&job);
+    if job.is_empty() {
+        return None;
+    }
+    let job_base = Regex::new(r"^(.+)_plate_\d+$").unwrap()
+        .captures(&job)
+        .map(|c| c.get(1).unwrap().as_str().to_string());
+    // (rank, matched length, path): rank 0 = same stem, 1 = truncated name;
+    // within a rank the longer match is the more specific one
+    let mut hits: Vec<(u8, usize, &String)> = Vec::new();
+    for path in candidates {
+        let stem = name_stem(&file_basename(path));
+        if stem.is_empty() {
+            continue;
+        }
+        if stem == job || job_base.as_deref() == Some(stem.as_str()) {
+            hits.push((0, stem.len(), path));
+        } else if let Some(prefix) = truncated_prefix(&stem)
+            && prefix.chars().count() >= MIN_TRUNCATED_PREFIX
+            && (job.starts_with(prefix)
+                || job_base.as_deref().is_some_and(|b| b.starts_with(prefix)))
+        {
+            hits.push((1, prefix.len(), path));
+        }
+    }
+    // stable sort: equal matches keep candidate order (/cache first)
+    hits.sort_by_key(|(rank, len, _)| (*rank, std::cmp::Reverse(*len)));
+    hits.first().map(|(_, _, path)| (*path).clone())
 }
 
 /// Plate the job was sliced for. A job 3mf only carries the printed
@@ -432,5 +486,89 @@ mod tests {
         assert_eq!(sliced_plate(&names(&["Metadata/plate_4.gcode.md5"]),
                                 Some(&info)), 3);
         assert_eq!(sliced_plate(&names(&[]), None), 1);
+    }
+
+    fn pick(candidates: &[&str], job: &str, file: &str) -> Option<String> {
+        let candidates: Vec<String> =
+            candidates.iter().map(|s| s.to_string()).collect();
+        super::pick_3mf(&candidates, job, file)
+    }
+
+    #[test]
+    fn printer_reported_file_beats_same_named_cache_copy() {
+        let found = pick(&["/cache/part.3mf", "/part.gcode.3mf"],
+                         "part", "part.gcode.3mf");
+        assert_eq!(found.as_deref(), Some("/part.gcode.3mf"));
+    }
+
+    #[test]
+    fn gcode_3mf_name_finds_cache_3mf() {
+        let found = pick(&["/cache/part.3mf"], "", "part.gcode.3mf");
+        assert_eq!(found.as_deref(), Some("/cache/part.3mf"));
+    }
+
+    #[test]
+    fn job_name_matches_regardless_of_extension_and_case() {
+        let found = pick(&["/First Layer Square.stl.gcode.3mf"],
+                         "first layer square.stl", "");
+        assert_eq!(found.as_deref(),
+                   Some("/First Layer Square.stl.gcode.3mf"));
+    }
+
+    #[test]
+    fn plate_suffixed_job_matches_its_project() {
+        let found = pick(&["/cache/hole_cap.3mf"], "hole_cap_plate_3", "");
+        assert_eq!(found.as_deref(), Some("/cache/hole_cap.3mf"));
+    }
+
+    #[test]
+    fn empty_stem_matches_nothing() {
+        // the old fallback matched a file named ".3mf" to every job
+        assert_eq!(pick(&["/cache/.3mf"], "anything", ""), None);
+    }
+
+    #[test]
+    fn substrings_are_not_matches() {
+        let cache = ["/cache/cap.3mf", "/cache/cube.3mf",
+                     "/cache/bracket_v2_final.3mf"];
+        assert_eq!(pick(&cache, "escape_key_cap_v2", ""), None);
+        assert_eq!(pick(&cache, "big cube", ""), None);
+        assert_eq!(pick(&cache, "bracket", ""), None);
+    }
+
+    #[test]
+    fn truncated_file_name_matches_full_job_name() {
+        let found = pick(&["/Fidget+Cube+toy+.stl + ....gcode.3mf"],
+                         "Fidget+Cube+toy+.stl + lid.stl", "");
+        assert_eq!(found.as_deref(),
+                   Some("/Fidget+Cube+toy+.stl + ....gcode.3mf"));
+        // too little left after truncation to trust
+        assert_eq!(pick(&["/ab....gcode.3mf"], "abcdef", ""), None);
+    }
+
+    #[test]
+    fn most_specific_match_wins() {
+        // same stem beats a truncated name
+        let found = pick(&["/cache/bracket left si....3mf",
+                           "/bracket left side.gcode.3mf"],
+                         "bracket left side", "");
+        assert_eq!(found.as_deref(), Some("/bracket left side.gcode.3mf"));
+        // longer truncated prefix beats a shorter one; unrelated prefix
+        // never matches
+        let found = pick(&["/cache/bracket le....3mf",
+                           "/cache/bracket righ....3mf",
+                           "/cache/bracket left si....3mf"],
+                         "bracket left side", "");
+        assert_eq!(found.as_deref(), Some("/cache/bracket left si....3mf"));
+        // same name in both folders: candidate order (/cache first)
+        let found = pick(&["/cache/bracket part....3mf",
+                           "/bracket part....gcode.3mf"],
+                         "bracket part two", "");
+        assert_eq!(found.as_deref(), Some("/cache/bracket part....3mf"));
+    }
+
+    #[test]
+    fn no_candidates_no_match() {
+        assert_eq!(pick(&[], "part", "part.gcode.3mf"), None);
     }
 }
