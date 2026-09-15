@@ -79,3 +79,6 @@ licensed as above, without any additional terms or conditions.
 
 Binary releases link many third-party Rust crates and embed fonts; their license texts
 are included in the release archive.
+
+`vendor/suppaftp` is a copy of the suppaftp crate (MIT OR Apache-2.0, license files
+included) with one small patch, described in `vendor/suppaftp/PATCHES.md`.
