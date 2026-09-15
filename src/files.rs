@@ -153,9 +153,8 @@ fn fetch_inner(ip: &str, access_code: &str, job_name: &str,
     read_3mf(data, job_plate(job_name, file_name))
 }
 
-/// Shortest name left by the slicer's "...." truncation that is still
-/// trusted to identify a job.
-const MIN_TRUNCATED_PREFIX: usize = 8;
+/// Studio shortens long upload names to 97 characters + "...".
+const TRUNCATED_STEM_CHARS: usize = 100;
 
 fn file_basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or("").to_lowercase()
@@ -172,23 +171,25 @@ fn name_stem(name: &str) -> String {
     lower
 }
 
-/// "long project na...." -> "long project na"
-fn truncated_prefix(stem: &str) -> Option<&str> {
-    let cut = stem.strip_suffix("...").or_else(|| stem.strip_suffix('…'))?;
-    Some(cut.trim_end_matches('.').trim_end())
+/// The part Studio kept of a shortened name.
+fn truncated_prefix(stem: &str) -> Option<String> {
+    (stem.chars().count() == TRUNCATED_STEM_CHARS && stem.ends_with("..."))
+        .then(|| stem.chars().take(TRUNCATED_STEM_CHARS - 3).collect())
 }
 
-/// Picks the job's 3mf among `candidates` (full paths, /cache first).
-/// Exact names go first, most trusted first: the gcode_file the printer
-/// reports, the .3mf derived from it, then the job name. The fallback only
-/// accepts the same stem or a name the slicer truncated with "...". A job
-/// 3mf holds a single plate, so `X.3mf` is never taken for an `X_plate_2`
-/// job: that is another upload. A wrong file would show another print and
-/// send skip commands for the wrong objects, so a loose match is no match.
+/// Picks the job's 3mf: the file gcode_file names, else the one with the
+/// job's name or Studio's shortened form of it. A wrong file means skip
+/// commands for the wrong objects, so a loose match is no match.
 fn pick_3mf(candidates: &[String], job_name: &str,
             file_name: &str) -> Option<String> {
+    // root uploads first: where both exist the /cache copy was the older
+    let in_cache = |p: &&String| p.to_lowercase().starts_with("/cache/");
+    let ordered: Vec<&String> = candidates.iter()
+        .filter(|p| !in_cache(p))
+        .chain(candidates.iter().filter(in_cache))
+        .collect();
+
     let fname = file_basename(file_name);
-    let job = file_basename(job_name);
     let mut exact: Vec<String> = Vec::new();
     if !fname.is_empty() {
         exact.push(fname.clone());
@@ -198,25 +199,25 @@ fn pick_3mf(candidates: &[String], job_name: &str,
             exact.push(format!("{stem}.3mf"));
         }
     }
-    if !job.is_empty() {
-        exact.push(format!("{job}.3mf"));
-    }
     for name in &exact {
-        if let Some(path) =
-            candidates.iter().find(|p| file_basename(p) == *name)
+        if let Some(path) = ordered.iter().find(|p| file_basename(p) == *name)
         {
-            return Some(path.clone());
+            return Some((*path).clone());
         }
     }
 
-    let job = name_stem(&job);
+    // a job name is a project name, not a path: the SD copy has '/' as '_'
+    let job = if job_name == file_name {
+        name_stem(&file_basename(job_name))
+    } else {
+        name_stem(&job_name.replace(['/', '\\'], "_"))
+    };
     if job.is_empty() {
         return None;
     }
-    // (rank, matched length, path): rank 0 = same stem, 1 = truncated name;
-    // within a rank the longer match is the more specific one
+    // (rank, matched length, path): rank 0 = same stem, 1 = shortened name
     let mut hits: Vec<(u8, usize, &String)> = Vec::new();
-    for path in candidates {
+    for path in ordered {
         let stem = name_stem(&file_basename(path));
         if stem.is_empty() {
             continue;
@@ -224,13 +225,11 @@ fn pick_3mf(candidates: &[String], job_name: &str,
         if stem == job {
             hits.push((0, stem.len(), path));
         } else if let Some(prefix) = truncated_prefix(&stem)
-            && prefix.chars().count() >= MIN_TRUNCATED_PREFIX
-            && job.starts_with(prefix)
+            && job.starts_with(&prefix)
         {
             hits.push((1, prefix.len(), path));
         }
     }
-    // stable sort: equal matches keep candidate order (/cache first)
     hits.sort_by_key(|(rank, len, _)| (*rank, std::cmp::Reverse(*len)));
     hits.first().map(|(_, _, path)| (*path).clone())
 }
@@ -474,6 +473,18 @@ mod tests {
         format!(r#"{{"bbox_objects":[{}]}}"#, items.join(","))
     }
 
+    fn pick(candidates: &[&str], job: &str, file: &str) -> Option<String> {
+        let candidates: Vec<String> =
+            candidates.iter().map(|s| s.to_string()).collect();
+        super::pick_3mf(&candidates, job, file)
+    }
+
+    /// Studio's shortened upload name: the first 97 characters + "...".
+    fn shortened(name: &str) -> String {
+        let kept: String = name.chars().take(97).collect();
+        format!("{kept}...")
+    }
+
     #[test]
     fn plate_n_job_uses_its_own_thumbnail() {
         // Studio keeps every plate's pictures but only the sliced plate's
@@ -629,12 +640,6 @@ mod tests {
         assert_eq!(job_plate("X", "X.gcode.3mf"), None);
     }
 
-    fn pick(candidates: &[&str], job: &str, file: &str) -> Option<String> {
-        let candidates: Vec<String> =
-            candidates.iter().map(|s| s.to_string()).collect();
-        super::pick_3mf(&candidates, job, file)
-    }
-
     #[test]
     fn printer_reported_file_beats_same_named_cache_copy() {
         let found = pick(&["/cache/part.3mf", "/part.gcode.3mf"],
@@ -643,17 +648,45 @@ mod tests {
     }
 
     #[test]
+    fn root_upload_beats_cache_copy_without_gcode_file() {
+        // gcode_file is empty once a print ends; on the owner's cards the
+        // root upload was the newer copy in every such pair
+        let found = pick(&["/cache/(Unsaved).3mf", "/(Unsaved).gcode.3mf"],
+                         "(Unsaved)", "");
+        assert_eq!(found.as_deref(), Some("/(Unsaved).gcode.3mf"));
+        let found = pick(&["/cache/part.3mf", "/part.3mf"], "x", "part.3mf");
+        assert_eq!(found.as_deref(), Some("/part.3mf"));
+    }
+
+    #[test]
     fn gcode_3mf_name_finds_cache_3mf() {
         let found = pick(&["/cache/part.3mf"], "", "part.gcode.3mf");
+        assert_eq!(found.as_deref(), Some("/cache/part.3mf"));
+        // an empty stem in gcode_file names nothing
+        assert_eq!(pick(&["/cache/.3mf"], "", ".gcode.3mf"), None);
+    }
+
+    #[test]
+    fn job_name_matches_regardless_of_extension_case_and_spaces() {
+        let found = pick(&["/First Layer Square.stl.gcode.3mf"],
+                         "first layer square.stl ", "");
+        assert_eq!(found.as_deref(),
+                   Some("/First Layer Square.stl.gcode.3mf"));
+        // job taken from a gcode_file path
+        let found = pick(&["/cache/part.3mf"], "/sdcard/part.gcode",
+                         "/sdcard/part.gcode");
         assert_eq!(found.as_deref(), Some("/cache/part.3mf"));
     }
 
     #[test]
-    fn job_name_matches_regardless_of_extension_and_case() {
-        let found = pick(&["/First Layer Square.stl.gcode.3mf"],
-                         "first layer square.stl", "");
+    fn slash_in_job_name_is_not_a_path() {
+        // Studio stores "/" in upload names as "_"
+        let cache = ["/cache/18.7mm Hole (for 1_2 inch EMT).3mf",
+                     "/cache/Base.3mf"];
+        let found = pick(&cache, "18.7mm Hole (for 1/2 inch EMT)", "");
         assert_eq!(found.as_deref(),
-                   Some("/First Layer Square.stl.gcode.3mf"));
+                   Some("/cache/18.7mm Hole (for 1_2 inch EMT).3mf"));
+        assert_eq!(pick(&cache, "Tool holder/Base", ""), None);
     }
 
     #[test]
@@ -685,34 +718,30 @@ mod tests {
     }
 
     #[test]
-    fn truncated_file_name_matches_full_job_name() {
-        let found = pick(&["/Fidget+Cube+toy+.stl + ....gcode.3mf"],
-                         "Fidget+Cube+toy+.stl + lid.stl", "");
-        assert_eq!(found.as_deref(),
-                   Some("/Fidget+Cube+toy+.stl + ....gcode.3mf"));
-        // too little left after truncation to trust
-        assert_eq!(pick(&["/ab....gcode.3mf"], "abcdef", ""), None);
+    fn shortened_upload_name_matches_full_job_name() {
+        let job = "Fidget+Cube+toy+.stl + Fidget+Cube+toy+.stl 1 + \
+                   Fidget+Cube+toy+.stl 2 + Fidget+Cube+toy+.stl 3 + \
+                   Fidget+Cube+toy+.stl 4";
+        let file = format!("/{}.gcode.3mf", shortened(job));
+        assert_eq!(pick(&[file.as_str()], job, "").as_deref(),
+                   Some(file.as_str()));
+        // the kept part has to start the job, not appear inside it
+        assert_eq!(pick(&[file.as_str()], &format!("x {job}"), ""), None);
+        // a short name that merely ends in "..." is not a shortened one
+        assert_eq!(pick(&["/cache/Wait for it....3mf"], "wait for it v2",
+                        ""), None);
     }
 
     #[test]
-    fn most_specific_match_wins() {
-        // same stem beats a truncated name
-        let found = pick(&["/cache/bracket left si....3mf",
-                           "/bracket left side.gcode.3mf"],
-                         "bracket left side", "");
-        assert_eq!(found.as_deref(), Some("/bracket left side.gcode.3mf"));
-        // longer truncated prefix beats a shorter one; unrelated prefix
-        // never matches
-        let found = pick(&["/cache/bracket le....3mf",
-                           "/cache/bracket righ....3mf",
-                           "/cache/bracket left si....3mf"],
-                         "bracket left side", "");
-        assert_eq!(found.as_deref(), Some("/cache/bracket left si....3mf"));
-        // same name in both folders: candidate order (/cache first)
-        let found = pick(&["/cache/bracket part....3mf",
-                           "/bracket part....gcode.3mf"],
-                         "bracket part two", "");
-        assert_eq!(found.as_deref(), Some("/cache/bracket part....3mf"));
+    fn same_stem_beats_a_shortened_name_of_equal_length() {
+        // a 97-character job equals the kept part of a longer job's
+        // shortened name; its own file wins even from /cache
+        let job = "a".repeat(90) + " part 1";
+        let other = format!("/{}.gcode.3mf",
+                            shortened(&format!("{job} + more")));
+        let own = format!("/cache/{job}.3mf");
+        let found = pick(&[own.as_str(), other.as_str()], &job, "");
+        assert_eq!(found.as_deref(), Some(own.as_str()));
     }
 
     #[test]
