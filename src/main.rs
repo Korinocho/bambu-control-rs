@@ -133,6 +133,7 @@ impl PrinterUi {
             self.job_fetch = Some(files::JobFetch::spawn(
                 self.cfg.ip.clone(), self.cfg.access_code.clone(), job,
                 panel::s_str(&state, "gcode_file").to_string(),
+                panel::s_str(&state, "print_type").to_string(),
                 ctx.clone()));
         }
     }
