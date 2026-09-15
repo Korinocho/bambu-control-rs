@@ -838,7 +838,7 @@ Phase 0 fixes -> TLS spike (<= 1 d) -> owner reviews numbers -> gates G3, G4 -> 
 
 ### 10.1 Phase 0: fix now, separately
 
-Status: **done** on branch `printer-files` (8 commits, 40 unit tests on synthetic zips; no printer files as fixtures). Adversarial reviews ran in rounds, each a mutation check (old code put back under the new tests) plus a replay on the printers' real file lists (1245 cases) and real job 3mf files. Round 1, on the first three commits, produced `dfe5597`, `25f313b` and `56bb586`; round 2, on those, produced `90ba8c0` and `eb4e6cc`.
+Status: **done** on branch `printer-files` (10 code commits, 45 unit tests on synthetic zips; no printer files as fixtures). Adversarial reviews ran in three rounds, each a mutation check (old code put back under the new tests) plus a replay on the printers' real file lists (1245 cases; 4534 runs in round 3) and real job 3mf files. Round 1 produced `dfe5597`, `25f313b` and `56bb586`; round 2 produced `90ba8c0` and `eb4e6cc`; round 3 found no blocker or major issue and produced `cea8a39` and `1abcb4c`.
 
 | Commit | Fix |
 |---|---|
@@ -850,12 +850,22 @@ Status: **done** on branch `printer-files` (8 commits, 40 unit tests on syntheti
 | `56bb586` | Match follow-ups: root uploads before `/cache` copies (with `gcode_file` empty the root copy was the newer one in all 5 real pairs); a `/` in a job name is `_` on the card, not a path separator; shortened names count only at exactly 100 characters (97 + `...`, like all 17 on the cards) and match on the kept prefix |
 | `90ba8c0` | Round 2 follow-ups. Boxes come from `Metadata/pick_N.png`, which fills each object with its `identify_id` as the colour (on the four real jobs within 0.5 mm of the plate json boxes, wider only where there is a brim), so identical copies get boxes too; name pairing is the fallback. Copies are labelled `part #2`. XML-escaped names are decoded. `model_settings` is a fallback only without `slice_info` and only for the chosen plate; `<plate>` blocks match by index number; `Nameplate_3` is not plate 3. File choice: folder order by the MQTT `print_type` (`cloud` looks in `/cache` first, everything else in the root); no `X.3mf` derived from `X.gcode.3mf`; an X1 ramdisk `gcode_file` is not a job name; names are also compared as Studio sanitises uploads; shortened names count by characters or bytes |
 | `eb4e6cc` | The plate map numbers boxes by their position in the skip list (they diverged as soon as one object had no box) |
+| `cea8a39` | The plate map draws bigger boxes first, so an object inside another object's box (a peg in a ring) stays visible and clickable |
+| `1abcb4c` | Round 3 follow-ups: the lower-rank name match works one way only, as Studio does (the card form with illegal characters as `_` and spaces kept, or a MakerWorld title form without spaces); shortened names also match the card form of a long title; copy labels never repeat; numeric XML references must be plain digits |
 
-**Matching rules now in `pick_3mf`** (the MVP's `JobBundle` keeps them): the exact `gcode_file` basename; then, by rank, the same stem as the job name (extension, case and surrounding spaces ignored), the same name after Studio's upload sanitising, and a shortened upload name (100 characters or bytes ending in `...`) whose kept part starts the job name. A job name taken from an X1 ramdisk `gcode_file` is ignored. Within a rank, `cloud` jobs prefer `/cache` and all others the root; anything else is no match.
+**Matching rules now in `pick_3mf`** (the MVP's `JobBundle` keeps them): the exact `gcode_file` basename; then, by rank, the same stem as the job name (extension, case and surrounding spaces ignored), the job as the card stores it (`<>:/\|?*"` as `_`, spaces kept) or as a MakerWorld title (no spaces, no `__`), and a shortened upload name (100 characters or bytes ending in `...`) whose kept part starts the job name or its card form. A job name taken from an X1 ramdisk `gcode_file` is ignored. Within a rank, `cloud` jobs prefer `/cache` and all others the root; anything else is no match.
 
 **Skip data in `read_3mf`:** the plate is the file's single `plate_N.gcode`, else the reported plate, else a lone `slice_info` index; objects and skip ids come from that plate's `slice_info` block (or its `model_settings` instances when there is no `slice_info`); boxes come from `pick_N.png`, else by unique name from `plate_N.json`.
 
 Not in phase 0: JobFetch timeouts, cancel and error display (the MVP worker replaces JobFetch); choosing between a root upload and a `/cache` copy by date when `print_type` is missing, which needs LIST dates (the MVP worker has them); and a live check of a skip command, which has not been sent to a printer.
+
+**Deferred to the MVP's `threemf.rs` (found in round 3, all minor):**
+- Boxes in millimetres on every bed: read `printable_area` from `Metadata/project_settings.config`, convert pick pixels with Studio's Top_Plate framing (the whole printable area fitted into 512 px) and give `plate_map` the real bed size. Today pick boxes are 256 units: exact on 256 mm beds, up to about 13 mm off in y on an H2D; plate json boxes on an A1 mini are drawn on a 256 mm map.
+- Once both sources are in millimetres, fill objects missing from the pick image (hidden under another object in top view) from the plate json by unique name.
+- Hit-test the map through the pick image (an id raster) instead of boxes.
+- Ignore isolated seam pixels in the pick image (Studio renders picking without anti-aliasing, and the real images have none).
+- Decode limits (dimensions and allocation) for PNG entries read from the card.
+- Studio's other MakerWorld cut (under 100 bytes, no `...`), and a unit test for the `print_type` hand-off from `main.rs`.
 
 ### 10.2 Phase 1: TLS session-resumption spike (at most 1 dev-day)
 
