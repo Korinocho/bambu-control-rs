@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # CI enforces the TLS rules, so its actions are pinned by commit and
+      # updated on purpose
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # the toolchain is pinned too: another clippy can resolve the
+      # clippy.toml paths differently
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.97.1
+          components: clippy
+
+      - name: Tests
+        run: cargo test --locked
+
+      # T10 holds for release builds too, where a panic aborts the app. The
+      # filter stays quoted: YAML reads a plain value ending in ':' as a key,
+      # and then GitHub rejects the whole file (workflow-lint.yml checks it).
+      - name: TLS tests (release)
+        run: cargo test --locked --release "tls::"
+
+      # clippy.toml lists the provider-less rustls builders, the
+      # process-wide provider calls and the rustls signature helpers
+      # (design doc 5.3)
+      - name: Clippy provider guard
+        run: cargo clippy --locked --all-targets -- -D clippy::disallowed_methods
+
+      # complements clippy (it misses aliases); tests/ is not scanned, so the
+      # same pattern can live in tests/source_rules.rs. git grep exits 1 for
+      # no match; any other non-zero exit is an error, never a pass.
+      - name: Provider rule grep
+        run: |
+          set +e
+          git grep -nE "install_default|get_default\(|ClientConfig::builder\(\)|ServerConfig::builder\(\)|builder_with_protocol_versions\(" -- src vendor/suppaftp/src
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::process-wide crypto provider or provider-less builder in src or vendor/suppaftp (design doc 5.3)"
+            exit 1
+          elif [ "$rc" -ne 1 ]; then
+            echo "::error::git grep failed (exit $rc)"
+            exit 1
+          fi
+
+      # FTPS must verify certificates; MQTT and the camera keep the flags
+      # until issues #1 and #2, then this grep covers all of src
+      - name: No danger flags in FTPS code
+        run: |
+          set +e
+          git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src/tls.rs src/tls src/ftp.rs src/browser.rs src/files.rs vendor/suppaftp/src
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::certificate checks disabled in FTPS code (design doc 5.3)"
+            exit 1
+          elif [ "$rc" -ne 1 ]; then
+            echo "::error::git grep failed (exit $rc)"
+            exit 1
+          fi
+
+      # Cargo.lock keeps no checksum for the [patch.crates-io] path
+      # dependency: compare vendor/suppaftp with the published crate
+      # (vendor/suppaftp/PATCHES.md)
+      - name: Vendored suppaftp
+        run: bash .github/scripts/check-vendored-suppaftp.sh
+
+      # one rustls, one rustls-webpki, one ring, no aws-lc (T24)
+      - name: Dependency tree
+        run: |
+          dups="$(cargo tree --locked -d --depth 0 --prefix none --format '{p}')"
+          echo "$dups"
+          if echo "$dups" | grep -E '^(rustls|rustls-webpki|ring|aws-lc-rs|aws-lc-sys) v'; then
+            echo "::error::duplicate TLS or crypto crate in the dependency tree"
+            exit 1
+          fi
+          # absent only when cargo fails AND says the package is unknown;
+          # any other failure (lock out of date, registry error) fails
+          for crate in aws-lc-rs aws-lc-sys; do
+            set +e
+            out="$(cargo tree --locked -i "$crate" 2>&1)"
+            rc=$?
+            set -e
+            echo "$out"
+            if [ "$rc" -eq 0 ] || ! printf '%s\n' "$out" | grep -q "did not match any packages"; then
+              echo "::error::$crate is in the dependency tree, or cargo tree failed (exit $rc)"
+              exit 1
+            fi
+          done
