@@ -150,7 +150,7 @@ fn fetch_inner(ip: &str, access_code: &str, job_name: &str,
     progress(100);
     let _ = ftp.quit();
 
-    read_3mf(data)
+    read_3mf(data, job_plate(job_name, file_name))
 }
 
 /// Shortest name left by the slicer's "...." truncation that is still
@@ -235,29 +235,112 @@ fn pick_3mf(candidates: &[String], job_name: &str,
     hits.first().map(|(_, _, path)| (*path).clone())
 }
 
-/// Plate the job was sliced for. A job 3mf only carries the printed
-/// plate's gcode, so that entry wins; slice_info's index is the fallback.
-fn sliced_plate(names: &[String], slice_info: Option<&str>) -> u32 {
+/// Plate number in the reported gcode_file ("/data/Metadata/plate_3.gcode")
+/// or job name ("X_plate_3").
+fn job_plate(job_name: &str, file_name: &str) -> Option<u32> {
+    let re = Regex::new(r"plate_(\d+)(?:\.gcode)?$").unwrap();
+    [file_name, job_name].iter().find_map(|name| {
+        re.captures(&name.trim().to_lowercase())
+            .and_then(|c| c.get(1).unwrap().as_str().parse().ok())
+    })
+}
+
+/// Plate the job was sliced for, None when the file can't tell. A job 3mf
+/// carries only the printed plate's gcode; slice_info has one `<plate>`
+/// block per sliced plate; the reported plate number breaks ties.
+fn sliced_plate(names: &[String], slice_info: Option<&str>,
+                reported: Option<u32>) -> Option<u32> {
     let re_gcode = Regex::new(r"^Metadata/plate_(\d+)\.gcode$").unwrap();
     let mut plates: Vec<u32> = names.iter()
         .filter_map(|n| re_gcode.captures(n))
         .filter_map(|c| c.get(1).unwrap().as_str().parse().ok())
         .collect();
     plates.sort_unstable();
-    let index = slice_info.and_then(|xml| {
-        Regex::new(r#"<metadata key="index" value="(\d+)""#).unwrap()
-            .captures(xml)
-            .and_then(|c| c.get(1).unwrap().as_str().parse::<u32>().ok())
-    });
-    match (plates.first(), index) {
-        (Some(_), Some(i)) if plates.contains(&i) => i,
-        (Some(&first), _) => first,
-        (None, Some(i)) => i,
-        (None, None) => 1,
+    plates.dedup();
+    let re_index =
+        Regex::new(r#"<metadata key="index" value="(\d+)""#).unwrap();
+    let indices: Vec<u32> = slice_info
+        .map(|xml| re_index.captures_iter(xml)
+            .filter_map(|c| c.get(1).unwrap().as_str().parse().ok())
+            .collect())
+        .unwrap_or_default();
+    if let Some(n) = reported
+        && (plates.contains(&n)
+            || (plates.is_empty()
+                && (indices.is_empty() || indices.contains(&n))))
+    {
+        return Some(n);
+    }
+    match plates.as_slice() {
+        [only] => Some(*only),
+        [] => match indices.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        },
+        _ => {
+            let mut sliced = indices.iter().filter(|i| plates.contains(i));
+            match (sliced.next(), sliced.next()) {
+                (Some(&only), None) => Some(only),
+                _ => None,
+            }
+        }
     }
 }
 
-fn read_3mf(data: Vec<u8>) -> anyhow::Result<JobBundle> {
+/// slice_info's `<plate>` block for `plate`; a lone block without an index
+/// also counts.
+fn plate_block(xml: &str, plate: Option<u32>) -> Option<&str> {
+    let blocks: Vec<&str> = xml.split("<plate>").skip(1).collect();
+    if let Some(n) = plate
+        && let Some(block) = blocks.iter()
+            .find(|b| b.contains(&format!(r#"key="index" value="{n}""#)))
+    {
+        return Some(*block);
+    }
+    match blocks.as_slice() {
+        [only] if plate.is_none() || !only.contains(r#"key="index""#) => {
+            Some(*only)
+        }
+        _ => None,
+    }
+}
+
+/// Skip commands need the printer's object ids (slice_info identify_id,
+/// the gcode's OBJECT_ID); plate json uses other ids. So a box goes to the
+/// object with the same name, only where that name is unique on both
+/// sides — look-alike instances get no box rather than a wrong one.
+fn bboxes_by_name(plate_json: &serde_json::Value,
+                  objects: &[(i64, String)]) -> HashMap<i64, [f32; 4]> {
+    let mut boxes: HashMap<&str, Option<[f32; 4]>> = HashMap::new();
+    let entries = plate_json.get("bbox_objects").and_then(|v| v.as_array());
+    for obj in entries.into_iter().flatten() {
+        let Some(name) = obj.get("name").and_then(|v| v.as_str())
+        else { continue };
+        let bbox = obj.get("bbox").and_then(|v| v.as_array())
+            .filter(|b| b.len() == 4)
+            .map(|b| {
+                let mut arr = [0f32; 4];
+                for (i, v) in b.iter().enumerate() {
+                    arr[i] = v.as_f64().unwrap_or(0.0) as f32;
+                }
+                arr
+            });
+        boxes.entry(name).and_modify(|b| *b = None).or_insert(bbox);
+    }
+    let mut counts: HashMap<&str, u32> = HashMap::new();
+    for (_, name) in objects {
+        *counts.entry(name.as_str()).or_insert(0) += 1;
+    }
+    objects.iter()
+        .filter(|(_, name)| counts[name.as_str()] == 1)
+        .filter_map(|(id, name)| {
+            Some((*id, boxes.get(name.as_str()).copied().flatten()?))
+        })
+        .collect()
+}
+
+fn read_3mf(data: Vec<u8>, reported_plate: Option<u32>)
+            -> anyhow::Result<JobBundle> {
     let mut bundle = JobBundle { label_objects: true, ..Default::default() };
     let mut zip = zip::ZipArchive::new(Cursor::new(data))?;
     let read_entry = |zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>,
@@ -271,74 +354,39 @@ fn read_3mf(data: Vec<u8>) -> anyhow::Result<JobBundle> {
     let names: Vec<String> = zip.file_names().map(str::to_string).collect();
     let slice_info = read_entry(&mut zip, "Metadata/slice_info.config")
         .map(|xml| String::from_utf8_lossy(&xml).to_string());
-    let plate = sliced_plate(&names, slice_info.as_deref());
+    let plate = sliced_plate(&names, slice_info.as_deref(), reported_plate);
 
     // this plate's images only — another plate's picture would mislead
-    for cand in [format!("Metadata/plate_{plate}.png"),
-                 format!("Metadata/top_{plate}.png")] {
-        if let Some(png) = read_entry(&mut zip, &cand) {
-            bundle.plate_png = Some(png);
-            break;
+    if let Some(plate) = plate {
+        for cand in [format!("Metadata/plate_{plate}.png"),
+                     format!("Metadata/top_{plate}.png")] {
+            if let Some(png) = read_entry(&mut zip, &cand) {
+                bundle.plate_png = Some(png);
+                break;
+            }
         }
     }
-    if let Some(text) = &slice_info {
-        let (objects, skipped, label) = parse_slice_info(text);
+    if let Some(block) = slice_info.as_deref()
+        .and_then(|xml| plate_block(xml, plate))
+    {
+        let (objects, skipped, label) = parse_slice_info(block);
         bundle.objects = objects;
         bundle.skipped = skipped;
         bundle.label_objects = label;
-    }
-    let json_name = format!("Metadata/plate_{plate}.json");
-    if let Some(raw) = read_entry(&mut zip, &json_name)
-        && let Ok(plate_json) =
-            serde_json::from_slice::<serde_json::Value>(&raw)
-    {
-        let bbox_objects = plate_json.get("bbox_objects")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for obj in &bbox_objects {
-            let (Some(id), Some(bbox)) = (
-                obj.get("id").and_then(|v| v.as_i64()),
-                obj.get("bbox").and_then(|v| v.as_array()),
-            ) else { continue };
-            if bbox.len() == 4 {
-                let mut arr = [0f32; 4];
-                for (i, v) in bbox.iter().enumerate() {
-                    arr[i] = v.as_f64().unwrap_or(0.0) as f32;
-                }
-                bundle.bboxes.insert(id, arr);
-            }
-        }
-        // plate json ids are the printer-side identify ids — prefer
-        // them whenever present so skip commands match
-        if !bbox_objects.is_empty()
-            && bbox_objects.len() >= bundle.objects.len()
-        {
-            let mut counts: HashMap<String, u32> = HashMap::new();
-            let mut objs = Vec::new();
-            for obj in &bbox_objects {
-                let Some(id) = obj.get("id").and_then(|v| v.as_i64())
-                else { continue };
-                let base = obj.get("name").and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("object {id}"));
-                let n = counts.entry(base.clone()).or_insert(0);
-                *n += 1;
-                let label =
-                    if *n == 1 { base } else { format!("{base} #{n}") };
-                objs.push((id, label));
-            }
-            if !objs.is_empty() {
-                bundle.objects = objs;
-            }
-        }
     }
     if bundle.objects.is_empty()
         && let Some(xml) = read_entry(&mut zip, "Metadata/model_settings.config")
     {
         bundle.objects =
             parse_model_settings(&String::from_utf8_lossy(&xml));
+    }
+    if let Some(plate) = plate
+        && let Some(raw) =
+            read_entry(&mut zip, &format!("Metadata/plate_{plate}.json"))
+        && let Ok(plate_json) =
+            serde_json::from_slice::<serde_json::Value>(&raw)
+    {
+        bundle.bboxes = bboxes_by_name(&plate_json, &bundle.objects);
     }
     Ok(bundle)
 }
@@ -383,7 +431,7 @@ mod tests {
 
     use zip::write::SimpleFileOptions;
 
-    use super::{read_3mf, sliced_plate};
+    use super::{job_plate, read_3mf, sliced_plate};
 
     fn make_3mf(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -396,51 +444,130 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
-    fn slice_info(index: u32, iid: i64) -> String {
-        format!(r#"<config><plate>
-  <metadata key="index" value="{index}"/>
-  <object identify_id="{iid}" name="part" skipped="false" />
-</plate></config>"#)
+    /// slice_info with one `<plate>` block per index: (index, id, name).
+    fn slice_info(objects: &[(u32, i64, &str)]) -> String {
+        let mut xml = String::from("<config>");
+        let mut open = None;
+        for (index, iid, name) in objects {
+            if open != Some(*index) {
+                if open.is_some() {
+                    xml += "</plate>\n";
+                }
+                xml += &format!("<plate>\n  \
+                    <metadata key=\"index\" value=\"{index}\"/>\n");
+                open = Some(*index);
+            }
+            xml += &format!("  <object identify_id=\"{iid}\" \
+                name=\"{name}\" skipped=\"false\" />\n");
+        }
+        if open.is_some() {
+            xml += "</plate>\n";
+        }
+        xml + "</config>"
     }
 
-    fn plate_json(id: i64) -> String {
-        format!(r#"{{"bbox_objects":[{{"id":{id},"name":"part",
-            "bbox":[1.0,2.0,3.0,4.0]}}]}}"#)
+    fn plate_json(objects: &[(i64, &str)]) -> String {
+        let items: Vec<String> = objects.iter()
+            .map(|(id, name)| format!(
+                r#"{{"id":{id},"name":"{name}","bbox":[1.0,2.0,3.0,4.0]}}"#))
+            .collect();
+        format!(r#"{{"bbox_objects":[{}]}}"#, items.join(","))
     }
 
     #[test]
-    fn plate_n_job_uses_its_own_thumbnail_and_bboxes() {
+    fn plate_n_job_uses_its_own_thumbnail() {
         // Studio keeps every plate's pictures but only the sliced plate's
         // gcode + json (seen on an A1 job sliced as plate 2 only)
-        let info = slice_info(2, 506);
-        let json = plate_json(506);
         let data = make_3mf(&[
             ("Metadata/plate_1.png", b"plate-1"),
             ("Metadata/plate_2.png", b"plate-2"),
             ("Metadata/plate_2.gcode", b"; gcode"),
             ("Metadata/plate_2.gcode.md5", b"0"),
+        ]);
+        let bundle = read_3mf(data, None).unwrap();
+        assert_eq!(bundle.plate_png.as_deref(), Some(&b"plate-2"[..]));
+    }
+
+    #[test]
+    fn skip_ids_are_slice_info_identify_ids() {
+        // ids from the A1 #1 job: its gcode labels the object
+        // "; OBJECT_ID: 484" while plate_2.json calls it 506
+        let info = slice_info(&[(2, 484, "Soporte.stl_3")]);
+        let json = plate_json(&[(506, "Soporte.stl_3")]);
+        let data = make_3mf(&[
+            ("Metadata/plate_2.png", b"plate-2"),
+            ("Metadata/plate_2.gcode", b"; gcode"),
             ("Metadata/plate_2.json", json.as_bytes()),
             ("Metadata/slice_info.config", info.as_bytes()),
         ]);
-        let bundle = read_3mf(data).unwrap();
-        assert_eq!(bundle.plate_png.as_deref(), Some(&b"plate-2"[..]));
-        assert_eq!(bundle.bboxes.get(&506), Some(&[1.0, 2.0, 3.0, 4.0]));
-        assert_eq!(bundle.objects, vec![(506, "part".to_string())]);
+        let bundle = read_3mf(data, None).unwrap();
+        assert_eq!(bundle.objects, vec![(484, "Soporte.stl_3".to_string())]);
+        assert_eq!(bundle.bboxes.get(&484), Some(&[1.0, 2.0, 3.0, 4.0]));
+        assert!(!bundle.bboxes.contains_key(&506));
     }
 
     #[test]
     fn single_plate_job_reads_plate_1() {
-        let info = slice_info(1, 7);
-        let json = plate_json(7);
+        let info = slice_info(&[(1, 91, "Square.stl")]);
+        let json = plate_json(&[(107, "Square.stl")]);
         let data = make_3mf(&[
             ("Metadata/plate_1.png", b"plate-1"),
             ("Metadata/plate_1.gcode", b"; gcode"),
             ("Metadata/plate_1.json", json.as_bytes()),
             ("Metadata/slice_info.config", info.as_bytes()),
         ]);
-        let bundle = read_3mf(data).unwrap();
+        let bundle = read_3mf(data, None).unwrap();
         assert_eq!(bundle.plate_png.as_deref(), Some(&b"plate-1"[..]));
-        assert!(bundle.bboxes.contains_key(&7));
+        assert_eq!(bundle.objects, vec![(91, "Square.stl".to_string())]);
+        assert!(bundle.bboxes.contains_key(&91));
+    }
+
+    #[test]
+    fn lookalike_instances_get_no_box() {
+        let info = slice_info(&[(1, 11, "part"), (1, 12, "part"),
+                                (1, 13, "lid")]);
+        let json = plate_json(&[(20, "part"), (21, "part"), (22, "lid")]);
+        let data = make_3mf(&[
+            ("Metadata/plate_1.gcode", b"; gcode"),
+            ("Metadata/plate_1.json", json.as_bytes()),
+            ("Metadata/slice_info.config", info.as_bytes()),
+        ]);
+        let bundle = read_3mf(data, None).unwrap();
+        assert_eq!(bundle.objects.len(), 3);
+        let boxed: Vec<i64> = bundle.bboxes.keys().copied().collect();
+        assert_eq!(boxed, vec![13]);
+    }
+
+    #[test]
+    fn reported_plate_picks_among_several() {
+        let info = slice_info(&[(1, 10, "p1obj"), (3, 30, "p3obj")]);
+        let entries: &[(&str, &[u8])] = &[
+            ("Metadata/plate_1.png", b"plate-1"),
+            ("Metadata/plate_3.png", b"plate-3"),
+            ("Metadata/plate_1.gcode", b"; gcode"),
+            ("Metadata/plate_3.gcode", b"; gcode"),
+            ("Metadata/slice_info.config", info.as_bytes()),
+        ];
+        let bundle = read_3mf(make_3mf(entries), Some(3)).unwrap();
+        assert_eq!(bundle.plate_png.as_deref(), Some(&b"plate-3"[..]));
+        assert_eq!(bundle.objects, vec![(30, "p3obj".to_string())]);
+        // without a reported plate the file can't tell: show nothing
+        let bundle = read_3mf(make_3mf(entries), None).unwrap();
+        assert_eq!(bundle.plate_png, None);
+        assert!(bundle.objects.is_empty());
+    }
+
+    #[test]
+    fn lone_plate_block_without_index_still_lists_objects() {
+        let info = "<config><plate>\n  \
+            <object identify_id=\"5\" name=\"a\" skipped=\"false\" />\n\
+            </plate></config>";
+        let data = make_3mf(&[
+            ("Metadata/plate_1.gcode", b"; gcode"),
+            ("Metadata/slice_info.config", info.as_bytes()),
+        ]);
+        let bundle = read_3mf(data, None).unwrap();
+        assert_eq!(bundle.objects, vec![(5, "a".to_string())]);
     }
 
     #[test]
@@ -450,7 +577,7 @@ mod tests {
             ("Metadata/top_2.png", b"top-2"),
             ("Metadata/plate_2.gcode", b"; gcode"),
         ]);
-        let bundle = read_3mf(data).unwrap();
+        let bundle = read_3mf(data, None).unwrap();
         assert_eq!(bundle.plate_png.as_deref(), Some(&b"top-2"[..]));
     }
 
@@ -460,28 +587,46 @@ mod tests {
             ("Metadata/plate_1.png", b"plate-1"),
             ("Metadata/plate_2.gcode", b"; gcode"),
         ]);
-        let bundle = read_3mf(data).unwrap();
+        let bundle = read_3mf(data, None).unwrap();
         assert_eq!(bundle.plate_png, None);
         assert!(bundle.bboxes.is_empty());
     }
 
     #[test]
-    fn sliced_plate_prefers_gcode_entry_then_slice_info() {
+    fn sliced_plate_rules() {
         let names = |list: &[&str]| -> Vec<String> {
             list.iter().map(|s| s.to_string()).collect()
         };
-        let info = slice_info(3, 1);
-        // the gcode entry wins over a disagreeing index
+        let plate_2 = slice_info(&[(2, 1, "a")]);
+        let plate_3 = slice_info(&[(3, 2, "b")]);
+        let plates_1_3 = slice_info(&[(1, 1, "a"), (3, 2, "b")]);
+        let both = names(&["Metadata/plate_1.gcode",
+                           "Metadata/plate_3.gcode"]);
+        // the file's only gcode entry beats a different reported plate
         assert_eq!(sliced_plate(&names(&["Metadata/plate_2.gcode"]),
-                                Some(&info)), 2);
-        // index picks among several gcode entries
-        assert_eq!(sliced_plate(&names(&["Metadata/plate_1.gcode",
-                                         "Metadata/plate_3.gcode"]),
-                                Some(&info)), 3);
+                                Some(&plate_2), Some(3)), Some(2));
+        // several sliced plates: the reported one, or the one slice_info
+        // agrees on, else no guess
+        assert_eq!(sliced_plate(&both, Some(&plates_1_3), Some(3)), Some(3));
+        assert_eq!(sliced_plate(&both, Some(&plate_3), None), Some(3));
+        assert_eq!(sliced_plate(&both, Some(&plates_1_3), None), None);
         // md5 sidecars are not gcode entries
         assert_eq!(sliced_plate(&names(&["Metadata/plate_4.gcode.md5"]),
-                                Some(&info)), 3);
-        assert_eq!(sliced_plate(&names(&[]), None), 1);
+                                Some(&plate_3), None), Some(3));
+        // no gcode: the reported plate, else nothing to go on
+        assert_eq!(sliced_plate(&names(&[]), None, Some(2)), Some(2));
+        assert_eq!(sliced_plate(&names(&[]), None, None), None);
+        assert_eq!(sliced_plate(&names(&["Metadata/plate_99999999999.gcode"]),
+                                None, None), None);
+    }
+
+    #[test]
+    fn job_plate_reads_gcode_file_then_job_name() {
+        assert_eq!(job_plate("X_plate_3", ""), Some(3));
+        assert_eq!(job_plate("X", "/data/Metadata/plate_2.gcode"), Some(2));
+        assert_eq!(job_plate("X_plate_3", "/data/Metadata/plate_2.gcode"),
+                   Some(2));
+        assert_eq!(job_plate("X", "X.gcode.3mf"), None);
     }
 
     fn pick(candidates: &[&str], job: &str, file: &str) -> Option<String> {
