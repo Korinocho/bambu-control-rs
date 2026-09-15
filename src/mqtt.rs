@@ -44,6 +44,9 @@ impl PrinterClient {
             format!("bambu-control-{serial}"), ip, 8883);
         options.set_credentials("bblp", access_code);
         options.set_keep_alive(Duration::from_secs(30));
+        // Accepts any certificate, so the access code goes to whoever
+        // answers on 8883. GitHub issue #1 moves MQTT to the printer
+        // certificate verifier in src/tls.rs, which FTPS already uses.
         let connector = native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
