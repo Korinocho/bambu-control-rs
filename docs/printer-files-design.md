@@ -14,7 +14,7 @@ These owner decisions override anything else in this document.
 | Topic | Decision |
 |---|---|
 | Order of work | 1. Fix now, separately: P1S/P1P serial prefix swap, hard-coded `plate_1` in `files.rs`, over-permissive fuzzy `.3mf` match (done, section 10.1). 2. No separate JobFetch timeout/cancel fix: the MVP FTP worker replaces JobFetch. 3. A TLS session-resumption spike of at most 1 day (done, section 11). 4. The owner reviewed the spike and approved the rustls + X.509 v1 path with conditions (G2, section 10.3). The owner then replaced certificate pinning with a verifier anchored on Bambu's `BBL CA` and bound to the serial, and approved that design. Step 0 (the owner's X.509 v1 diagnosis check) is confirmed and the design is specified in section 5.3, so the MVP starts. Gate G4 runs during the MVP, coordinated with the owner, once the browser lists files. |
-| TLS | rustls 0.23.42 (ring provider only, TLS 1.2 only) with the printer's resumption store, and a certificate verifier anchored on Bambu's `BBL CA` and bound to the printer's serial. G2 approved rustls with conditions; the owner then replaced certificate pinning with CA anchoring and approved it (section 10.3). **Justification:** performance for many small files inside one open FTP session (section 11). Bulk downloads (~206 KiB/s) and connect + login (~0.85 s) do not improve. **Security:** FTPS gets real verification on every full handshake, before credentials are sent: `BBL CA`'s signature over the leaf, the leaf key's signature over the handshake, and subject CN == configured serial. Nothing is learned or stored from a connection, and a refusal offers no trust action. Expiry is deliberately not checked (`BBL CA` ends 2032-04-01, leaves 2035). The FTPS native-tls path is deleted. **Not closed by the MVP:** MQTT (8883) and the camera (6000) still accept any certificate, so the access code is handed to anyone who answers on those ports (issues #1 and #2, section 10.5). Trust on first use was rejected (5.3). Spec: section 5.3. |
+| TLS | rustls 0.23.42 (ring provider only, TLS 1.2 only) with a resumption store per FTP session, and a certificate verifier anchored on Bambu's `BBL CA` and bound to the printer's serial. G2 approved rustls with conditions; the owner then replaced certificate pinning with CA anchoring and approved it (section 10.3). **Justification:** performance for many small files inside one open FTP session (section 11). Bulk downloads (~206 KiB/s) and connect + login (~0.85 s) do not improve. **Security:** FTPS gets real verification on every full handshake, before credentials are sent: `BBL CA`'s signature over the leaf, the leaf key's signature over the handshake, and subject CN == configured serial. Nothing is learned or stored from a connection, and a refusal offers no trust action. Expiry is deliberately not checked (`BBL CA` ends 2032-04-01, leaves 2035). The FTPS native-tls path is deleted. **Not closed by the MVP:** MQTT (8883) and the camera (6000) still accept any certificate, so the access code is handed to anyone who answers on those ports (issues #1 and #2, section 10.5). Trust on first use was rejected (5.3). Spec: section 5.3. |
 | Storage | Cache in `%LOCALAPPDATA%\Bambu Control\cache`, size cap configurable (default 5 GB), least-recently-used eviction that never evicts a file open in the player, and a "Clear cache" button. "Save to PC" writes to `Downloads\Bambu Control\<printer>`. |
 | While printing | Listings and thumbnails are allowed. Large downloads only when the user asks, and at most one download per printer while it is printing. |
 | Live tests | Approved: full download of the 86.5 MB P1S timelapse (P1S not printing; done, gate G3); a Studio send while the app is browsing (gate G4, coordinated with the owner once the MVP browser lists files; small test file, printer not printing, owner cancels the print if it starts). Not blocking: a 1-layer timelapse print on the A1 Combo, which the owner runs later. |
@@ -182,21 +182,21 @@ FtpWorker (one per printer; thread started lazily; no session until needed)
    |- browse lane   -- FtpSession A (lazy; QUIT after 12 s idle)
    |     LIST, SIZE/MDTM/CWD, thumbnails, 3mf <= 1 MB, .gcode head reads, JobBundle
    |- transfer lane -- FtpSession B (only for user-started downloads; FIFO, 1 at a time)
-         big RETR -> <dest>.part -> size check -> rename; cancel = shutdown sockets + drop
-   both sessions share one PrinterTls (one Arc<PrinterCertVerifier>, one resumption store); each
-   session gets its own ClientConfig, and every connection records its own TLS outcome (5.3)
+         big RETR -> <dest>.part -> size check -> rename; cancel = session cancel flag + drop
+   both sessions share one PrinterTls (one Arc<PrinterCertVerifier>); each session gets its own
+   ClientConfig and resumption store, and every connection records its own TLS outcome (5.3)
 Cache (disk): listings JSON, thumbs, 3mf meta JSON, played files (LRU, 5 GB cap)
 MjpegPlayer thread: local file only -> frame slot -> TextureHandle::set (camera pattern)
 ```
 
 Design rules:
 1. **Session budget from section 4.** JobFetch is removed; its work becomes `Cmd::JobBundle` on the worker.
-2. **Every socket has a timeout,** set before the TLS handshake by a wrapping connector (5.2). No helper threads around blocking connects.
+2. **Every socket read and write has a time limit,** enforced from before the TLS handshake by the anchored connector, and every handshake has one too (5.2). No helper threads around blocking connects.
 3. **A session that saw a cancel, EOF, timeout or decrypt error is discarded, never reused.**
 4. **No `pwd()`, no `File::from_str`** (it never fails and turns garbage lines into entries).
 5. **Decode and downscale on the lane thread;** the UI thread only calls `load_texture` / `TextureHandle::set`.
 6. **No panics on untrusted bytes** (release builds use `panic = "abort"`): checked slicing, frame and entry size caps.
-7. **Never join worker threads on the UI thread.** Stop and cancel set flags and shut sockets down; threads exit on their own.
+7. **Never join worker threads on the UI thread.** Stop and cancel set the sessions' cancel flags, which every waiting read and write sees within 100 ms (5.2); threads exit on their own.
 8. **Never accept a certificate that is not anchored on `BBL CA` and bound to the configured serial, never retry a TLS or certificate error, and never read the absence of a recorded error as a verified certificate** (5.3).
 
 ### 5.2 `src/ftp.rs` (new): sessions, TLS, parsing
@@ -242,45 +242,20 @@ pub enum FtpError {
     Local(String),                     // rename / create failed
 }
 
-/// Wraps the session's AnchoredConnector (5.3). suppaftp calls `connect`
-/// for the control connection and again for every data connection, so one
-/// wrapper bounds all handshakes and records every socket for cancel.
-#[derive(Debug)]
-pub struct TimedConnector<C> {
-    inner: C,
-    io_timeout: Duration,
-    sockets: Arc<SocketSet>,          // try_clone() handles of live sockets
-}
-impl<C: suppaftp::TlsConnector> suppaftp::TlsConnector for TimedConnector<C> {
-    type Stream = C::Stream;
-    /// set_read_timeout / set_write_timeout on the raw TcpStream, register a
-    /// try_clone() handle in `sockets`, then delegate to `inner`. Never completes
-    /// the TLS handshake here: suppaftp turns connector errors into strings, so
-    /// the handshake runs in AnchoredStream, which records the outcome per connection (5.3).
-    fn connect(&self, domain: &str, stream: TcpStream) -> suppaftp::FtpResult<C::Stream>;
-}
-
-pub struct SocketSet { /* Mutex<Vec<TcpStream>> */ }
-impl SocketSet {
-    /// shutdown(Both) on every registered socket: unblocks a stalled read at once
-    pub fn shutdown_all(&self);
-}
-
 pub struct FtpSession {
     ftp: suppaftp::ImplFtpStream<AnchoredStream>,
     conns: Arc<SessionConns>,         // TLS outcome of each of this session's connections (5.3)
     profile: ServerProfile,
     printer_year: Option<i32>,        // learned once per session, see below
-    sockets: Arc<SocketSet>,
     poisoned: bool,
 }
 
 impl FtpSession {
     /// 1. TcpStream::connect_timeout(CONNECT_TIMEOUT) pre-check (RST -> PortClosed,
     ///    timeout -> Offline), closed immediately.
-    /// 2. connect_secure_implicit with TimedConnector around the printer's
-    ///    connector; then set_passive_nat_workaround(true) and a
-    ///    passive_stream_builder with connect_timeout + read/write timeouts.
+    /// 2. connect_secure_implicit with the session's AnchoredConnector, which
+    ///    bounds every socket (below); then set_passive_nat_workaround(true)
+    ///    and a passive_stream_builder with connect_timeout.
     /// 3. Profile from the banner; login("bblp", code); TYPE I.
     /// Every handshake is verified before `login` sends the access code (5.3).
     /// TLS failures are read from the records of this session's connections,
@@ -298,8 +273,8 @@ impl FtpSession {
     /// CWD dir -> 250/550, then CWD / (no data connection)
     pub fn dir_exists(&mut self, dir: &str) -> Result<bool, FtpError>;
     /// Streams to `out` in 64 KB chunks, checks `cancel` between chunks and
-    /// verifies bytes == expected. Cancel from another thread calls
-    /// sockets.shutdown_all(), so a stalled read ends immediately.
+    /// verifies bytes == expected. Cancel from another thread cancels the
+    /// session (`SessionConns::cancel`): a waiting read fails within 100 ms.
     /// Any Err except NotFound poisons the session.
     pub fn retr_to(&mut self, path: &str, expected: u64, out: &mut dyn Write,
                    cancel: &AtomicBool, progress: &mut dyn FnMut(u64))
@@ -307,7 +282,7 @@ impl FtpSession {
     /// Reads at most `max` bytes, then drops the connection. The server kills
     /// the session on early close, so this consumes `self`.
     pub fn retr_head(self, path: &str, max: usize) -> Result<Vec<u8>, FtpError>;
-    pub fn sockets(&self) -> Arc<SocketSet>;
+    pub fn conns(&self) -> Arc<SessionConns>;   // cancel() ends the session from any thread
     pub fn quit(self);
 }
 
@@ -329,6 +304,17 @@ pub fn parse_list_line(dir: &str, line: &str, rule: DateRule, printer_year: i32)
     -> Option<RemoteEntry>;
 ```
 
+**Time limits and cancel** (stage 1b; review probes P2 and P5):
+- There is no connector wrapper and no set of socket handles. `AnchoredConnector` (5.3) bounds every socket itself, since suppaftp calls its `connect` for the control connection and again for every data connection:
+  - before any TLS byte it puts the socket in non-blocking mode and creates the connection's record;
+  - every read and write then waits for progress at most the profile's IO timeout, retrying with pauses that double from 1 ms to 100 ms;
+  - a handshake ends within 2 IO timeouts from its first byte, however the peer paces its bytes. Before this limit, a peer sending its handshake one byte just inside each IO timeout held the thread for hours (P2);
+  - a close writes the queued alert or close_notify for at most 2 s and never reads.
+- **Cancel** sets the session's flag (`SessionConns::cancel`). Every waiting read or write sees it within 100 ms, shuts its socket down and fails. Once a connection of the session has failed, the session's reads fail at once too, so a data refusal is reported without waiting for the control reply.
+- Why not `shutdown()` from the cancelling thread: on Windows, `shutdown(Both)` through a `try_clone()` handle returns Ok but does not wake a read blocked in another thread; in P5 the read waited its full 6 s timeout.
+- Why non-blocking sockets rather than short `SO_RCVTIMEO` slices: Microsoft documents a socket as indeterminate after a receive timeout, and a lost byte would surface as a TLS record error, which 5.3 treats as a security failure.
+- Residual risk: after the handshake only each read is bounded, not a whole transfer. A peer that trickles a data connection or a control reply just inside the IO timeout holds its session until the session is cancelled. The worker (5.4) adds a transfer deadline or a minimum rate.
+
 **Why not suppaftp's `ListParser::parse_posix`?** It got name, size and is_dir right on all 4730 real LIST lines from the three printers, but its dates are wrong three ways: it applies a 180-day rollback, labels printer-local time as UTC, and returns `InvalidDate` for a year-less `Feb 29` in a non-leap PC year. `parse_posix` stays the test reference: unit tests must reproduce its name/size/is_dir results on the corpus. The corpus must be scrubbed first, because `/logger` and `/recorder` names contain full serial numbers.
 
 **Printer year.** The calendar-year rule applies to the printer's clock, which can be days off the PC's. Once per session, run MDTM on the newest `HH:MM`-form entry and use its year for `HH:MM` rows. Display all times as "printer clock", never converted.
@@ -337,7 +323,7 @@ pub fn parse_list_line(dir: &str, line: &str, rule: DateRule, printer_year: i32)
 
 ### 5.3 TLS: CA-anchored verifier, serial binding, resumption
 
-Implementation spec for the MVP. Gate G2 approved rustls with conditions; the owner then replaced certificate pinning with this CA-anchored design and approved it (section 10.3). Every rule below is testable, and the required tests (T1-T26) are listed at the end of this section. The spikes (section 11) are evidence, not templates: section 11 lists where they deviate from this spec.
+Implementation spec for the MVP. Gate G2 approved rustls with conditions; the owner then replaced certificate pinning with this CA-anchored design and approved it (section 10.3). Every rule below is testable, and the required tests (T1-T27) are listed at the end of this section. The spikes (section 11) are evidence, not templates: section 11 lists where they deviate from this spec.
 
 **Security position.**
 - rustls is adopted for performance: data commands (LIST, small RETR) inside one open FTP session. It does not speed up bulk downloads (~206 KiB/s, limited by the printer) or connect + login (~0.85 s on both stacks, paid again by every new session).
@@ -366,8 +352,8 @@ Implementation spec for the MVP. Gate G2 approved rustls with conditions; the ow
   - ureq reads the process-level default provider before its own ring fallback, so a process default set by the app would silently change ureq's provider.
 - Enforcement:
   - `clippy.toml` lists those six methods under `disallowed-methods`, run as `cargo clippy --all-targets -- -D clippy::disallowed_methods`. It catches `use ... as` aliases and UFCS calls (6 of 6 in the spike's guard crate).
-  - A CI step fails the build on any output of `git grep -nE "install_default|get_default\(|ClientConfig::builder\(\)|ServerConfig::builder\(\)|builder_with_protocol_versions\(" -- src`. It misses aliases (5 of 6), so it complements clippy and does not replace it.
-  - The repo has no CI yet; the MVP adds it (10.4). The same pattern also runs as test T23, which lives in `tests/` (outside the scanned `src` tree, so its own pattern string does not trip the grep), and `cargo test` enforces it locally.
+  - A CI step fails the build on any output of `git grep -nE "install_default|get_default\(|ClientConfig::builder\(\)|ServerConfig::builder\(\)|builder_with_protocol_versions\(" -- src vendor/suppaftp/src`, and on any git grep error. It misses aliases (5 of 6), so it complements clippy and does not replace it.
+  - CI is `.github/workflows/ci.yml`, with its actions pinned by commit and the toolchain pinned (1.97.1). `workflow-lint.yml` runs actionlint and shellcheck in a workflow of its own, so a `ci.yml` that does not parse is still reported. The same pattern also runs as test T23, which lives in `tests/` (outside the scanned trees, so its own pattern string does not trip the grep), and `cargo test` enforces it locally.
 
 **Dependencies (final).**
 
@@ -388,8 +374,10 @@ ring = "0.17"
 - **No direct `rustls-webpki` dependency.** webpki stays only as rustls' own transitive dependency.
 - **The FTPS native-tls path is deleted when the verifier lands.** That path is `NativeTlsFtpStream` with a `TlsConnector` using `danger_*`, at `files.rs:174-179` today.
   - There is no runtime fallback, and no second path is kept "just in case". suppaftp loses its `native-tls` feature.
-  - CI fails on any `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` in the FTPS code: `git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src/tls.rs src/tls src/ftp.rs src/browser.rs src/files.rs` must print nothing.
+  - CI fails on any `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` in the FTPS code: `git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src/tls.rs src/tls src/ftp.rs src/browser.rs src/files.rs vendor/suppaftp/src` must print nothing.
   - When issues #1 and #2 land, the same grep runs over all of `src`, and the `native-tls` dependency is removed.
+- **suppaftp is vendored** (stage 1b). suppaftp 10.0.2 declares its `TlsConnector` trait in a private module, so no application can supply a connector. `vendor/suppaftp` is the published crate plus one export (`pub use sync_ftp::TlsConnector`), wired through `[patch.crates-io]`; `vendor/suppaftp/PATCHES.md` documents it and when to drop it.
+  - A path dependency has no checksum in `Cargo.lock`. CI therefore downloads the crate, checks its crates.io checksum, and requires `vendor/suppaftp` to equal it except for `vendor/suppaftp.patch` and the documented added files.
 - **`rumqttc` without default features** removes aws-lc-rs, aws-lc-sys and rustls-webpki 0.102.8 from the tree.
 - **The `tls12` feature is load-bearing.**
   - The printers negotiate only TLS 1.2 (`ECDHE-RSA-AES256-GCM-SHA384`), and the resumption tickets come from those sessions.
@@ -406,11 +394,10 @@ ring = "0.17"
 
 ```rust
 /// One per printer, for the worker's lifetime. A connection edit (IP, serial or access
-/// code) rebuilds the worker, which drops this value and its resumption store.
+/// code) rebuilds the worker, which drops this value.
 pub struct PrinterTls {
     verifier: Arc<PrinterCertVerifier>,
     provider: Arc<rustls::crypto::CryptoProvider>,  // rustls::crypto::ring::default_provider()
-    resumption: rustls::client::Resumption,         // in_memory_sessions(SESSION_STORE_N); clones share one store
 }
 
 /// ClientSessionMemoryCache::new(N) keeps ceil(N/8) - 1 server names: N <= 8 keeps nothing
@@ -451,11 +438,14 @@ impl PrinterTls {
   - `builder_with_provider(self.provider.clone())`, then `.with_protocol_versions(&[&rustls::version::TLS12])`;
   - `.dangerous().with_custom_certificate_verifier(self.verifier.clone())`, which is the same `Arc<PrinterCertVerifier>` on every call (no second verifier is ever built);
   - `.with_no_client_auth()`;
-  - then `config.resumption = self.resumption.clone()`. Clones of a `Resumption` share its store, so every FTP session of this printer uses the printer's one store (TLS 1.2 session id or ticket, the default mechanism).
-- Why sharing the store is safe:
-  - An abbreviated (resumed) TLS 1.2 handshake calls no verifier method (rustls `client/tls12.rs`: "Since we're resuming, we verified the certificate"). So every stored session must come from a handshake this verifier accepted.
-  - The store lives in `PrinterTls`, which exists for one (IP, serial) pair. A connection edit rebuilds the worker and drops the store, and no other printer, service or verifier reads it.
-- MQTT and the camera (issues #1 and #2) take their configs from the same `PrinterTls` with `Resumption::disabled()`. rustls keys the store by server name, not by port, so a shared store would present FTP tickets to 8883 and 6000.
+  - then `config.resumption = Resumption::in_memory_sessions(SESSION_STORE_N)`: a store of the session's own (TLS 1.2 session id or ticket, the default mechanism), dropped with the session.
+- Why one store per session (stage 1b; it was one store per printer):
+  - It loses nothing. rustls 0.23.42 offers a stored session only to a config with the same verifier and the same client-certificate resolver (`Arc::ptr_eq`), and `with_no_client_auth()` makes a new resolver per config. So no session ever resumed another session's ticket from a shared store, which matches the spike: control connections never resumed across FTP sessions.
+  - A shared store did harm. rustls keeps one TLS 1.2 session per server name and overwrites it after every full handshake, so overlapping sessions of one printer overwrote each other's session, and their data connections then did full handshakes (review probe P3). The browse and transfer lanes (5.4) overlap by design.
+- Why the store is safe:
+  - An abbreviated (resumed) TLS 1.2 handshake calls no verifier method (rustls `client/tls12.rs`: "Since we're resuming, we verified the certificate"). So every stored session must come from a handshake this verifier accepted, which holds for a store that only this session's config fills.
+  - No other printer, service, session or verifier reads it.
+- MQTT and the camera (issues #1 and #2) take their configs from the same `PrinterTls` with `Resumption::disabled()`. rustls keys the store by server name, not by port, so a store shared with FTP would present FTP tickets to 8883 and 6000.
 - Resumption helps only inside one FTP session. Control connections never resumed across sessions in the spike, even when they presented a ticket. So keep one session open while a grid loads; a reconnect is never cheaper than today.
 
 **Server name.** suppaftp passes its stored `domain` to the connector for the control connection and every data connection, so the printer IP string is used for all of them. rustls keys the store on that `ServerName::IpAddress` and presents the ticket on data connections. SNI is not sent for IP names, and the verifier ignores the server name.
@@ -530,48 +520,58 @@ fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>,
   - If rustls were blocked, the app would keep today's FTPS behaviour (any certificate accepted) and say so in the README Security notes.
 
 **Error reporting: per connection, below suppaftp.**
-- suppaftp 10.0.2 flattens connector errors into strings (`SecureError(String)`), and any data-stream read error during LIST becomes `BadResponse`. Refusals are therefore captured by the app's TLS connector wrapper, below suppaftp:
+- suppaftp 10.0.2 flattens connector errors into strings (`SecureError(String)`), and any data-stream read error during LIST becomes `BadResponse`. Refusals are therefore captured by the app's TLS connector, below suppaftp (vendored with its `TlsConnector` trait exported, see Dependencies):
   - `AnchoredConnector::connect` creates one `ConnTls` record per connection, control or data, and appends it to its session's list. The verifier keeps no state.
-  - `AnchoredStream` drives the handshake itself on the first read or write (`complete_io` until `!is_handshaking()`), before any plaintext passes in either direction.
-  - It inspects every `io::Error` from rustls before returning it. It walks `io::Error::get_ref()` and `source()` to the `rustls::Error`, recovers `PrinterCertError` by type from `InvalidCertificate(Other(OtherError(..)))`, and records the outcome once, in its own `ConnTls`.
-  - `ftp.rs` maps a failed command only from the records of the connections that command opened. `PrinterCertError` or `CertificateError::BadSignature` becomes `FtpError::CertRefused`; anything else, alerts included, becomes `TlsRejected`. It never matches suppaftp error strings.
+  - **Handshake placement** (`complete_io` until `!is_handshaking()`, before any plaintext passes in either direction). The control connection's handshake runs inside `connect`, so it is verified before suppaftp reads the banner. A data connection's handshake runs on its first read or write, inside `AnchoredStream`:
+    - suppaftp opens the data connection before it reads the reply to the data command, and reads or writes it only after a 1xx reply. A data command answered with 550 therefore closes its data connection without a TLS byte (recorded `Unused`), and the 550 is `NotFound` at once.
+    - With the data handshake inside `connect`, as the first stage 1b build had it, a server that answers 550 and never accepts the data connection (vsftpd, as reported) cost the full IO timeout and poisoned the session as a handshake stall (review probe P1).
+    - BBL-P003 accepts the unused close. In the Python spike, ftplib (which also handshakes after the reply) got 550 for `LIST /timelapse/thumbnail`, and the next `LIST /cache` on the same session returned 65 lines. For a successful command the printer sends 150 before it waits for the data handshake, as ftplib's order requires.
+  - Before a handshake error reaches suppaftp, the connection walks `io::Error::get_ref()` and `source()` to the `rustls::Error`, recovers `PrinterCertError` by type from `InvalidCertificate(Other(OtherError(..)))`, and records the outcome once, in its own `ConnTls`. A TLS error after a completed handshake is kept in the same record as its late error.
+  - `ftp.rs` maps a failed command only from the records of the connections that command opened, plus any late error or cancel of the session. `PrinterCertError` or `CertificateError::BadSignature` becomes `FtpError::CertRefused`; anything else, alerts included, becomes `TlsRejected`, in any phase of the connection. It never matches suppaftp error strings.
 - No slot is shared between connections, sessions or lanes.
-- **Absence of a recorded error never means success.** A connection whose handshake did not complete, with no recorded error and no socket timeout, is `TlsRejected`, not `SessionLost`.
+- **Absence of a recorded error never means success.** A connection whose handshake did not complete, with no recorded error and no socket timeout, is `TlsRejected`, not `SessionLost`. Only a connection that never started its handshake, and so carried no byte, is `Unused`, which is no failure.
 - **Retries:**
   - Only `HandshakeStall` gets the single retry of section 4 rule 4.
   - `CertRefused` and `TlsRejected` are never retried. Each one poisons its session and sets a worker-wide flag that stops both lanes and the transfer queue until the user acts.
-- The handshake never runs inside `TimedConnector::connect`, so suppaftp never turns a handshake error into a string before `AnchoredStream` has recorded it.
-- After a completed handshake, `AnchoredStream` records `handshake_kind()` and `protocol_version()`. The control connection is `Full`; every data connection must be `Resumed`, and every connection `TLSv1_2`.
-  - Debug builds: `debug_assert!`.
-  - Release builds: a counter, plus one log line per session that had any Full data connection. This is a performance regression, not a security failure, because a Full handshake goes through the verifier.
-  - QA on the printers fails if a healthy session shows a Full data connection.
+- Every outcome is recorded before suppaftp sees the error, so suppaftp never turns a handshake error into a string first.
+- After a completed handshake, the connection records `handshake_kind()` and `protocol_version()`. The control connection is `Full`; every data connection should be `Resumed`, and every connection must be `TLSv1_2` (anything else is refused).
+  - A Full data connection is counted in every build (`SessionConns::full_data_connections`), with one log line per session. It is never a `debug_assert!`: a peer can cause it (a server with a ticket key per session, or, before stage 1b, overlapping sessions sharing a store: review probe P3), and a panic from what the peer does is not acceptable.
+  - This is a performance regression, not a security failure, because a Full handshake goes through the verifier.
+  - T22 asserts `Resumed` on every data connection in CI; QA on the printers fails if a healthy session shows a Full data connection.
 - **No serial characters in any message or log:** neither the full serial nor a masked form. The anchor spike's messages showed the first 3 and last 4 characters of the CN; the MVP must not copy that.
 
 ```rust
 /// One per TLS connection, created by AnchoredConnector::connect.
 pub struct ConnTls {
     kind: ConnKind,                     // Control | Data
-    outcome: OnceLock<ConnOutcome>,     // set once, by this connection's AnchoredStream
+    outcome: OnceLock<ConnOutcome>,     // set once: when the handshake ends, or when dropped unused
+    late: OnceLock<rustls::Error>,      // the first TLS error after the handshake
 }
 pub enum ConnOutcome {
     Established { kind: HandshakeKind, version: ProtocolVersion },
     Refused(Refusal),
     Rejected(rustls::Error),            // alerts and every other TLS error
+    Stalled,                            // no byte from the server within the IO timeout
+    Incomplete(io::ErrorKind),          // EOF, reset, cancel, or the handshake limit after the server started
+    Unused,                             // dropped before its handshake started: not a byte sent or read
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     Cert(PrinterCertError),             // verify_server_cert, or steps 2-3 of verify_tls12_signature
     HandshakeSignature,                 // signature (b) failed: the peer does not hold the leaf's key
 }
-/// suppaftp::TlsConnector for one FTP session (wrapped by TimedConnector, 5.2). Creates
-/// ClientConnection::new(config, ServerName::IpAddress) and returns an AnchoredStream.
-/// It does not run the handshake.
-pub struct AnchoredConnector { config: Arc<rustls::ClientConfig>, conns: Arc<SessionConns> }
-/// One per FtpSession: the records of its connections, in order. Read only by that session.
-pub struct SessionConns { list: Mutex<Vec<Arc<ConnTls>>> }
-/// suppaftp::TlsStream over StreamOwned<ClientConnection, TcpStream>, holding its
-/// Arc<ConnTls>. Sends close_notify on drop, like suppaftp's RustlsStream.
-pub struct AnchoredStream { io: StreamOwned<ClientConnection, TcpStream>, conn: Arc<ConnTls>, shutdown: bool }
+/// suppaftp::TlsConnector for one FTP session. Bounds the socket (5.2), creates
+/// ClientConnection::new(config, ServerName::IpAddress), runs the control connection's
+/// handshake, and returns an AnchoredStream.
+pub struct AnchoredConnector { config: Arc<rustls::ClientConfig>, conns: Arc<SessionConns>, io_timeout: Duration }
+/// One per FtpSession: the records of its connections, in order, and its cancel flag.
+/// Read only by that session; cancelled by its owner.
+pub struct SessionConns { list: Mutex<Vec<Arc<ConnTls>>>, cancelled: AtomicBool, failed: Arc<AtomicBool>, full_data: AtomicUsize }
+/// suppaftp::TlsStream over StreamOwned<ClientConnection, SessionSocket>, holding its
+/// Arc<ConnTls>. Runs a data connection's handshake on first use. Its drop never reads:
+/// close_notify like suppaftp's RustlsStream (nothing for an unused or failed connection),
+/// written within 2 s.
+pub struct AnchoredStream { io: AnchoredIo, close_notify: bool }
 ```
 
 **Models and certificate generations.**
@@ -653,7 +653,7 @@ Handshake signature (b):
   - `non_rsa_leaf_key_is_refused` (ECDSA v1 leaf, end to end);
   - `scheme_not_in_provider_list_is_refused`;
   - `each_rsa_scheme_maps_to_ring_and_verifies`;
-  - `tls_module_never_calls_the_rustls_signature_helper`: a source scan of `src/tls.rs` and `src/tls/` for the exact patterns `crypto::verify_tls12_signature(`, `webpki::`, `rustls_webpki` and `WebPkiServerVerifier`, which must find none. It does not match the bare word webpki, because the required comment in `verify_tls12_signature` contains it.
+  - `tls_module_never_calls_the_rustls_signature_helper`: a source scan of all of `src` for the exact patterns `crypto::verify_tls12_signature(`, `crypto::verify_tls13_signature(`, `webpki::`, `rustls_webpki` and `WebPkiServerVerifier`, which must find none. `clippy.toml` also bans both rustls signature helpers and both `WebPkiServerVerifier` builders. It does not match the bare word webpki, because the required comment in `verify_tls12_signature` contains it.
 - **T14** `tls13_signature_is_hard_error`, `tls12_only_client_refuses_tls13_only_server`.
 - **T15** `wrong_serial_is_refused_before_key_exchange`: the client writes only ClientHello and a fatal `certificate_unknown` alert, and against a test FTP server no `USER` is sent.
 - **T16** `full_handshake_logs_leaf_version_and_no_serial`.
@@ -661,13 +661,13 @@ Handshake signature (b):
 Errors, connections, config:
 - **T17** `printer_cert_error_is_recovered_by_type_through_io_error`, and `no_message_or_log_contains_serial_characters`: Display and Debug of every variant, and every log line, are checked for any 4-character run of the configured serial.
 - **T18** `concurrent_sessions_report_a_refusal_on_their_own_connection_only`. Two sessions from one `PrinterTls` run at the same time, one against a genuine test server and one against an impostor. Only the impostor's session reports `CertRefused`; the genuine session completes its command; no retry follows.
-- **T19** `data_connection_refusal_reports_cert_refused_not_bad_response`: a LIST whose data connection does a Full handshake against a refused certificate reports `CertRefused`, never `BadResponse` or `SessionLost`.
+- **T19** `data_connection_refusal_reports_cert_refused_not_bad_response`: a LIST whose data connection does a Full handshake against a refused certificate reports `CertRefused`, never `BadResponse` or `SessionLost`; the refusal poisons the session; in a fetch, the refusal text reaches `JobBundle.error` and no connection follows it. Also `data_refusal_returns_promptly_while_the_peer_holds_both_connections` (NLST and RETR within 2 s while the peer holds the data connection and never replies on the control connection).
 - **T20** `tls_and_certificate_errors_are_never_retried`, `failed_handshake_without_recorded_error_is_tls_rejected`.
-- **T21** `config_for_new_session_shares_one_verifier_and_one_store` (`Arc::ptr_eq` across calls and lanes), and `verifier_writes_nothing` (no file in the config directory changes across accepted and refused handshakes).
-- **T22** `in_memory_sessions_8_never_resumes_tls12_ticket`, `in_memory_sessions_64_resumes_tls12_ticket`, and `data_connections_resume_on_tls12_within_session`, which asserts `handshake_kind() == Some(HandshakeKind::Resumed)` and `protocol_version() == Some(ProtocolVersion::TLSv1_2)` on every data connection.
+- **T21** `config_for_new_session_shares_one_verifier_and_keeps_its_own_store` (one verifier `Arc` across calls; a config resumes its own stored session from another thread; another session's config neither resumes it nor, with its full handshake, replaces it), and `verifier_writes_nothing` (no file in the config directory changes across accepted and refused handshakes).
+- **T22** `in_memory_sessions_8_never_resumes_tls12_ticket`, `in_memory_sessions_64_resumes_tls12_ticket`, and `data_connections_resume_on_tls12_within_session`, which asserts `handshake_kind() == Some(HandshakeKind::Resumed)` and `protocol_version() == Some(ProtocolVersion::TLSv1_2)` on every data connection. Also `overlapping_sessions_resume_their_own_data_connections` (two sessions of one printer overlap against a ticket key per session) and `full_data_handshake_is_counted_not_asserted`.
 
 Provider, dependencies, UI:
-- **T23** `no_provider_default_calls_in_src` (a scan of `src` with the CI grep pattern; the test file lives in `tests/`, so the pattern string itself is never scanned), plus the clippy `disallowed-methods` run in CI.
+- **T23** `no_provider_default_calls_in_src` (a scan of `src` and `vendor/suppaftp/src` with the CI grep pattern; the test file lives in `tests/`, so the pattern string itself is never scanned), plus the clippy `disallowed-methods` run in CI.
 - **T24** CI steps, not cargo tests: no `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` in the FTPS code; `cargo tree -d` lists none of rustls, rustls-webpki, ring, aws-lc-rs and aws-lc-sys; `cargo tree -i aws-lc-rs` fails.
 - **T25** UI and model texts:
   - `refusal_card_has_no_trust_action` (only Edit printer and Close);
@@ -675,7 +675,19 @@ Provider, dependencies, UI:
   - `unobserved_models_say_not_tested_on_this_model` (every model except A1 and P1S, A1 mini and P1P included, unknown prefixes, and a banner other than `BBL-P003`);
   - `no_refusal_text_shows_unknown_with_a_prefix`;
   - `model_prefixes_match_studio_table` (14 prefixes).
-- **T26** `config_save_is_atomic_and_reports_errors` (a failed save returns Err and leaves the previous file intact), `corrupt_config_is_not_overwritten`, `serial_is_trimmed_and_uppercased_on_save_and_load` (5.9).
+- **T26** `config_save_is_atomic_and_reports_errors` (a failed save returns Err and leaves the previous file intact; a reader holding the old file still reads it whole), `corrupt_config_is_not_overwritten`, `save_after_a_failed_load_is_refused`, `serial_is_trimmed_and_uppercased_on_save_and_load` (5.9).
+
+Connections (stage 1b):
+- **T27** Time limits, handshake placement and cancel (5.2, Error reporting). Each test asserts its elapsed time wherever it waits:
+  - `silent_peer_ends_within_the_io_timeout`, `stalled_and_broken_handshakes_are_recorded_as_such`, `stalled_data_handshake_is_a_handshake_stall`;
+  - `trickling_peer_is_bounded_by_the_handshake_limit` (2 IO timeouts, however the peer paces its bytes);
+  - `writes_to_a_peer_that_never_reads_end_within_the_io_timeout` (and the drop after it within the close limit);
+  - `dropping_a_stream_never_waits_for_the_peer`, `refusal_returns_promptly_while_the_peer_keeps_the_socket_open`;
+  - `cancel_ends_a_stalled_handshake_within_a_poll_slice`, `cancel_ends_a_stalled_retr_read`;
+  - `data_connection_dropped_unused_sends_nothing`, `data_command_answered_550_closes_its_data_connection_unused` (a server that accepts the data connection, and one that never does);
+  - `rustls_error_after_the_handshake_is_tls_rejected`, `tls_error_on_an_established_data_connection_is_tls_rejected`, `truncated_data_is_never_accepted`;
+  - `size_failure_ends_the_fetch_with_its_own_text`;
+  - `job_fetcher_returns_the_requested_bundle`, `a_new_job_waits_for_the_running_fetch_to_end` (section 4 rule 3 for job fetches, until the worker of 5.4).
 
 **Out of the MVP, tracked:** MQTT (issue #1) and the camera (issue #2), section 10.5. Until both land, the security position above applies: the access code is not protected on 8883 and 6000.
 
@@ -683,7 +695,7 @@ Provider, dependencies, UI:
 
 ```rust
 //! Per-printer FTPS worker: a browse lane and an on-demand transfer lane,
-//! enforcing the section 4 session budget. Replaces files::JobFetch.
+//! enforcing the section 4 session budget. Replaces files::JobFetcher.
 
 pub enum Cmd {
     List { dir: String, gen: u64 },
@@ -716,7 +728,7 @@ pub enum Event {
 pub struct FtpWorker {
     tx: crossbeam_channel::Sender<Cmd>,
     pub events: crossbeam_channel::Receiver<Event>,
-    cancels: Arc<Mutex<HashMap<u64, (Arc<AtomicBool>, Arc<ftp::SocketSet>)>>>,
+    cancels: Arc<Mutex<HashMap<u64, Arc<SessionConns>>>>,  // cancel() ends that transfer's session (5.2)
     stop: Arc<AtomicBool>,
 }
 
@@ -724,9 +736,9 @@ impl FtpWorker {
     /// Spawns the lane threads; returns immediately. No session is opened.
     pub fn start(cfg: WorkerCfg, cache: Arc<cache::Cache>, ctx: egui::Context) -> Arc<Self>;
     pub fn send(&self, cmd: Cmd);
-    /// Sets the flag and shuts the transfer's sockets down (not queued).
+    /// Cancels the transfer's session (not queued).
     pub fn cancel(&self, id: u64);
-    /// Sets `stop`, shuts every socket down, drops the sender. Never joins.
+    /// Sets `stop`, cancels every session, drops the sender. Never joins.
     pub fn stop(&self);
     pub fn active_transfers(&self) -> usize;
 }
@@ -746,7 +758,7 @@ pub struct WorkerCfg {
 - Repaints are throttled with `request_repaint_after(100 ms)`, not one repaint per chunk.
 
 **Cancel and stop:**
-- `cancel(id)`: set the flag, `shutdown_all()` on that transfer's sockets, delete the `.part`, emit `Done(Err(Cancelled))`. The session is discarded; the next download reconnects (~0.9 s).
+- `cancel(id)`: cancel that transfer's session (its reads and writes fail within 100 ms, 5.2), delete the `.part`, emit `Done(Err(Cancelled))`. The session is discarded; the next download reconnects (~0.9 s).
 - `stop()`: used by `PrinterUi::shutdown`, printer removal and connection edits. Before a connection edit or removal with active transfers, the UI asks for confirmation.
 - App close with transfers running: confirm through `ViewportCommand::CancelClose`; on confirmation call `stop()` and exit without waiting. `.part` files left behind are deleted at the next start.
 
@@ -955,7 +967,7 @@ impl MjpegPlayer {
 | `src/files.rs` | Reduced to `JobBundle` and the slice_info/model_settings parsers used by `threemf.rs`; the FTP code and `JobFetch` move to `ftp.rs` / `browser.rs`. The native-tls FTPS path (`files.rs:174-179`, with `danger_*`) is deleted, not kept as a fallback (5.3). |
 | `src/tls.rs` (new) | `PrinterTls`, `PrinterCertVerifier`, `PrinterCertError`, `AnchoredConnector` / `AnchoredStream` and the per-connection records (5.3). Used by FTPS in the MVP, and by MQTT and the camera after issues #1 and #2. |
 | `src/tls/bbl_ca.rs` (new) | The embedded `BBL CA` DER, with its source and licence header (5.3). |
-| `src/config.rs` | `MODEL_PREFIXES` (`config.rs:63-71`) gains `03W`, `093`, `239`, `31B`, `22E`, `20P` and `26A`; a certificate-generation lookup for refusal wording (5.3, Models); the serial is trimmed and ASCII-uppercased on save and load; atomic `save() -> io::Result<()>` and a strict `load()` (below); `[files] cache_cap_gb`; `family()` and `storage_support()` for "not tested on this model" gating. (Prefix swap fixed in phase 0.) |
+| `src/config.rs` | `MODEL_PREFIXES` (`config.rs:63-71`) gains `03W`, `093`, `239`, `31B`, `22E`, `20P` and `26A`; a certificate-generation lookup for refusal wording (5.3, Models); the serial is trimmed and ASCII-uppercased on save and load; a `Store` with a strict `load()` and an atomic `save() -> io::Result<()>` that writes nothing after a failed load (below); `[files] cache_cap_gb`; `family()` and `storage_support()` for "not tested on this model" gating. (Prefix swap fixed in phase 0.) |
 | `src/ui/panel.rs` | `PanelAction::OpenFiles`; a `FILES` `clickable_card` after MAINTENANCE (`panel.rs:542-563`). |
 | `src/ui/files_view.rs` (new) | The view (section 6). |
 | `src/ui/dialogs.rs` | The edit-printer dialog stores the serial normalised and shows a failed save instead of ignoring it. |
@@ -964,14 +976,14 @@ impl MjpegPlayer {
 | `README.md` | One disclaimer line for the embedded `BBL CA` certificate; Security notes rewritten per path when the verifier lands (10.4). |
 | `clippy.toml`, `.github/workflows/ci.yml` (new) | Provider guard, `danger_*` grep on the FTPS code, dependency-tree checks and tests (5.3, 10.4). |
 
-**`config::save` and `config::load`** (`src/config.rs`). Today `save` ignores write errors with `let _ =` (`config.rs:59`), and `load` treats an unreadable or unparsable file like a missing one (`config.rs:38-55`).
-- `save(cfg) -> io::Result<()>`:
+**`config::Store`** (`src/config.rs`). Before the MVP, `save` ignored write errors with `let _ =` (`config.rs:59`), and `load` treated an unreadable or unparsable file like a missing one (`config.rs:38-55`).
+- `Store::save(cfg) -> io::Result<()>`:
   - serialise, then write a uniquely named temp file in the same directory (`config.toml.<pid>.<counter>.tmp`) with `write_all` + `sync_all`;
   - `std::fs::rename` it over `config.toml`, which replaces the target on Windows;
   - on error, remove the temp file;
   - no `let _ =`: every caller shows the error.
 - Why: the file holds every printer's access code, so a torn write or a silently failed save is not acceptable.
-- `load()`: `NotFound` gives defaults (a real first start). Any other read or parse error keeps the file untouched, shows the error and blocks every config write until the user acts. The file is never overwritten with defaults.
+- `Store::load()`: `NotFound` gives defaults (a real first start). Any other read or parse error keeps the file untouched and is shown, and it blocks the store: every later `save` returns Err without touching the file, whoever calls it, until the app starts with a readable file. The file is never overwritten with defaults. The rule lives in `config`, not in its callers (stage 1b).
 - The serial is trimmed and ASCII-uppercased on save and load; that is the value the verifier compares with the certificate CN (5.3).
 - Tests: T26.
 
@@ -995,7 +1007,7 @@ impl MjpegPlayer {
 | Session lost mid-download | EOF, reset or decrypt error after a completed handshake, with no error recorded for that connection | "download interrupted" + Retry (restarts at 0) |
 | Truncated | bytes ≠ SIZE | same as above; `.part` deleted |
 | Disk full | free-space check, or write error | "not enough disk space: needs X, Y free" |
-| Config not saved or unreadable | `config::save` returned Err; `config.toml` unreadable at start | "settings couldn't be saved" / "config.toml can't be read; nothing is written until it is fixed" |
+| Config not saved or unreadable | `Store::save` returned Err; `config.toml` unreadable at start | "settings couldn't be saved" / "config.toml can't be read; nothing is written until it is fixed" |
 | Not playable | `sniff` ≠ AviMjpeg | "can't play this format in the app" + Open in player |
 | Mid-print | `gcode_state` RUNNING/PAUSE | hint "printing: transfers share the printer's Wi-Fi"; one download at a time |
 
@@ -1277,7 +1289,7 @@ Blocking:
 
 Also required in the same pass (secondary items):
 - Session store far above 8 entries (64), with `handshake_kind() == Resumed` and `protocol_version() == TLSv1_2` asserted: 5.3; T22.
-- `config_for_new_session` defined: a new `ClientConfig` per FTP session, with the same `Arc` verifier and the printer's resumption store: 5.3; T21.
+- `config_for_new_session` defined: a new `ClientConfig` per FTP session, with the same `Arc` verifier and a resumption store of its own (one per printer until stage 1b): 5.3; T21.
 - Atomic `config::save` without `let _ =` (the file holds access codes), and a `load()` that never overwrites an unreadable file: 5.9; T26.
 - The earlier secondary item "the trust action is never the default" is superseded, because no trust action exists: 5.3, Refusal card; T25.
 - MQTT and camera verification tracked as real work: issues #1 and #2 (10.5).
@@ -1295,8 +1307,8 @@ Step 0 (diagnosis check): done. X.509 v1 is confirmed on all three printers (sec
 
 | Area | Files | Effort |
 |---|---|---|
-| FTPS session: `TimedConnector`, timeouts, NAT workaround, server profiles, LIST parser + printer year + scrubbed-corpus tests, error enum and mapping, family gating | new `src/ftp.rs`; `src/config.rs` | 2.5-3 d |
-| Worker: session budget, lanes, priorities, generations, prefetch limits, cancel via socket shutdown, JobBundle replacing JobFetch, lifecycle on edit/remove/exit, single-instance guard | new `src/browser.rs`; `src/files.rs`, `src/main.rs` | 4-5 d |
+| FTPS session: time limits (in the anchored connector), NAT workaround, server profiles, LIST parser + printer year + scrubbed-corpus tests, error enum and mapping, family gating | new `src/ftp.rs`; `src/config.rs` | 2.5-3 d |
+| Worker: session budget, lanes, priorities, generations, prefetch limits, cancel via the session flag, JobBundle replacing JobFetcher, lifecycle on edit/remove/exit, single-instance guard | new `src/browser.rs`; `src/files.rs`, `src/main.rs` | 4-5 d |
 | Cache and storage: locations, 5 GB LRU cap, open-file protection, Clear cache, Save to PC, sanitising, free-space check | new `src/cache.rs` | 1-1.5 d |
 | 3mf inspection (plate N) + plain `.gcode` header read | new `src/threemf.rs`, `src/gcode.rs` | 1.5 d |
 | Files view: Timelapses / Recordings / Print files tabs, Other folders, companion grouping, grid + list via `show_rows`, month grouping, filter/sort, detail pane, skeleton/empty/error states, transfer bar, chip badge, FILES card, View routing, close confirmation, player chrome | new `src/ui/files_view.rs`; `src/ui/mod.rs`, `src/ui/panel.rs`, `src/main.rs` | 6-7 d |
@@ -1304,7 +1316,7 @@ Step 0 (diagnosis check): done. X.509 v1 is confirmed on all three printers (sec
 | Live validation and tests: truncated AVI/zip fuzz-style tests, corpus scrubbing, QA on the three printers and their failure states (damaged card, offline, printing, certificate refusal, a model refused by name; no Full data connection in a healthy session) | tests | 2-3 d |
 | **Subtotal** | | **about 19-24 d** |
 | TLS verifier (5.3): `PrinterCertVerifier` with the embedded anchor and its header, signatures (a) and (b), CN == serial, typed `PrinterCertError`, leaf-version log; tests T1-T16 (real-leaf tests local only) | new `src/tls.rs`, new `src/tls/bbl_ca.rs` | 1.5 d |
-| TLS connections (5.3): `AnchoredConnector` / `AnchoredStream` with per-connection records, `FtpError` mapping, `config_for_new_session` with the printer's resumption store, handshake-kind and protocol-version checks; tests T17-T22 | `src/tls.rs`, `src/ftp.rs` | 1 d |
+| TLS connections (5.3): `AnchoredConnector` / `AnchoredStream` with per-connection records, `FtpError` mapping, `config_for_new_session` with a store per session, handshake-kind and protocol-version checks; tests T17-T22 and T27 | `src/tls.rs`, `src/ftp.rs` | 1 d |
 | TLS build and CI (5.3): delete the FTPS native-tls path; final `Cargo.toml` lines and comments (suppaftp without `native-tls`, `rumqttc` without default features, the `tls12` comment, `native-tls` only for MQTT and camera); `clippy.toml`; CI workflow with clippy, tests, the provider grep, the `danger_*` grep on FTPS code and the `cargo tree` checks; T23-T24 | `src/files.rs`, `Cargo.toml`, new `clippy.toml`, new `.github/workflows/ci.yml` | 0.5 d |
 | TLS user-facing (5.3): refusal card, model messages, `MODEL_PREFIXES` + 7 prefixes and the certificate-generation lookup, serial normalisation, atomic `config::save` and strict `load`, README disclaimer line and per-path Security notes; T25-T26 | `src/ui/files_view.rs`, `src/config.rs`, `src/ui/dialogs.rs`, `README.md` | 0.5-1 d |
 | **Total** | | **about 23-28 d** |
@@ -1478,14 +1490,14 @@ Before the `rumqttc` change, the lock compiled both ring and aws-lc-rs, and `Cli
 - Both verifier spikes called rustls' signature helper first and sent its v1 error to the ring check, with a direct rustls-webpki dependency for the downcast. The MVP has one ring path and no direct rustls-webpki dependency (5.3).
 - Serial characters in messages: the resumption spike showed the last characters of the serial, and the anchor spike showed a masked CN (first 3 and last 4 characters). The MVP shows neither.
 - The resumption spike ran on rustls 0.23.45 / rustls-webpki 0.103.15. The 5.3 tests must pass on the app's lock.
-- The spikes measured one session at a time; concurrent lanes sharing one printer's resumption store were not measured.
+- The spikes measured one session at a time; concurrent lanes sharing one printer's resumption store were not measured. In-process tests later showed overlapping sessions overwriting each other's TLS 1.2 session in a shared store (stage 1b review, P3), so each session now has its own store (5.3).
 - The anchor spike's unit tests use the owner's real leaves directly. In the repository those tests are local only (5.3, fixtures).
 
 **Claims not used as justification**
 - "X1 and H2 printers run vsftpd and require data-channel session reuse (`522` without it)" is unverified third-party information. The checkable half of the same sources is false for this fleet: the P1S runs `BBL-P003`, not vsftpd, and native-tls completed 70 of 70 full handshakes on it without a failure. There is no X1 or H2 hardware and no captured `522`. The claim is kept only as input for the X1/H2 work (10.7), not as a reason for rustls or for urgency.
 - The 100-file figures above are estimates.
 
-**Decision (G2, owner, 2026-09-15):** approved with conditions, then CA anchoring adopted and approved (10.3). The MVP uses rustls (ring provider, TLS 1.2 only) with the printer's resumption store and a verifier anchored on `BBL CA` and bound to the serial, as specified in 5.3.
+**Decision (G2, owner, 2026-09-15):** approved with conditions, then CA anchoring adopted and approved (10.3). The MVP uses rustls (ring provider, TLS 1.2 only) with a resumption store per FTP session and a verifier anchored on `BBL CA` and bound to the serial, as specified in 5.3.
 - **Justification: performance.** The gain is for many small files inside one open session; bulk downloads and connect + login do not improve.
 - **Security:** FTPS gets real verification. LAN credential theft stays open until issues #1 and #2 land.
 - **Plan B** (native-tls with pinning) is not an equivalent fallback, because its signature-check assumption was never tested. If rustls were blocked, the app would keep today's behaviour and say so.
@@ -1498,8 +1510,8 @@ Before the `rumqttc` change, the lock compiled both ring and aws-lc-rs, and `Cli
 | Risk | Evidence | Mitigation |
 |---|---|---|
 | App sessions block Studio's uploads or hit the session ceiling | ceiling unknown (≥3 on P1S; a 4th/5th stalled in one test); Studio's Send uploads over the same service | 1 session by default, 2nd only for user downloads, 12 s idle QUIT, single-instance guard, gate G4 |
-| Stalled handshake hangs a thread or leaks a session slot | one P1S handshake stalled >15 s; suppaftp's implicit connect has no timeout | `TimedConnector` sets socket timeouts before the handshake; TCP pre-check; no helper threads; one retry then stop |
-| rustls resumption stops working (firmware change, config regression) | resumed on every rustls data connection on all three printers (P1S: 7 full, 64 resumed; 148-byte ticket on the wire) | The printer's resumption store with N = 64; `handshake_kind()` and `protocol_version()` checks and T22 (5.3); keep one session open while a grid loads |
+| Stalled handshake hangs a thread or leaks a session slot | one P1S handshake stalled >15 s; suppaftp's implicit connect has no timeout | The anchored connector bounds every read and write from before the handshake, and each handshake to 2 IO timeouts (5.2); TCP pre-check; no helper threads; one retry then stop |
+| rustls resumption stops working (firmware change, config regression) | resumed on every rustls data connection on all three printers (P1S: 7 full, 64 resumed; 148-byte ticket on the wire) | Each session's resumption store with N = 64; `handshake_kind()` and `protocol_version()` checks and T22 (5.3); keep one session open while a grid loads |
 | The verifier accepts an impostor | the leaf is public (sent in every handshake); `BBL CA` issues every legacy printer's leaf and also signed certificates that are not leaves | Two signatures, both required (the anchor's key over the TBS, the leaf's key over the handshake); CN == configured serial as a hard check after the anchor signature; nothing learned from connections; T4-T15 (5.3). Residual: the printer's own private key or the `BBL CA` key; no revocation exists for this CA |
 | A legitimate printer is refused | `BBL CA` expires 2032-04-01 and the leaves in 2035; firmware could move a model to `BBL CA2`; whether a board replacement keeps the serial was not verified | Expiry not checked, as a requirement (T8); the refusal card lists the causes and offers Edit printer; a board that keeps its serial passes; a new anchor ships in an app release if a model moves to another authority |
 | Access code stolen through the camera or MQTT | `camera.rs:49-51`, `:82-83` and `mqtt.rs:45-53` accept any certificate and send the access code; the MVP does not change them | Not closed by the MVP. Issues #1 and #2 (10.5): same verifier, same certificate |
@@ -1537,7 +1549,7 @@ Before the `rumqttc` change, the lock compiled both ring and aws-lc-rs, and `Cli
    - Until `03W` is added, the "Bambu Lab X1E" arms in `firmware.rs:29` and `:41` can never match.
    - Not scheduled: using `info.get_version` `product_name` or SSDP `DevModel` as a more reliable source for the model name (display only; the serial for the certificate check always comes from the user, 5.3).
 2. **`files.rs` hard-codes `plate_1.png` and `plate_1.json`**: plate-N jobs show the wrong plate image and lose bounding boxes (seen on A1 #1's plate-2 job). **Fixed (`47d015f`, `25f313b`).**
-3. **`files.rs` has no connect or read timeouts, JobFetch has no cancel**, a superseded fetch keeps downloading, `JobBundle.error` is never shown and failed fetches are never retried. **Absorbed by the MVP worker** (no separate fix).
+3. **`files.rs` has no connect or read timeouts, JobFetch has no cancel**, a superseded fetch keeps downloading, `JobBundle.error` is never shown and failed fetches are never retried. **Absorbed by the MVP worker** (no separate fix). Stage 1b already bounds every FTPS read, write and handshake, and `JobFetcher` cancels a superseded fetch and starts the next one only after it has ended (section 4 rule 3).
 4. **The fuzzy 3mf match in `files.rs:147-158` can pick the wrong file**: an empty stem matches every job, and a shorter unrelated stem can win. **Fixed (`820ed12`, `dfe5597`, `56bb586`, `90ba8c0`).**
 5. **The FTPS stack never resumes TLS sessions**: ~0.65 s extra per data command on A1/P1. The spike showed rustls resumes inside a session (section 11), and the MVP moves to it. Third-party reports of `522` on vsftpd printers are unverified.
 6. **suppaftp quirks:** `pwd()` fails on `257 /`; `File::from_str` never fails (garbage lines become entries); a failing data command costs a full TLS handshake; LIST lines are decoded lossily (invalid UTF-8 becomes U+FFFD).
@@ -1621,4 +1633,4 @@ All live work was read-only and used at most 2-3 sockets per printer. No secrets
   - Third-party certificate chains, verified with `openssl verify -partial_chain` against those files: ha-bambulab issues #1596 and #1705, Bambuddy issues #1638 and #2780, bambino issue #142.
 
 **A.5 Not verified anywhere**
-A1 timelapse video format; A1 mini and P1P behaviour; the per-printer session ceiling; Studio uploads while the app holds sessions (G4); two concurrent sessions sharing one printer's resumption store; Schannel's handshake-signature check with certificate validation disabled (plan B); the X1/H2 session-reuse requirement; the certificate generation of H2D, H2S, H2D Pro, A2L, X1, X1E, A1 mini and P1P; whether a replaced board keeps its serial with a new `BBL CA` leaf; how hard key extraction from a printer is; DELE; AVBL/STAT; `project_file` URL scheme; port-6000 framing; X1/H2/P2S FTPS behaviour; effect of transfers on print quality.
+A1 timelapse video format; A1 mini and P1P behaviour; the per-printer session ceiling; Studio uploads while the app holds sessions (G4); two concurrent sessions of one printer on the real printers (each with its own resumption store since stage 1b); Schannel's handshake-signature check with certificate validation disabled (plan B); the X1/H2 session-reuse requirement; the certificate generation of H2D, H2S, H2D Pro, A2L, X1, X1E, A1 mini and P1P; whether a replaced board keeps its serial with a new `BBL CA` leaf; how hard key extraction from a printer is; DELE; AVBL/STAT; `project_file` URL scheme; port-6000 framing; X1/H2/P2S FTPS behaviour; effect of transfers on print quality.
