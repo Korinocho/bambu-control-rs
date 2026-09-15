@@ -154,14 +154,19 @@ pub fn jog_wheel(ui: &mut Ui) -> Option<JogAction> {
 }
 
 // ----------------------------------------------------------- plate map
-/// Objects that have a box, with their position in the skip list, so the
-/// map numbers them like the list even when some objects have no box.
+/// Objects that have a box, with their position in the skip list (the map
+/// numbers them like the list), largest box first: a small object inside a
+/// bigger object's box is then drawn on top and gets the pointer.
 fn boxed_objects<'a>(objects: &'a [(i64, String)],
                      bboxes: &HashMap<i64, [f32; 4]>)
                      -> Vec<(usize, &'a (i64, String))> {
-    objects.iter().enumerate()
+    let area = |id: &i64| bboxes.get(id)
+        .map_or(0.0, |b| (b[2] - b[0]) * (b[3] - b[1]));
+    let mut boxed: Vec<_> = objects.iter().enumerate()
         .filter(|(_, (i, _))| bboxes.contains_key(i))
-        .collect()
+        .collect();
+    boxed.sort_by(|(_, (a, _)), (_, (b, _))| area(b).total_cmp(&area(a)));
+    boxed
 }
 
 /// Top-down plate view from per-object bounding boxes. Click toggles
@@ -271,5 +276,16 @@ mod tests {
         assert_eq!(boxed.len(), 1);
         assert_eq!(boxed[0].0 + 1, 3);
         assert_eq!(boxed[0].1.0, 95);
+    }
+
+    #[test]
+    fn small_objects_inside_bigger_boxes_are_drawn_last() {
+        // a peg standing in a ring's hole, listed first
+        let objects = vec![(1, "peg".to_string()), (2, "ring".to_string())];
+        let bboxes = HashMap::from([(1, [115.0, 120.0, 135.0, 141.0]),
+                                    (2, [75.0, 80.0, 175.0, 181.0])]);
+        let order: Vec<(usize, i64)> = boxed_objects(&objects, &bboxes)
+            .iter().map(|(index, (id, _))| (*index, *id)).collect();
+        assert_eq!(order, vec![(1, 2), (0, 1)]);
     }
 }
