@@ -67,8 +67,8 @@ pub fn save(cfg: &Config) {
 pub const MODEL_PREFIXES: &[(&str, &str)] = &[
     ("039", "Bambu Lab A1"),
     ("030", "Bambu Lab A1 mini"),
-    ("01S", "Bambu Lab P1S"),
-    ("01P", "Bambu Lab P1P"),
+    ("01P", "Bambu Lab P1S"),
+    ("01S", "Bambu Lab P1P"),
     ("00M", "Bambu Lab X1 Carbon"),
     ("00W", "Bambu Lab X1"),
     ("094", "Bambu Lab H2D"),
@@ -82,4 +82,28 @@ pub fn model_from_serial(serial: &str) -> String {
         }
     }
     format!("Unknown ({prefix})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_from_serial;
+
+    #[test]
+    fn p1_prefixes_match_bambu_serials() {
+        // Bambu wiki: P1S serials start with 01P, P1P serials with 01S
+        assert_eq!(model_from_serial("01P00A000000000"), "Bambu Lab P1S");
+        assert_eq!(model_from_serial("01S00A000000000"), "Bambu Lab P1P");
+    }
+
+    #[test]
+    fn prefix_lookup_is_case_insensitive() {
+        assert_eq!(model_from_serial("01p00a000000000"), "Bambu Lab P1S");
+        assert_eq!(model_from_serial("039xx"), "Bambu Lab A1");
+    }
+
+    #[test]
+    fn unknown_prefix_is_reported() {
+        assert_eq!(model_from_serial("ZZZ123"), "Unknown (ZZZ)");
+        assert_eq!(model_from_serial(""), "Unknown ()");
+    }
 }
