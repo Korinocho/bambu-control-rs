@@ -16,7 +16,8 @@ pub struct JobBundle {
     pub plate_png: Option<Vec<u8>>,
     /// (identify_id, label)
     pub objects: Vec<(i64, String)>,
-    /// id -> [x1, y1, x2, y2] in mm
+    /// id -> [x1, y1, x2, y2], y up, on a 256-unit bed (mm on 256 mm beds):
+    /// from the pick image, else plate json first-layer footprints
     pub bboxes: HashMap<i64, [f32; 4]>,
     pub skipped: HashSet<i64>,
     pub label_objects: bool,
@@ -108,11 +109,17 @@ fn xml_unescape(s: &str) -> String {
                 "gt" => Some('>'),
                 name => name.strip_prefix("#x")
                     .or_else(|| name.strip_prefix("#X"))
-                    .map(|hex| u32::from_str_radix(hex, 16).ok())
-                    .unwrap_or_else(|| {
-                        name.strip_prefix('#').and_then(|d| d.parse().ok())
+                    .map(|hex| {
+                        let digits = hex.bytes().all(|b| b.is_ascii_hexdigit());
+                        u32::from_str_radix(hex, 16).ok().filter(|_| digits)
                     })
-                    .and_then(char::from_u32),
+                    .unwrap_or_else(|| {
+                        name.strip_prefix('#')
+                            .filter(|d| d.bytes().all(|b| b.is_ascii_digit()))
+                            .and_then(|d| d.parse().ok())
+                    })
+                    .and_then(char::from_u32)
+                    .filter(|c| *c != '\0'),
             };
             c.map(|c| (c, end))
         });
@@ -131,15 +138,21 @@ fn xml_unescape(s: &str) -> String {
     out
 }
 
-/// Copies share a name: "part", "part" -> "part", "part #2".
+/// Copies share a name: "part", "part" -> "part", "part #2", skipping any
+/// label another object already has.
 fn label_copies(objects: &mut [(i64, String)]) {
-    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut taken: HashSet<String> =
+        objects.iter().map(|(_, name)| name.clone()).collect();
+    let mut seen: HashSet<String> = HashSet::new();
     for (_, name) in objects.iter_mut() {
-        let n = counts.entry(name.clone()).or_insert(0);
-        *n += 1;
-        if *n > 1 {
-            *name = format!("{name} #{n}");
+        if seen.insert(name.clone()) {
+            continue;
         }
+        let label = (2u32..).map(|k| format!("{name} #{k}"))
+            .find(|label| !taken.contains(label))
+            .unwrap_or_else(|| name.clone());
+        taken.insert(label.clone());
+        *name = label;
     }
 }
 
@@ -239,17 +252,29 @@ fn truncated_prefix(stem: &str) -> Option<&str> {
     if long { stem.strip_suffix("...") } else { None }
 }
 
-/// Studio's upload-name sanitising: spaces and <>[]:/\|?*" become '_',
-/// runs of '_' collapse.
-fn sanitised(stem: &str) -> String {
-    let mut out = String::with_capacity(stem.len());
-    for c in stem.chars() {
-        let c = if c == ' ' || "<>[]:/\\|?*\"".contains(c) { '_' } else { c };
+/// Characters Studio keeps out of upload names; the cards show them as '_'.
+const ILLEGAL_NAME_CHARS: &str = "<>:/\\|?*\"";
+
+/// A job name as the card stores it: illegal characters become '_'.
+fn card_form(name: &str) -> String {
+    name.chars()
+        .map(|c| if ILLEGAL_NAME_CHARS.contains(c) { '_' } else { c })
+        .collect()
+}
+
+/// Studio's form of a MakerWorld title: spaces, [ ] and illegal characters
+/// become '_', runs of '_' collapse; a trailing '_' is dropped.
+fn maker_form(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        let mapped = c == ' ' || c == '[' || c == ']'
+            || ILLEGAL_NAME_CHARS.contains(c);
+        let c = if mapped { '_' } else { c };
         if !(c == '_' && out.ends_with('_')) {
             out.push(c);
         }
     }
-    out
+    out.trim_end_matches('_').to_string()
 }
 
 /// Picks the job's 3mf: the file gcode_file names, else the one named like
@@ -283,18 +308,24 @@ fn pick_3mf(candidates: &[String], job_name: &str, file_name: &str,
     {
         return None;
     }
-    let job_sanitised = sanitised(&job);
-    // rank 0: same stem, 1: same once sanitised, 2: shortened name; equal
-    // ranks keep the folder order above
+    let job_card = card_form(&job);
+    let job_maker = maker_form(&job);
+    // rank 0: same stem; 1: the job as the card or a MakerWorld title stores
+    // it (one way only: Studio never turns '_' into a space); 2: a shortened
+    // name; equal ranks keep the folder order above
     let rank = |path: &&String| -> Option<u8> {
         let stem = name_stem(&file_basename(path));
+        let card = stem == job_card && job_card.chars().any(|c| c != '_');
+        let maker = !job_maker.is_empty() && !stem.contains(' ')
+            && !stem.contains("__") && stem.trim_end_matches('_') == job_maker;
         if stem.is_empty() {
             None
         } else if stem == job {
             Some(0)
-        } else if sanitised(&stem) == job_sanitised {
+        } else if card || maker {
             Some(1)
-        } else if truncated_prefix(&stem).is_some_and(|p| job.starts_with(p))
+        } else if truncated_prefix(&stem)
+            .is_some_and(|p| job.starts_with(p) || job_card.starts_with(p))
         {
             Some(2)
         } else {
@@ -379,10 +410,11 @@ fn plate_block(xml: &str, plate: Option<u32>) -> Option<&str> {
     }
 }
 
-/// Object boxes from Metadata/pick_N.png, where Studio renders the bed
-/// top-down with each object filled in its identify_id as the colour
-/// (R | G << 8 | B << 16). Pixel boxes are scaled to a 256-unit bed, y up
-/// (matches plate json boxes on the owner's A1 and P1S jobs).
+/// Object boxes from Metadata/pick_N.png, where Studio renders the whole
+/// bed top-down with each object filled in its identify_id as the colour
+/// (R | G << 8 | B << 16). Pixel boxes are scaled to a 256-unit bed, y up:
+/// millimetres on 256 mm beds (within 0.5 mm of the plate json on the
+/// owner's jobs), not on the A1 mini or H2 beds.
 fn pick_bboxes(png: &[u8], ids: &HashSet<i64>) -> HashMap<i64, [f32; 4]> {
     let Ok(img) =
         image::load_from_memory_with_format(png, image::ImageFormat::Png)
@@ -782,9 +814,9 @@ mod tests {
     }
 
     #[test]
-    fn root_upload_beats_cache_copy_without_gcode_file() {
-        // gcode_file is empty once a print ends; on the owner's cards the
-        // root upload was the newer copy in every such pair
+    fn local_jobs_prefer_the_root_upload() {
+        // non-cloud print types look in the root first: LAN uploads land
+        // there, and on the owner's cards the root copy was the newer one
         let found = pick(&["/cache/(Unsaved).3mf", "/(Unsaved).gcode.3mf"],
                          "(Unsaved)", "");
         assert_eq!(found.as_deref(), Some("/(Unsaved).gcode.3mf"));
@@ -1071,7 +1103,8 @@ mod tests {
              r#"{"bbox_objects":[{"id":20,"name":"part","bbox":[1,1,2,2]},
                 {"id":21,"name":"part","bbox":[3,3,4,4]}]}"#),
             (&[(1, 11, "part")],
-             r#"{"bbox_objects":[{"id":20,"name":"part","bbox":[1,2,3,4,5]}]}"#),
+             r#"{"bbox_objects":[
+                {"id":20,"name":"part","bbox":[1,2,3,4,5]}]}"#),
         ];
         for (objects, json) in cases {
             let info = slice_info(objects);
@@ -1118,5 +1151,53 @@ mod tests {
             ("Metadata/slice_info.config", info.as_bytes()),
         ]);
         assert!(read_3mf(data, None).unwrap().objects.is_empty());
+    }
+
+    #[test]
+    fn card_and_maker_forms_match_one_way_only() {
+        // '|' is stored as '_' with the spaces kept
+        let file = concat!("/cache/FAN GRILL V2 _ 0.2mm layer _ ",
+                           "4 walls _ 17% infill.3mf");
+        let found = pick_typed(&[file],
+            "FAN GRILL V2 | 0.2mm layer | 4 walls | 17% infill", "", "cloud");
+        assert_eq!(found.as_deref(), Some(file));
+        // a MakerWorld title ending in a space keeps a trailing '_'
+        let file = "/Playing_Cards_-_Minimal_.gcode.3mf";
+        assert_eq!(pick(&[file], "Playing Cards - Minimal ", "").as_deref(),
+                   Some(file));
+        // Studio never turns '_' into a space
+        assert_eq!(pick(&["/Part A.gcode.3mf"], "Part_A", ""), None);
+        // symbols alone or doubled '_' are no Studio output
+        assert_eq!(pick(&["/cache/_.3mf"], "?", ""), None);
+        assert_eq!(pick(&["/cache/a__b.3mf"], "a b", ""), None);
+    }
+
+    #[test]
+    fn shortened_card_form_of_a_long_title_matches() {
+        let job = "Big Fan Grill | 0.2mm layer | 4 walls | 17% infill | \
+                   lid, base, clips and a spare set of feet for the stand";
+        let file = format!("/cache/{}.3mf", shortened(&super::card_form(job)));
+        assert_eq!(pick_typed(&[file.as_str()], job, "", "cloud").as_deref(),
+                   Some(file.as_str()));
+    }
+
+    #[test]
+    fn copy_labels_never_repeat() {
+        let info = slice_info(&[(1, 11, "part"), (1, 12, "part"),
+                                (1, 13, "part #2")]);
+        let data = make_3mf(&[
+            ("Metadata/plate_1.gcode", b"; gcode"),
+            ("Metadata/slice_info.config", info.as_bytes()),
+        ]);
+        let labels: Vec<String> = read_3mf(data, None).unwrap().objects
+            .into_iter().map(|(_, label)| label).collect();
+        assert_eq!(labels, ["part", "part #3", "part #2"]);
+    }
+
+    #[test]
+    fn numeric_references_must_be_plain_digits() {
+        assert_eq!(super::xml_unescape("a&#+65;b"), "a&#+65;b");
+        assert_eq!(super::xml_unescape("&#x+41;"), "&#x+41;");
+        assert_eq!(super::xml_unescape("&#0;"), "&#0;");
     }
 }
