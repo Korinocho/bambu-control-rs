@@ -181,10 +181,10 @@ fn truncated_prefix(stem: &str) -> Option<&str> {
 /// Picks the job's 3mf among `candidates` (full paths, /cache first).
 /// Exact names go first, most trusted first: the gcode_file the printer
 /// reports, the .3mf derived from it, then the job name. The fallback only
-/// accepts the same stem (also for a `<job>_plate_N` job name) or a name
-/// the slicer truncated with "...". A wrong file would show another print
-/// and send skip commands for the wrong objects, so a loose match is no
-/// match.
+/// accepts the same stem or a name the slicer truncated with "...". A job
+/// 3mf holds a single plate, so `X.3mf` is never taken for an `X_plate_2`
+/// job: that is another upload. A wrong file would show another print and
+/// send skip commands for the wrong objects, so a loose match is no match.
 fn pick_3mf(candidates: &[String], job_name: &str,
             file_name: &str) -> Option<String> {
     let fname = file_basename(file_name);
@@ -213,9 +213,6 @@ fn pick_3mf(candidates: &[String], job_name: &str,
     if job.is_empty() {
         return None;
     }
-    let job_base = Regex::new(r"^(.+)_plate_\d+$").unwrap()
-        .captures(&job)
-        .map(|c| c.get(1).unwrap().as_str().to_string());
     // (rank, matched length, path): rank 0 = same stem, 1 = truncated name;
     // within a rank the longer match is the more specific one
     let mut hits: Vec<(u8, usize, &String)> = Vec::new();
@@ -224,12 +221,11 @@ fn pick_3mf(candidates: &[String], job_name: &str,
         if stem.is_empty() {
             continue;
         }
-        if stem == job || job_base.as_deref() == Some(stem.as_str()) {
+        if stem == job {
             hits.push((0, stem.len(), path));
         } else if let Some(prefix) = truncated_prefix(&stem)
             && prefix.chars().count() >= MIN_TRUNCATED_PREFIX
-            && (job.starts_with(prefix)
-                || job_base.as_deref().is_some_and(|b| b.starts_with(prefix)))
+            && job.starts_with(prefix)
         {
             hits.push((1, prefix.len(), path));
         }
@@ -516,9 +512,16 @@ mod tests {
     }
 
     #[test]
-    fn plate_suffixed_job_matches_its_project() {
-        let found = pick(&["/cache/hole_cap.3mf"], "hole_cap_plate_3", "");
-        assert_eq!(found.as_deref(), Some("/cache/hole_cap.3mf"));
+    fn plate_job_never_takes_the_base_project() {
+        // a 3mf holds one plate: X.gcode.3mf is another upload than the
+        // X_plate_2 job (seen on the P1S with the plate_2 file deleted)
+        assert_eq!(pick(&["/Fidget+Cube+Toy-Sofi.gcode.3mf"],
+                        "Fidget+Cube+Toy-Sofi_plate_2", ""), None);
+        let found = pick(&["/Fidget+Cube+Toy-Sofi.gcode.3mf",
+                           "/Fidget+Cube+Toy-Sofi_plate_2.gcode.3mf"],
+                         "Fidget+Cube+Toy-Sofi_plate_2", "");
+        assert_eq!(found.as_deref(),
+                   Some("/Fidget+Cube+Toy-Sofi_plate_2.gcode.3mf"));
     }
 
     #[test]
