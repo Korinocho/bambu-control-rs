@@ -11,10 +11,10 @@ mod firmware;
 mod hms;
 mod mqtt;
 mod theme;
+mod tls;
 mod ui;
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -31,7 +31,10 @@ struct PrinterUi {
     cam_texture: Option<egui::TextureHandle>,
     fw_latest_slot: Arc<Mutex<Option<String>>>,
     fw_latest: String,
-    job_fetch: Option<Arc<files::JobFetch>>,
+    /// FTPS endpoint + certificate verifier, rebuilt with this printer
+    ftps: files::FtpsPrinter,
+    /// job fetches: one FTPS session at a time (design doc 4, rule 3)
+    jobs: files::JobFetcher,
     job_bundle: Option<files::JobBundle>,
     plate_texture: Option<egui::TextureHandle>,
     current_job: String,
@@ -45,6 +48,7 @@ impl PrinterUi {
         let fw_latest_slot = Arc::new(Mutex::new(None));
         firmware::spawn_check(model_from_serial(&cfg.serial), false,
                               fw_latest_slot.clone(), ctx.clone());
+        let ftps = files::FtpsPrinter::new(&cfg);
         Self {
             cfg,
             client,
@@ -52,7 +56,8 @@ impl PrinterUi {
             cam_texture: None,
             fw_latest_slot,
             fw_latest: String::new(),
-            job_fetch: None,
+            ftps,
+            jobs: files::JobFetcher::default(),
             job_bundle: None,
             plate_texture: None,
             current_job: String::new(),
@@ -71,11 +76,14 @@ impl PrinterUi {
         }
     }
 
+    /// Stops everything without waiting: a running job fetch is cancelled
+    /// and its thread ends on its own.
     fn shutdown(&mut self) {
         if let Some(cam) = self.camera.take() {
             cam.stop();
         }
         self.client.stop();
+        self.jobs.cancel();
     }
 
     /// Per-frame sync of async results into UI state.
@@ -95,9 +103,7 @@ impl PrinterUi {
                 }
             }
         }
-        let fetched = self.job_fetch.as_ref()
-            .and_then(|f| f.result.lock().unwrap().take());
-        if let Some(bundle) = fetched {
+        if let Some(bundle) = self.jobs.poll(&self.ftps, ctx) {
             if let Some(png) = &bundle.plate_png
                 && let Ok(img) = image::load_from_memory(png)
             {
@@ -110,7 +116,6 @@ impl PrinterUi {
                     Default::default()));
             }
             self.job_bundle = Some(bundle);
-            self.job_fetch = None;
         }
 
         // auto-fetch job data when a new print shows up
@@ -130,11 +135,12 @@ impl PrinterUi {
             self.current_job = job.clone();
             self.job_bundle = None;
             self.plate_texture = None;
-            self.job_fetch = Some(files::JobFetch::spawn(
-                self.cfg.ip.clone(), self.cfg.access_code.clone(), job,
+            // a fetch still running for the previous job name is cancelled,
+            // and this one starts once its thread has ended
+            self.jobs.request(
+                &self.ftps, job,
                 panel::s_str(&state, "gcode_file").to_string(),
-                panel::s_str(&state, "print_type").to_string(),
-                ctx.clone()));
+                panel::s_str(&state, "print_type").to_string(), ctx);
         }
     }
 }
@@ -457,8 +463,13 @@ impl App {
                                 || new_cfg.access_code != old.access_code;
                             if conn_changed {
                                 self.printers[index].shutdown();
+                                // the cancelled fetch counts as the printer's
+                                // session until its thread has ended
+                                let jobs = std::mem::take(
+                                    &mut self.printers[index].jobs);
                                 self.printers[index] =
                                     PrinterUi::new(new_cfg, ctx);
+                                self.printers[index].jobs = jobs;
                                 if index == self.selected {
                                     self.printers[index]
                                         .set_active(true, ctx);
@@ -800,8 +811,7 @@ impl eframe::App for App {
                         .map(|c| c.status.lock().unwrap().clone())
                         .unwrap_or_else(|| "camera paused".into()),
                     plate_texture: printer.plate_texture.as_ref(),
-                    fetch_progress: printer.job_fetch.as_ref()
-                        .map(|f| f.progress.load(Ordering::Relaxed)),
+                    fetch_progress: printer.jobs.progress(),
                     object_count: printer.job_bundle.as_ref()
                         .map(|b| b.objects.len()).unwrap_or(0),
                     fw_current: panel::ota_version(&device_info),

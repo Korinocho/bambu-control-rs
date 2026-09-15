@@ -17,6 +17,8 @@ through LAN / Developer Mode, which Bambu Lab does not officially support; you u
 your own risk, including any effect on your printer or its warranty. Printer error (HMS)
 descriptions and firmware version information are fetched at runtime from Bambu Lab's
 servers, belong to Bambu Lab, and are not distributed with this project.
+The `BBL CA` certificate embedded in the app belongs to Bambu Lab, is included only to
+verify printers, and is not covered by this project's license.
 
 ## Features
 
