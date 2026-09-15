@@ -151,17 +151,27 @@ struct App {
     selected: usize,
     dialog: Dialog,
     started: bool,
+    /// config.toml; writes nothing after a failed load
+    store: config::Store,
+    /// a failed save, or an unreadable config.toml; shown above the panel
+    config_error: Option<String>,
 }
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         theme::install_fonts(ctx);
         theme::apply(ctx);
-        let cfg = config::load();
+        let (store, loaded) = config::Store::load();
+        let (cfg, migrated, config_error) = match loaded {
+            Ok(loaded) => (loaded.cfg, loaded.migrated, None),
+            Err(e) => (Config::default(), false, Some(format!(
+                "config.toml can't be read; nothing is written until it is \
+                 fixed ({e})"))),
+        };
         let printers: Vec<PrinterUi> = cfg.printers.iter()
             .map(|p| PrinterUi::new(p.clone(), ctx))
             .collect();
-        let dialog = if printers.is_empty() {
+        let dialog = if printers.is_empty() && !store.is_blocked() {
             Dialog::AddPrinter(dialogs::AddPrinterDlg {
                 draft: PrinterCfg::default(),
                 editing: None,
@@ -170,13 +180,27 @@ impl App {
         } else {
             Dialog::None
         };
-        Self { cfg, printers, selected: 0, dialog, started: false }
+        let mut app = Self {
+            cfg, printers, selected: 0, dialog, started: false, store,
+            config_error,
+        };
+        if migrated {
+            app.save_config();
+        }
+        app
     }
 
+    /// Saves atomically and shows a failure. While config.toml is unreadable
+    /// the store writes nothing, and the load error stays on screen.
     fn save_config(&mut self) {
         self.cfg.printers =
             self.printers.iter().map(|p| p.cfg.clone()).collect();
-        config::save(&self.cfg);
+        match self.store.save(&self.cfg) {
+            Ok(()) => self.config_error = None,
+            Err(_) if self.store.is_blocked() => {}
+            Err(e) => self.config_error =
+                Some(format!("settings couldn't be saved: {e}")),
+        }
     }
 
     fn select(&mut self, index: usize, ctx: &egui::Context) {
@@ -735,6 +759,9 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(theme::BG)
                 .inner_margin(10))
             .show(root, |ui| {
+                if let Some(error) = &self.config_error {
+                    ui.label(RichText::new(error).color(theme::DANGER));
+                }
                 egui::ScrollArea::vertical().auto_shrink(false)
                     .show(ui, |ui| {
                 if self.printers.is_empty() {

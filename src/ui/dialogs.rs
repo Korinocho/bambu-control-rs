@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Stroke};
 
-use crate::config::PrinterCfg;
+use crate::config::{self, PrinterCfg};
 use crate::files::JobBundle;
 use crate::firmware::is_newer;
 use crate::mqtt::PrinterClient;
@@ -119,6 +119,8 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                               &mut d.access_code] {
                     *field = field.trim().to_string();
                 }
+                // the value the FTPS certificate check compares with the CN
+                d.serial = config::normalize_serial(&d.serial);
                 if d.ip.is_empty() || d.serial.is_empty()
                     || d.access_code.is_empty()
                 {
