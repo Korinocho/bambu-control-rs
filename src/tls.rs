@@ -20,10 +20,8 @@ mod tests;
 #[cfg(test)]
 pub mod testkit;
 
-pub use connector::{AnchoredConnector, AnchoredStream, SessionConns,
-                    TlsFailure};
-#[cfg(test)]
-pub use connector::{ConnKind, ConnOutcome};
+pub use connector::{AnchoredConnector, AnchoredStream, ConnKind, ConnOutcome,
+                    SessionConns, TlsFailure};
 
 use std::fmt;
 use std::io;

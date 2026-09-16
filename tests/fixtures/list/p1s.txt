@@ -1,0 +1,616 @@
+# dir /
+drw-rw-rw-   1 root  root         0 May 22 04:52 recorder
+drw-rw-rw-   1 root  root         0 May 22 04:52 logger
+drw-rw-rw-   1 root  root         0 May 22 04:52 image
+drw-rw-rw-   1 root  root         0 May 22 04:52 ipcam
+drw-rw-rw-   1 root  root         0 May 22 04:52 timelapse
+drw-rw-rw-   1 root  root         0 May 22 14:31 cache
+-rw-rw-rw-   1 root  root        16 Sep 07 19:35 verify_job
+-rw-rw-rw-   1 root  root  22948551 Jul 07 14:04 Fidget+Cube+toy+.stl + Fidget+Cube+toy+.stl 1 + Fidget+Cube+toy+.stl 2 + Fidget+Cube+toy+.stl 3 +....gcode.3mf
+-rw-rw-rw-   1 root  root    256358 Jul 07 16:56 Fidget+Cube+Toy-Sofi_plate_2.gcode.3mf
+-rw-rw-rw-   1 root  root  12052354 Jul 08 12:37 Fidget+Cube+Toy-Sofi.gcode.3mf
+-rw-rw-rw-   1 root  root    155745 Jul 12 21:46 hole_cap_plate_3.gcode.3mf
+-rw-rw-rw-   1 root  root   3424173 Jul 16 20:57 Pet-Feeder.stl.gcode.3mf
+-rw-rw-rw-   1 root  root   2257296 Jul 18 11:48 GTA_VI_logo_with_AMS_and_NO_AMS.gcode.3mf
+-rw-rw-rw-   1 root  root    252617 Jul 20 10:57 2_Color_Playing_Cards_With_AMS.gcode.3mf
+-rw-rw-rw-   1 root  root    345201 Jul 07 17:58 Playing_Cards_-_Minimal_.gcode.3mf
+-rw-rw-rw-   1 root  root   2300739 Jul 21 21:01 Bambu_Lab_Reusable_Spool_Holder.gcode.3mf
+-rw-rw-rw-   1 root  root    307290 Jul 12 13:03 Card_Shuffler_V2_-_No_Screw,_No_Glue.gcode.3mf
+-rw-rw-rw-   1 root  root   1262928 Jul 21 06:46 (Unsaved).gcode.3mf
+-rw-rw-rw-   1 root  root    911866 Jul 07 20:46 Rueda-Chango.stl.gcode.3mf
+-rw-rw-rw-   1 root  root   1825344 Jul 08 11:05 Untitled.stl.gcode.3mf
+-rw-rw-rw-   1 root  root    215700 Jul 13 13:07 hole_cap_plate_Plate 1.gcode.3mf
+-rw-rw-rw-   1 root  root    216486 Jul 13 23:15 hole_cap_plate_plate_2.gcode.3mf
+-rw-rw-rw-   1 root  root    396116 Jul 12 00:01 Arredi_architettura_in_scala_1.50.gcode.3mf
+-rw-rw-rw-   1 root  root    287169 Jul 12 03:42 Sofa_1_50.gcode.3mf
+-rw-rw-rw-   1 root  root   1133252 Jul 12 04:48 Patente_Custom_v1.gcode.3mf
+-rw-rw-rw-   1 root  root    772830 Jul 13 12:06 hole_cap_plate_plate_3.gcode.3mf
+-rw-rw-rw-   1 root  root    270254 Jul 17 02:23 Tapa_Agujero_Grande_plate_2.gcode.3mf
+-rw-rw-rw-   1 root  root    128872 Jul 18 09:09 Tapa_Agujero_Grande_plate_3.gcode.3mf
+-rw-rw-rw-   1 root  root    290510 Jul 17 07:24 Tapa_Agujero_Grande_Plate 1.gcode.3mf
+-rw-rw-rw-   1 root  root    611849 Jul 18 11:36 Bambu_A1_filament_tube_guide.gcode.3mf
+-rw-rw-rw-   1 root  root    298002 Jul 20 22:12 Soporte-650MT-GPS-Luces.stl.gcode.3mf
+-rw-rw-rw-   1 root  root   4358305 Jul 25 05:08 3KG_Filament_Large_Spool_Holder.gcode.3mf
+-rw-rw-rw-   1 root  root   1194085 Sep 11 23:07 Soporte-Altavoz-650-MT_v2.gcode.3mf
+-rw-rw-rw-   1 root  root   6921062 Sep 07 19:38 Soporte-Altavoz-650-MT_v3.gcode.3mf
+# dir /recorder
+-rw-rw-rw-   1 root  root         2 Sep 09 21:00 file_2242
+-rw-rw-rw-   1 root  root   4210736 Sep 09 16:27 file_2243.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 17:33 file_2244.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 18:27 file_2245.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 18:38 file_2246.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 19:00 file_2247.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 19:44 file_2248.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 20:38 file_2249.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 21:00 file_2250.bin
+-rw-rw-rw-   1 root  root   2441216 Sep 09 21:07 file_2251.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 03:10 file_2252.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 03:21 file_2253.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 03:43 file_2254.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 03:54 file_2255.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 04:05 file_2256.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 04:48 file_2257.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 04:59 file_2258.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 05:10 file_2259.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 05:21 file_2260.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 05:43 file_2261.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 05:54 file_2262.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 06:05 file_2263.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 06:27 file_2264.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 06:38 file_2265.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 06:59 file_2266.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 07:10 file_2267.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 07:21 file_2268.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 07:43 file_2269.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 07:54 file_2270.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 08:05 file_2271.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 08:48 file_2272.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 08:59 file_2273.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 09:43 file_2274.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 09:54 file_2275.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 10:05 file_2276.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 10:27 file_2277.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 10:38 file_2278.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 11:11 file_2279.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 11:22 file_2280.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 11:32 file_2281.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 11:43 file_2282.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 11:55 file_2283.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 12:16 file_2284.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 12:27 file_2285.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 12:38 file_2286.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 12:49 file_2287.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 13:00 file_2288.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 13:11 file_2289.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 13:33 file_2290.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 13:44 file_2291.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 13:55 file_2292.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 14:05 file_2293.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 14:16 file_2294.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 14:38 file_2295.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 14:49 file_2296.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 15:00 file_2297.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 15:11 file_2298.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 15:33 file_2299.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 15:54 file_2300.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 16:05 file_2301.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 16:16 file_2302.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 16:38 file_2303.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 17:00 file_2304.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 17:11 file_2305.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 17:22 file_2306.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 17:44 file_2307.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 18:05 file_2308.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 18:16 file_2309.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 18:49 file_2310.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 19:55 file_2311.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 20:17 file_2312.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 20:27 file_2313.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 04:16 file_2314.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 04:38 file_2315.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 05:32 file_2316.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 06:16 file_2317.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 06:48 file_2318.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 07:32 file_2319.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 08:16 file_2320.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 08:27 file_2321.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 08:38 file_2322.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 09:10 file_2323.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 09:21 file_2324.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 09:32 file_2325.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 10:16 file_2326.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 11:00 file_2327.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 13:22 file_2328.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 14:27 file_2329.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 15:22 file_2330.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 15:44 file_2331.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 17:55 file_2332.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 19:11 file_2333.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 19:22 file_2334.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 19:33 file_2335.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 20:06 file_2336.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 20:49 file_2337.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 03:32 file_2338.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 04:27 file_2339.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 10:49 file_2340.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 12:05 file_2341.bin
+-rw-rw-rw-   1 root  root   4210736 Sep 09 16:49 file_2342.bin
+# dir /logger
+-rw-rw-rw-   1 root  root         1 Sep 09 12:20 file_2343
+-rw-rw-rw-   1 root  root  26222592 Sep 08 01:02 file_2344.log
+-rw-rw-rw-   1 root  root  26222592 Sep 09 00:30 file_2345.log
+-rw-rw-rw-   1 root  root  19521536 Sep 09 21:07 file_2346.log
+-rw-rw-rw-   1 root  root  26222592 Jul 20 07:07 file_2347.log
+-rw-rw-rw-   1 root  root  26222592 Jul 20 21:17 file_2348.log
+-rw-rw-rw-   1 root  root  26222592 Jul 21 09:47 file_2349.log
+-rw-rw-rw-   1 root  root  26222592 Jul 21 22:42 file_2350.log
+-rw-rw-rw-   1 root  root  26222592 Jul 23 00:34 file_2351.log
+-rw-rw-rw-   1 root  root  26222592 Jul 23 13:30 file_2352.log
+-rw-rw-rw-   1 root  root  26222592 Jul 24 02:25 file_2353.log
+-rw-rw-rw-   1 root  root  26222592 Jul 24 15:21 file_2354.log
+-rw-rw-rw-   1 root  root  26222592 Jul 25 04:17 file_2355.log
+-rw-rw-rw-   1 root  root  26222592 Jul 26 01:37 file_2356.log
+-rw-rw-rw-   1 root  root  26222592 Sep 07 01:11 file_2357.log
+-rw-rw-rw-   1 root  root  26222592 Sep 08 03:38 file_2358.log
+-rw-rw-rw-   1 root  root  26222592 Sep 08 16:33 file_2359.log
+-rw-rw-rw-   1 root  root  26222592 Sep 09 05:28 file_2360.log
+-rw-rw-rw-   1 root  root  26222592 Sep 09 18:24 file_2361.log
+-rw-rw-rw-   1 root  root  26222592 Sep 10 07:19 file_2362.log
+-rw-rw-rw-   1 root  root  26222592 Sep 10 20:15 file_2363.log
+-rw-rw-rw-   1 root  root  26222592 Sep 11 09:10 file_2364.log
+-rw-rw-rw-   1 root  root  26222592 Sep 11 21:16 file_2365.log
+-rw-rw-rw-   1 root  root  26222592 Sep 12 07:59 file_2366.log
+-rw-rw-rw-   1 root  root  10395648 Sep 12 11:36 file_2367.log
+-rw-rw-rw-   1 root  root  26222592 Sep 07 16:04 file_2368.log
+-rw-rw-rw-   1 root  root  26222592 Sep 08 12:40 file_2369.log
+-rw-rw-rw-   1 root  root  26222592 Sep 09 12:20 file_2370.log
+-rw-rw-rw-   1 root  root  26222592 Jul 19 16:56 file_2371.log
+-rw-rw-rw-   1 root  root  26222592 Jul 22 11:38 file_2372.log
+-rw-rw-rw-   1 root  root  26222592 Jul 25 13:12 file_2373.log
+-rw-rw-rw-   1 root  root  26222592 Sep 07 14:38 file_2374.log
+# dir /image
+drw-rw-rw-   1 root  root         0 May 22 04:52 md5
+-rw-rw-rw-   1 root  root      2020 May 22 03:31 27033504251.png
+-rw-rw-rw-   1 root  root      3418 May 29 23:09 15395292421.png
+-rw-rw-rw-   1 root  root      3550 May 31 06:12 15395292422.png
+-rw-rw-rw-   1 root  root       399 May 31 19:03 15395292428.png
+-rw-rw-rw-   1 root  root      3257 May 31 21:06 15395292425.png
+-rw-rw-rw-   1 root  root      4547 Jun 06 00:57 29240981277.png
+-rw-rw-rw-   1 root  root      3852 Jun 06 04:02 29240981278.png
+-rw-rw-rw-   1 root  root      4878 Jun 02 02:31 29240981271.png
+-rw-rw-rw-   1 root  root      6286 Jun 02 12:12 29240981272.png
+-rw-rw-rw-   1 root  root      7891 Jun 03 03:02 29240981273.png
+-rw-rw-rw-   1 root  root      6642 Jun 03 16:57 29240981276.png
+-rw-rw-rw-   1 root  root      5996 Jun 04 07:12 29240981279.png
+-rw-rw-rw-   1 root  root      5880 Jun 04 11:15 292409812710.png
+-rw-rw-rw-   1 root  root      4475 Jun 04 13:44 292409812711.png
+-rw-rw-rw-   1 root  root      1776 Jun 04 18:53 292409812713.png
+-rw-rw-rw-   1 root  root      3832 Jun 04 22:45 6289519895.png
+-rw-rw-rw-   1 root  root      1776 Jun 05 19:02 292409812714.png
+-rw-rw-rw-   1 root  root      3395 Jun 07 05:49 2976573901.png
+-rw-rw-rw-   1 root  root      2345 Jun 10 09:24 16098276033.png
+-rw-rw-rw-   1 root  root      1949 Jun 10 11:27 11913551402.png
+-rw-rw-rw-   1 root  root      1683 Jun 10 14:16 31636974971.png
+-rw-rw-rw-   1 root  root      2387 Jun 12 17:56 37651918872.png
+-rw-rw-rw-   1 root  root      1856 Jun 12 19:28 3845135662.png
+-rw-rw-rw-   1 root  root      4532 Jun 13 10:38 29623233561.png
+-rw-rw-rw-   1 root  root      6237 Jun 13 20:48 42599729843.png
+-rw-rw-rw-   1 root  root      3790 Jun 18 19:42 25297195601.png
+-rw-rw-rw-   1 root  root      3618 Jun 18 22:29 1328240653.png
+-rw-rw-rw-   1 root  root      5043 Jun 19 10:31 34216134881.png
+-rw-rw-rw-   1 root  root      4228 Jun 19 14:56 41851158022.png
+-rw-rw-rw-   1 root  root      1798 Jun 24 17:39 26679299413.png
+-rw-rw-rw-   1 root  root      2835 Jun 23 19:52 31816030084.png
+-rw-rw-rw-   1 root  root      3222 Jun 24 01:02 40907338457.png
+-rw-rw-rw-   1 root  root      1782 Jun 24 16:05 2916619964.png
+-rw-rw-rw-   1 root  root      2872 Jun 25 00:29 29179540795.png
+-rw-rw-rw-   1 root  root      1955 Jun 26 19:46 39806562131.png
+-rw-rw-rw-   1 root  root      2480 Jun 27 23:06 20198332161.png
+-rw-rw-rw-   1 root  root      2218 Jul 02 23:26 873673911.png
+-rw-rw-rw-   1 root  root      7621 Jul 02 08:38 21058572731.png
+-rw-rw-rw-   1 root  root      2387 Jul 02 20:58 36632213662.png
+-rw-rw-rw-   1 root  root      3351 Jul 03 03:18 38837765341.png
+-rw-rw-rw-   1 root  root      5251 Jul 03 21:43 8511970131.png
+-rw-rw-rw-   1 root  root      2569 Jul 05 03:51 22796978248.png
+-rw-rw-rw-   1 root  root      6530 Jul 05 19:13 42502608051.png
+-rw-rw-rw-   1 root  root      6530 Jul 07 03:02 19886762481.png
+-rw-rw-rw-   1 root  root       746 Jul 07 05:56 18044955082.png
+-rw-rw-rw-   1 root  root      6057 Jul 08 01:35 27330255261.png
+-rw-rw-rw-   1 root  root      2155 Jul 12 10:46 13286708743.png
+-rw-rw-rw-   1 root  root      2310 Jul 16 09:56 35785372821.png
+-rw-rw-rw-   1 root  root      6973 Jul 18 00:48 29757147291.png
+-rw-rw-rw-   1 root  root      1914 Jul 19 21:41 14853808861.png
+-rw-rw-rw-   1 root  root      1925 Jul 19 23:57 14853808862.png
+-rw-rw-rw-   1 root  root      1871 Jul 19 00:32 14853808863.png
+-rw-rw-rw-   1 root  root      2351 Jul 21 17:12 772654095.png
+-rw-rw-rw-   1 root  root      7019 Jul 21 02:45 6799796561.png
+-rw-rw-rw-   1 root  root      6946 Jul 21 10:01 6799796562.png
+-rw-rw-rw-   1 root  root      2744 Jul 21 19:02 772654091.png
+-rw-rw-rw-   1 root  root      2752 Jul 21 22:05 772654092.png
+-rw-rw-rw-   1 root  root      2757 Jul 21 23:24 772654093.png
+-rw-rw-rw-   1 root  root      2751 Jul 22 09:42 772654094.png
+-rw-rw-rw-   1 root  root      2659 Jul 22 11:26 772654096.png
+-rw-rw-rw-   1 root  root      2651 Jul 22 14:08 772654097.png
+-rw-rw-rw-   1 root  root      2665 Jul 22 16:00 772654098.png
+-rw-rw-rw-   1 root  root      2659 Jul 22 17:46 772654099.png
+-rw-rw-rw-   1 root  root      2242 Jul 22 19:39 7726540910.png
+-rw-rw-rw-   1 root  root      2880 Jul 27 14:43 33291374525.png
+-rw-rw-rw-   1 root  root      2145 Aug 10 12:11 23303294151.png
+-rw-rw-rw-   1 root  root      3077 Aug 15 22:32 23303294156.png
+-rw-rw-rw-   1 root  root      2488 Aug 19 07:22 37359362251.png
+-rw-rw-rw-   1 root  root      2842 Aug 19 21:40 41722665161.png
+-rw-rw-rw-   1 root  root      2762 Aug 24 23:43 10845110641.png
+-rw-rw-rw-   1 root  root      2698 Aug 25 09:50 24259281662.png
+-rw-rw-rw-   1 root  root      1345 Aug 22 19:24 264380825614.png
+-rw-rw-rw-   1 root  root      3903 Aug 22 23:43 26438082567.png
+-rw-rw-rw-   1 root  root      2141 Aug 23 10:37 26438082561.png
+-rw-rw-rw-   1 root  root      2707 Aug 23 14:18 38002973711.png
+-rw-rw-rw-   1 root  root      3987 Aug 23 15:24 2217866173.png
+-rw-rw-rw-   1 root  root      3464 Aug 24 22:42 1654050613.png
+-rw-rw-rw-   1 root  root      2784 Aug 28 12:59 26565626542.png
+-rw-rw-rw-   1 root  root      1530 Aug 29 19:45 3600046373.png
+-rw-rw-rw-   1 root  root      3031 Aug 28 17:59 1814556801.png
+-rw-rw-rw-   1 root  root      2109 Aug 29 22:12 13201743311.png
+-rw-rw-rw-   1 root  root      2975 Sep 01 08:48 8222454741.png
+-rw-rw-rw-   1 root  root      3983 Sep 05 15:43 10102937031.png
+-rw-rw-rw-   1 root  root      3786 Sep 11 23:07 4717147431.png
+-rw-rw-rw-   1 root  root      2856 Sep 12 23:46 9619277441.png
+# dir /ipcam
+-rw-rw-rw-   1 root  root         4 Sep 08 01:13 index
+-rw-rw-rw-   1 root  root 135286080 Sep 07 23:48 ipcam-record.2026-09-07_23-08-17.0.avi
+-rw-rw-rw-   1 root  root 135267848 Sep 08 00:29 ipcam-record.2026-09-07_23-48-51.1.avi
+-rw-rw-rw-   1 root  root 135329458 Sep 08 01:13 ipcam-record.2026-09-08_00-29-46.2.avi
+-rw-rw-rw-   1 root  root  95149114 Sep 08 01:42 ipcam-record.2026-09-08_01-13-03.3.avi
+-rw-rw-rw-   1 root  root 135280568 Jul 12 05:34 ipcam-record.2026-07-12_04-48-48.4.avi
+-rw-rw-rw-   1 root  root 135302090 Jul 12 06:18 ipcam-record.2026-07-12_05-34-53.5.avi
+-rw-rw-rw-   1 root  root 135296918 Jul 12 07:04 ipcam-record.2026-07-12_06-18-50.6.avi
+-rw-rw-rw-   1 root  root 135296134 Jul 12 07:50 ipcam-record.2026-07-12_07-04-49.7.avi
+-rw-rw-rw-   1 root  root 135266892 Jul 12 08:38 ipcam-record.2026-07-12_07-50-41.8.avi
+-rw-rw-rw-   1 root  root  33618124 Jul 12 08:50 ipcam-record.2026-07-12_08-39-00.9.avi
+-rw-rw-rw-   1 root  root 119852660 Jul 13 12:47 ipcam-record.2026-07-13_12-06-58.10.avi
+-rw-rw-rw-   1 root  root 135267678 Jul 13 14:00 ipcam-record.2026-07-13_13-07-54.11.avi
+-rw-rw-rw-   1 root  root 135267012 Jul 13 14:58 ipcam-record.2026-07-13_14-00-36.12.avi
+-rw-rw-rw-   1 root  root  81644934 Jul 13 15:36 ipcam-record.2026-07-13_14-58-25.13.avi
+-rw-rw-rw-   1 root  root 135279060 Jul 14 00:12 ipcam-record.2026-07-13_23-15-35.14.avi
+-rw-rw-rw-   1 root  root 135282936 Jul 14 01:06 ipcam-record.2026-07-14_00-12-32.15.avi
+-rw-rw-rw-   1 root  root 102220574 Jul 14 01:44 ipcam-record.2026-07-14_01-06-11.16.avi
+-rw-rw-rw-   1 root  root 135297616 Jul 16 23:51 ipcam-record.2026-07-16_23-03-04.17.avi
+-rw-rw-rw-   1 root  root 135286168 Jul 17 00:39 ipcam-record.2026-07-16_23-51-06.18.avi
+-rw-rw-rw-   1 root  root 135310608 Jul 17 01:35 ipcam-record.2026-07-17_00-39-56.19.avi
+-rw-rw-rw-   1 root  root  17922360 Jul 17 01:43 ipcam-record.2026-07-17_01-35-37.20.avi
+-rw-rw-rw-   1 root  root 135281494 Jul 17 03:12 ipcam-record.2026-07-17_02-23-43.21.avi
+-rw-rw-rw-   1 root  root 135304364 Jul 17 04:00 ipcam-record.2026-07-17_03-12-44.22.avi
+-rw-rw-rw-   1 root  root 135306958 Jul 17 04:50 ipcam-record.2026-07-17_04-00-56.23.avi
+-rw-rw-rw-   1 root  root  32824246 Jul 17 05:02 ipcam-record.2026-07-17_04-50-16.24.avi
+-rw-rw-rw-   1 root  root  45748968 Jul 17 07:17 ipcam-record.2026-07-17_07-03-55.25.avi
+-rw-rw-rw-   1 root  root 135297960 Jul 17 08:17 ipcam-record.2026-07-17_07-24-32.26.avi
+-rw-rw-rw-   1 root  root 135277178 Jul 17 09:15 ipcam-record.2026-07-17_08-17-12.27.avi
+-rw-rw-rw-   1 root  root  98661408 Jul 17 10:02 ipcam-record.2026-07-17_09-15-43.28.avi
+-rw-rw-rw-   1 root  root  37023420 Jul 18 09:21 ipcam-record.2026-07-18_09-10-05.29.avi
+-rw-rw-rw-   1 root  root  15817004 Jul 18 11:34 ipcam-record.2026-07-18_11-31-17.30.avi
+-rw-rw-rw-   1 root  root 135325398 Jul 18 12:13 ipcam-record.2026-07-18_11-36-56.31.avi
+-rw-rw-rw-   1 root  root  81189070 Jul 18 12:35 ipcam-record.2026-07-18_12-13-08.32.avi
+-rw-rw-rw-   1 root  root 135316602 Jul 20 22:47 ipcam-record.2026-07-20_22-12-34.33.avi
+-rw-rw-rw-   1 root  root  33502616 Jul 20 22:57 ipcam-record.2026-07-20_22-47-32.34.avi
+-rw-rw-rw-   1 root  root 135318002 Jul 25 05:51 ipcam-record.2026-07-25_05-08-22.35.avi
+-rw-rw-rw-   1 root  root 135280720 Jul 25 06:34 ipcam-record.2026-07-25_05-51-49.36.avi
+-rw-rw-rw-   1 root  root 135272334 Jul 25 07:16 ipcam-record.2026-07-25_06-34-40.37.avi
+-rw-rw-rw-   1 root  root 135332360 Jul 25 08:01 ipcam-record.2026-07-25_07-16-55.38.avi
+-rw-rw-rw-   1 root  root 135334886 Jul 25 08:45 ipcam-record.2026-07-25_08-01-26.39.avi
+-rw-rw-rw-   1 root  root 135302604 Jul 25 09:19 ipcam-record.2026-07-25_08-45-35.40.avi
+-rw-rw-rw-   1 root  root 135342882 Jul 25 09:52 ipcam-record.2026-07-25_09-19-22.41.avi
+-rw-rw-rw-   1 root  root 135308344 Jul 25 10:26 ipcam-record.2026-07-25_09-52-37.42.avi
+-rw-rw-rw-   1 root  root 135326096 Jul 25 10:58 ipcam-record.2026-07-25_10-26-24.43.avi
+-rw-rw-rw-   1 root  root 135285106 Jul 25 11:30 ipcam-record.2026-07-25_10-58-56.44.avi
+-rw-rw-rw-   1 root  root 135289924 Jul 25 12:00 ipcam-record.2026-07-25_11-30-22.45.avi
+-rw-rw-rw-   1 root  root 135268574 Jul 25 12:31 ipcam-record.2026-07-25_12-00-56.46.avi
+-rw-rw-rw-   1 root  root 135313800 Jul 25 13:02 ipcam-record.2026-07-25_12-31-18.47.avi
+-rw-rw-rw-   1 root  root 135267120 Jul 25 13:36 ipcam-record.2026-07-25_13-02-02.48.avi
+-rw-rw-rw-   1 root  root 108161944 Jul 25 14:05 ipcam-record.2026-07-25_13-36-27.49.avi
+-rw-rw-rw-   1 root  root 135281884 Sep 11 17:49 ipcam-record.2026-09-11_17-07-15.50.avi
+-rw-rw-rw-   1 root  root 135321092 Sep 11 18:31 ipcam-record.2026-09-11_17-49-13.51.avi
+-rw-rw-rw-   1 root  root  61706792 Sep 11 18:51 ipcam-record.2026-09-11_18-31-23.52.avi
+-rw-rw-rw-   1 root  root 135314730 Sep 11 23:51 ipcam-record.2026-09-11_23-07-57.53.avi
+-rw-rw-rw-   1 root  root 135315300 Sep 12 00:30 ipcam-record.2026-09-11_23-51-28.54.avi
+-rw-rw-rw-   1 root  root  76912182 Sep 12 00:54 ipcam-record.2026-09-12_00-30-25.55.avi
+-rw-rw-rw-   1 root  root 135339562 Sep 12 06:55 ipcam-record.2026-09-12_06-04-47.56.avi
+-rw-rw-rw-   1 root  root 124088626 Sep 12 07:31 ipcam-record.2026-09-12_06-55-43.57.avi
+-rw-rw-rw-   1 root  root  12174886 Sep 12 07:41 ipcam-record.2026-09-12_07-37-49.58.avi
+-rw-rw-rw-   1 root  root 135335408 Sep 12 08:25 ipcam-record.2026-09-12_07-41-47.59.avi
+-rw-rw-rw-   1 root  root 135324894 Sep 12 09:01 ipcam-record.2026-09-12_08-25-16.60.avi
+-rw-rw-rw-   1 root  root  31354148 Sep 12 09:09 ipcam-record.2026-09-12_09-01-08.61.avi
+-rw-rw-rw-   1 root  root 135322872 Sep 12 11:25 ipcam-record.2026-09-12_10-43-06.62.avi
+-rw-rw-rw-   1 root  root  40716666 Sep 12 11:37 ipcam-record.2026-09-12_11-25-12.63.avi
+-rw-rw-rw-   1 root  root 135316426 Sep 07 08:52 ipcam-record.2026-09-07_08-10-46.64.avi
+-rw-rw-rw-   1 root  root 135306338 Sep 07 09:31 ipcam-record.2026-09-07_08-52-26.65.avi
+-rw-rw-rw-   1 root  root 135328600 Sep 07 10:08 ipcam-record.2026-09-07_09-31-25.66.avi
+-rw-rw-rw-   1 root  root 135281050 Sep 07 10:46 ipcam-record.2026-09-07_10-08-59.67.avi
+-rw-rw-rw-   1 root  root 135271496 Sep 07 11:23 ipcam-record.2026-09-07_10-46-17.68.avi
+-rw-rw-rw-   1 root  root 135279782 Sep 07 12:02 ipcam-record.2026-09-07_11-23-49.69.avi
+-rw-rw-rw-   1 root  root 135296120 Sep 07 12:41 ipcam-record.2026-09-07_12-02-37.70.avi
+-rw-rw-rw-   1 root  root   9003030 Sep 07 12:44 ipcam-record.2026-09-07_12-41-50.71.avi
+-rw-rw-rw-   1 root  root 135331398 Sep 07 15:00 ipcam-record.2026-09-07_14-19-15.72.avi
+-rw-rw-rw-   1 root  root 135336154 Sep 07 15:41 ipcam-record.2026-09-07_15-00-51.73.avi
+-rw-rw-rw-   1 root  root  12483522 Sep 07 15:45 ipcam-record.2026-09-07_15-41-28.74.avi
+-rw-rw-rw-   1 root  root 135325636 Sep 07 20:22 ipcam-record.2026-09-07_19-38-59.75.avi
+-rw-rw-rw-   1 root  root 135274478 Sep 07 21:02 ipcam-record.2026-09-07_20-22-16.76.avi
+-rw-rw-rw-   1 root  root 135287570 Sep 07 21:46 ipcam-record.2026-09-07_21-02-36.77.avi
+-rw-rw-rw-   1 root  root 135333860 Sep 07 22:28 ipcam-record.2026-09-07_21-46-11.78.avi
+-rw-rw-rw-   1 root  root 135317298 Sep 07 23:08 ipcam-record.2026-09-07_22-28-20.79.avi
+# dir /timelapse
+-rw-rw-rw-   1 root  root  86527810 May 30 05:16 video_2026-05-29_15-43-43.avi
+drw-rw-rw-   1 root  root         0 May 30 05:16 thumbnail
+-rw-rw-rw-   1 root  root  80661270 May 30 17:42 video_2026-05-30_10-19-28.avi
+-rw-rw-rw-   1 root  root  82944644 May 31 16:34 video_2026-05-31_03-50-52.avi
+-rw-rw-rw-   1 root  root  66813434 Jun 01 05:50 video_2026-05-31_17-20-58.avi
+-rw-rw-rw-   1 root  root   4411548 Jun 01 06:17 video_2026-06-01_06-11-57.avi
+-rw-rw-rw-   1 root  root   7418172 Jul 20 22:57 video_2026-07-20_22-19-02.avi
+-rw-rw-rw-   1 root  root  65159892 Jul 25 14:05 video_2026-07-25_05-14-39.avi
+# dir /cache
+-rw-rw-rw-   1 root  root    170593 May 22 14:31 Pata Gabinete.stl.3mf
+-rw-rw-rw-   1 root  root    814685 May 22 14:31 Pata Gabinete_plate_1.gcode
+-rw-rw-rw-   1 root  root    134764 Jun 27 06:46 0_plate_1.gcode
+-rw-rw-rw-   1 root  root  19862339 Jun 01 08:10 FRAMES 340x202mm.3mf
+-rw-rw-rw-   1 root  root  24610849 May 30 10:11 FRAMES 340x202mm_plate_1.gcode
+-rw-rw-rw-   1 root  root    972226 Jun 19 06:43 Left mount with fan.3mf
+-rw-rw-rw-   1 root  root  50440840 May 31 17:17 FRAMES 340x202mm_plate_2.gcode
+-rw-rw-rw-   1 root  root       433 Jun 19 06:43 1_Left mount with fan.bbl
+-rw-rw-rw-   1 root  root    452711 Jun 01 06:04 FRAMES 340x202mm_plate_8.gcode
+-rw-rw-rw-   1 root  root  10771383 Jun 19 09:31 0_plate_3.gcode
+-rw-rw-rw-   1 root  root 105943666 Jun 01 08:16 FRAMES 340x202mm_plate_5.gcode
+-rw-rw-rw-   1 root  root   1688216 Jun 19 21:32 LeftCase_v060.stl.3mf
+-rw-rw-rw-   1 root  root   1795030 Jun 06 15:02 FRAMES 202x200mm Min. Bed size.3mf
+-rw-rw-rw-   1 root  root   7511883 Jun 06 11:58 FRAMES 202x200mm Min_plate_7.gcode
+-rw-rw-rw-   1 root  root    444735 Jul 03 10:26 Full Print Hero Me Gen 7_plate_1.3mf
+-rw-rw-rw-   1 root  root   6104522 Jun 06 15:03 FRAMES 202x200mm Min_plate_8.gcode
+-rw-rw-rw-   1 root  root   6685637 Jul 02 19:39 complex (FDM).3mf
+-rw-rw-rw-   1 root  root  29946456 Jun 02 13:36 FRAMES 202x200mm Min_plate_1.gcode
+-rw-rw-rw-   1 root  root   2529891 Jun 19 09:30 0.16mm layer, 2 walls, 15% infill.3mf
+-rw-rw-rw-   1 root  root  58034540 Jun 02 23:21 FRAMES 202x200mm Min_plate_2.gcode
+-rw-rw-rw-   1 root  root  10420515 Jun 19 21:32 LeftCase_v060_plate_1.gcode
+-rw-rw-rw-   1 root  root  61721237 Jun 03 14:08 FRAMES 202x200mm Min_plate_3.gcode
+-rw-rw-rw-   1 root  root   1641709 Jun 20 01:57 E3-Back-Case_plate_2.3mf
+-rw-rw-rw-   1 root  root  57208463 Jun 04 04:06 FRAMES 202x200mm Min_plate_6.gcode
+-rw-rw-rw-   1 root  root    304364 Jun 25 04:39 E3-Back-Case_plate_3.3mf
+-rw-rw-rw-   1 root  root  10920340 Jun 04 18:14 FRAMES 202x200mm Min_plate_9.gcode
+-rw-rw-rw-   1 root  root   2500384 Jun 24 06:53 Full Print Hero Me Gen 7_plate_4.3mf
+-rw-rw-rw-   1 root  root  11684739 Jun 04 22:16 FRAMES 202x200mm Min_plate_10.gcode
+-rw-rw-rw-   1 root  root   2447711 Jun 24 12:03 Full Print Hero Me Gen 7_plate_7.3mf
+-rw-rw-rw-   1 root  root  11381039 Jun 05 00:46 FRAMES 202x200mm Min_plate_11.gcode
+-rw-rw-rw-   1 root  root    274909 Jun 25 03:05 E3-Back-Case_plate_4.3mf
+-rw-rw-rw-   1 root  root    170076 Jun 05 05:53 FRAMES 202x200mm Min_plate_13.gcode
+-rw-rw-rw-   1 root  root    296651 Jun 25 11:30 E3-Back-Case_plate_5.3mf
+-rw-rw-rw-   1 root  root   2409583 Jun 05 09:46 MOUNTS.3mf
+-rw-rw-rw-   1 root  root   6589847 Jun 05 09:46 MOUNTS_plate_5.gcode
+-rw-rw-rw-   1 root  root    170378 Jun 06 06:03 FRAMES 202x200mm Min_plate_14.gcode
+-rw-rw-rw-   1 root  root    777434 Jun 28 10:07 Z-SpacerSide_v2_plate_1.gcode
+-rw-rw-rw-   1 root  root  18261906 Jun 07 16:52 Quick.3mf
+-rw-rw-rw-   1 root  root  98765241 Jun 07 16:57 Quick_plate_1.gcode
+-rw-rw-rw-   1 root  root   1031254 Jul 05 14:51 (Unsaved).3mf
+-rw-rw-rw-   1 root  root   2933777 Jun 10 20:25 HMG7.4 Standard Single 5015 Right Duct V5.stl + HMG7.4 Standard Single 5015 Left Duct V5.stl.3mf
+-rw-rw-rw-   1 root  root   8579062 Jun 10 20:25 HMG7_plate_3.gcode
+-rw-rw-rw-   1 root  root    373413 Jul 03 14:18 PLA silk_PLA normal 0.16mm layer, 2 walls, 15% infill.3mf
+-rw-rw-rw-   1 root  root   1419313 Jul 04 08:43 Fidget+Cube+toy+.stl.3mf
+-rw-rw-rw-   1 root  root   3923142 Jun 10 22:28 HMG7.4 BL-CR Touch Wide Right Wing V3.stl + HMG7 Velocity Stack Fan Guard.stl + HMG7.2 Universal ....3mf
+-rw-rw-rw-   1 root  root   1703376 Jun 13 06:29 HMG7_plate_2.gcode
+-rw-rw-rw-   1 root  root  95550231 Jul 07 14:09 Fidget+Cube+toy+_plate_1.gcode
+-rw-rw-rw-   1 root  root       434 Jul 04 08:44 1_Fidget+Cube+toy+.stl.bbl
+-rw-rw-rw-   1 root  root   3496192 Jul 05 14:51 (Unsaved)_plate_8.gcode
+-rw-rw-rw-   1 root  root   1171990 Jun 11 01:17 HMG7.4 Ender 3-Pro-CR-10 Gantry Clip V2.stl + HMG7.4 Ender 3-Pro Gantry Adapter V2.stl + HMG7 Cre....3mf
+-rw-rw-rw-   1 root  root   4730197 Jun 11 01:17 HMG7_plate_1.gcode
+-rw-rw-rw-   1 root  root       439 Jul 05 14:52 8_(Unsaved).bbl
+-rw-rw-rw-   1 root  root    806112 Jul 07 16:56 Fidget+Cube+Toy-Sofi_plate_2_plate_2.gcode
+-rw-rw-rw-   1 root  root    217383 Jun 13 04:56 HMG7.4 BL-CR Touch Medium Left Wing V3.stl + HMG7 Velocity Stack Fan Guard.stl + HMG7.2 Universal....3mf
+-rw-rw-rw-   1 root  root  22948552 Jul 06 06:17 Fidget+Cube+toy+.stl + Fidget+Cube+toy+.stl 1 + Fidget+Cube+toy+.stl 2 + Fidget+Cube+toy+.stl 3 +....3mf
+-rw-rw-rw-   1 root  root    338429 Jun 13 06:29 HMG7.4 BL-CR Touch Narrow Left Low Wing V3.stl + HMG7 Velocity Stack Fan Guard.stl + HMG7.4 BLTou....3mf
+-rw-rw-rw-   1 root  root       595 Jun 13 06:29 2_HMG7.4 BL-CR Touch Narrow Left Low Wing V3.stl + HMG7 Velocity Stack Fan Guard.stl + HMG7.4 BLTou....bbl
+-rw-rw-rw-   1 root  root   1314205 Jun 13 21:38 0.2mm layer, 2 walls, 15% infill.3mf
+-rw-rw-rw-   1 root  root       459 Jun 13 21:39 1_0.2mm layer, 2 walls, 15% infill.bbl
+-rw-rw-rw-   1 root  root   3897183 Jun 14 04:49 Color Custom Edition – Enhanced Type B.3mf
+-rw-rw-rw-   1 root  root  14091525 Jun 14 04:49 Color Custom Edition – Enhanced Type B_plate_3.gcode
+-rw-rw-rw-   1 root  root       476 Jun 14 04:49 3_Color Custom Edition – Enhanced Type B.bbl
+-rw-rw-rw-   1 root  root   3836145 Jun 19 06:43 Left mount with fan_plate_1.gcode
+-rw-rw-rw-   1 root  root       461 Jun 19 09:30 3_0.16mm layer, 2 walls, 15% infill.bbl
+-rw-rw-rw-   1 root  root       429 Jun 19 21:32 1_LeftCase_v060.stl.bbl
+-rw-rw-rw-   1 root  root  10033247 Jun 20 01:57 E3-Back-Case_plate_2_plate_2.gcode
+-rw-rw-rw-   1 root  root       435 Jun 20 01:57 2_E3-Back-Case_plate_2.bbl
+-rw-rw-rw-   1 root  root    906071 Jun 25 04:39 E3-Back-Case_plate_3_plate_3.gcode
+-rw-rw-rw-   1 root  root       435 Jun 25 04:39 3_E3-Back-Case_plate_3.bbl
+-rw-rw-rw-   1 root  root   9769785 Jun 24 06:53 Full Print Hero Me Gen 7_plate_4_plate_4.gcode
+-rw-rw-rw-   1 root  root       459 Jun 24 06:53 4_Full Print Hero Me Gen 7_plate_4.bbl
+-rw-rw-rw-   1 root  root   9767320 Jun 24 12:04 Full Print Hero Me Gen 7_plate_7_plate_7.gcode
+-rw-rw-rw-   1 root  root       459 Jun 24 12:04 7_Full Print Hero Me Gen 7_plate_7.bbl
+-rw-rw-rw-   1 root  root    807629 Jun 25 03:05 E3-Back-Case_plate_4_plate_4.gcode
+-rw-rw-rw-   1 root  root       435 Jun 25 03:05 4_E3-Back-Case_plate_4.bbl
+-rw-rw-rw-   1 root  root    929906 Jun 25 11:30 E3-Back-Case_plate_5_plate_5.gcode
+-rw-rw-rw-   1 root  root       435 Jun 25 11:30 5_E3-Back-Case_plate_5.bbl
+-rw-rw-rw-   1 root  root     48500 Jun 27 06:46 0.12mm layer, 2 walls, 15% infill.3mf
+-rw-rw-rw-   1 root  root       461 Jun 27 06:46 1_0.12mm layer, 2 walls, 15% infill.bbl
+-rw-rw-rw-   1 root  root    210211 Jun 28 10:07 Z-SpacerSide_v2.STL + Z-SpacerBottom_v2.STL.3mf
+-rw-rw-rw-   1 root  root       481 Jun 28 10:07 1_Z-SpacerSide_v2.STL + Z-SpacerBottom_v2.STL.bbl
+-rw-rw-rw-   1 root  root   1560152 Jul 03 10:26 Full Print Hero Me Gen 7_plate_1_plate_1.gcode
+-rw-rw-rw-   1 root  root       458 Jul 03 10:26 1_Full Print Hero Me Gen 7_plate_1.bbl
+-rw-rw-rw-   1 root  root  24458683 Jul 02 19:40 complex (FDM)_plate_1.gcode
+-rw-rw-rw-   1 root  root       420 Jul 02 19:39 1_complex (FDM).bbl
+-rw-rw-rw-   1 root  root    306754 Jul 03 07:58 Full Print Hero Me Gen 7_plate_2.3mf
+-rw-rw-rw-   1 root  root    706591 Jul 03 07:58 Full Print Hero Me Gen 7_plate_2_plate_2.gcode
+-rw-rw-rw-   1 root  root       458 Jul 03 07:58 2_Full Print Hero Me Gen 7_plate_2.bbl
+-rw-rw-rw-   1 root  root   1303331 Jul 03 14:18 PLA silk_PLA normal 0_plate_1.gcode
+-rw-rw-rw-   1 root  root       500 Jul 03 14:18 1_PLA silk_PLA normal 0.16mm layer, 2 walls, 15% infill.bbl
+-rw-rw-rw-   1 root  root       610 Jul 06 06:17 1_Fidget+Cube+toy+.stl + Fidget+Cube+toy+.stl 1 + Fidget+Cube+toy+.stl 2 + Fidget+Cube+toy+.stl 3 +....bbl
+-rw-rw-rw-   1 root  root       596 Jul 07 14:04 1_Fidget+Cube+toy+.stl + Fidget+Cube+toy+.stl 1 + Fidget+Cube+toy+.stl 2 + Fidget+Cube+toy+.stl 3 +....gcode.bbl
+-rw-rw-rw-   1 root  root       436 Jul 07 16:56 2_Fidget+Cube+Toy-Sofi_plate_2.gcode.bbl
+-rw-rw-rw-   1 root  root  50248214 Jul 08 12:40 Fidget+Cube+Toy-Sofi_plate_1.gcode
+-rw-rw-rw-   1 root  root       436 Jul 08 12:37 1_Fidget+Cube+Toy-Sofi.gcode.bbl
+-rw-rw-rw-   1 root  root    603689 Jul 12 21:46 hole_cap_plate_3_plate_3.gcode
+-rw-rw-rw-   1 root  root       412 Jul 12 21:46 3_hole_cap_plate_3.gcode.bbl
+-rw-rw-rw-   1 root  root  17670154 Jul 16 20:58 Pet-Feeder_plate_1.gcode
+-rw-rw-rw-   1 root  root       408 Jul 16 20:57 1_Pet-Feeder.stl.gcode.bbl
+-rw-rw-rw-   1 root  root   7525309 Jul 18 11:49 GTA_VI_logo_with_AMS_and_NO_AMS_plate_1.gcode
+-rw-rw-rw-   1 root  root       451 Jul 18 11:48 1_GTA_VI_logo_with_AMS_and_NO_AMS.gcode.bbl
+-rw-rw-rw-   1 root  root    996032 Jul 20 08:41 2_Color_Playing_Cards_With_AMS_plate_1.gcode
+-rw-rw-rw-   1 root  root       443 Jul 20 08:41 1_2_Color_Playing_Cards_With_AMS.gcode.bbl
+-rw-rw-rw-   1 root  root    798442 Jul 20 10:57 2_Color_Playing_Cards_With_AMS_plate_2.gcode
+-rw-rw-rw-   1 root  root       443 Jul 20 10:57 2_2_Color_Playing_Cards_With_AMS.gcode.bbl
+-rw-rw-rw-   1 root  root    698178 Jul 19 11:32 2_Color_Playing_Cards_With_AMS_plate_3.gcode
+-rw-rw-rw-   1 root  root       443 Jul 19 11:32 3_2_Color_Playing_Cards_With_AMS.gcode.bbl
+-rw-rw-rw-   1 root  root    623618 Jul 22 04:12 Playing_Cards_-_Minimal__plate_5.gcode
+-rw-rw-rw-   1 root  root       431 Jul 22 04:12 5_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root   8680350 Jul 21 13:46 Bambu_Lab_Reusable_Spool_Holder_plate_1.gcode
+-rw-rw-rw-   1 root  root       442 Jul 21 13:45 1_Bambu_Lab_Reusable_Spool_Holder.gcode.bbl
+-rw-rw-rw-   1 root  root   8306203 Jul 21 21:01 Bambu_Lab_Reusable_Spool_Holder_plate_2.gcode
+-rw-rw-rw-   1 root  root       442 Jul 21 21:01 2_Bambu_Lab_Reusable_Spool_Holder.gcode.bbl
+-rw-rw-rw-   1 root  root   1057478 Jul 22 06:02 Playing_Cards_-_Minimal__plate_1.gcode
+-rw-rw-rw-   1 root  root       431 Jul 22 06:02 1_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root   1039824 Jul 22 09:05 Playing_Cards_-_Minimal__plate_2.gcode
+-rw-rw-rw-   1 root  root       431 Jul 22 09:05 2_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root   1066876 Jul 22 10:24 Playing_Cards_-_Minimal__plate_3.gcode
+-rw-rw-rw-   1 root  root       431 Jul 22 10:24 3_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root   1085820 Jul 22 20:42 Playing_Cards_-_Minimal__plate_4.gcode
+-rw-rw-rw-   1 root  root       431 Jul 22 20:42 4_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root    896159 Jul 22 22:26 Playing_Cards_-_Minimal__plate_6.gcode
+-rw-rw-rw-   1 root  root       435 Jul 22 22:26 6_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root    879822 Jul 07 12:28 Playing_Cards_-_Minimal__plate_7.gcode
+-rw-rw-rw-   1 root  root       435 Jul 07 12:28 7_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root    906768 Jul 07 14:19 Playing_Cards_-_Minimal__plate_8.gcode
+-rw-rw-rw-   1 root  root       435 Jul 07 14:19 8_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root    936857 Jul 07 16:06 Playing_Cards_-_Minimal__plate_9.gcode
+-rw-rw-rw-   1 root  root       435 Jul 07 16:06 9_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root    335826 Jul 07 17:58 Playing_Cards_-_Minimal__plate_10.gcode
+-rw-rw-rw-   1 root  root       435 Jul 07 17:58 10_Playing_Cards_-_Minimal_.gcode.bbl
+-rw-rw-rw-   1 root  root    532176 Jul 12 13:03 Card_Shuffler_V2_-_No_Screw,_No_Glue_plate_5.gcode
+-rw-rw-rw-   1 root  root       464 Jul 12 13:03 5_Card_Shuffler_V2_-_No_Screw,_No_Glue.gcode.bbl
+-rw-rw-rw-   1 root  root    966337 Jul 15 20:26 (Unsaved)_plate_1.gcode
+-rw-rw-rw-   1 root  root       398 Jul 15 20:26 1_(Unsaved).gcode.bbl
+-rw-rw-rw-   1 root  root   3905110 Jul 21 06:47 (Unsaved)_plate_6.gcode
+-rw-rw-rw-   1 root  root       410 Jul 21 06:46 6_(Unsaved).gcode.bbl
+-rw-rw-rw-   1 root  root   3882510 Jul 07 20:47 Rueda-Chango_plate_1.gcode
+-rw-rw-rw-   1 root  root       436 Jul 07 20:46 1_Rueda-Chango.stl.gcode.bbl
+-rw-rw-rw-   1 root  root   6576576 Jul 08 11:05 Untitled_plate_1.gcode
+-rw-rw-rw-   1 root  root       428 Jul 08 11:05 1_Untitled.stl.gcode.bbl
+-rw-rw-rw-   1 root  root    799002 Jul 13 13:07 hole_cap_plate_Plate 1_plate_1.gcode
+-rw-rw-rw-   1 root  root       424 Jul 13 13:07 1_hole_cap_plate_Plate 1.gcode.bbl
+-rw-rw-rw-   1 root  root    825330 Jul 13 23:15 hole_cap_plate_plate_2_plate_2.gcode
+-rw-rw-rw-   1 root  root       424 Jul 13 23:15 2_hole_cap_plate_plate_2.gcode.bbl
+-rw-rw-rw-   1 root  root   1452555 Jul 11 08:48 Arredi_architettura_in_scala_1_plate_14.gcode
+-rw-rw-rw-   1 root  root       446 Jul 11 08:48 14_Arredi_architettura_in_scala_1.50.gcode.bbl
+-rw-rw-rw-   1 root  root   2156914 Jul 11 13:07 Arredi_architettura_in_scala_1_plate_7.gcode
+-rw-rw-rw-   1 root  root       446 Jul 11 13:07 7_Arredi_architettura_in_scala_1.50.gcode.bbl
+-rw-rw-rw-   1 root  root    478804 Jul 12 00:01 Arredi_architettura_in_scala_1_plate_1.gcode
+-rw-rw-rw-   1 root  root       446 Jul 12 00:02 1_Arredi_architettura_in_scala_1.50.gcode.bbl
+-rw-rw-rw-   1 root  root   1799373 Jul 12 03:42 Sofa_1_50_plate_1.gcode
+-rw-rw-rw-   1 root  root       398 Jul 12 03:42 1_Sofa_1_50.gcode.bbl
+-rw-rw-rw-   1 root  root   3693431 Jul 12 04:48 Patente_Custom_v1_plate_3.gcode
+-rw-rw-rw-   1 root  root       428 Jul 12 04:48 3_Patente_Custom_v1.gcode.bbl
+-rw-rw-rw-   1 root  root   2630392 Jul 13 12:07 hole_cap_plate_plate_3_plate_3.gcode
+-rw-rw-rw-   1 root  root       424 Jul 13 12:06 3_hole_cap_plate_plate_3.gcode.bbl
+-rw-rw-rw-   1 root  root   1108163 Jul 17 02:23 Tapa_Agujero_Grande_plate_2_plate_2.gcode
+-rw-rw-rw-   1 root  root       434 Jul 17 02:23 2_Tapa_Agujero_Grande_plate_2.gcode.bbl
+-rw-rw-rw-   1 root  root    361932 Jul 18 09:09 Tapa_Agujero_Grande_plate_3_plate_3.gcode
+-rw-rw-rw-   1 root  root       434 Jul 18 09:10 3_Tapa_Agujero_Grande_plate_3.gcode.bbl
+-rw-rw-rw-   1 root  root   1107324 Jul 17 07:24 Tapa_Agujero_Grande_Plate 1_plate_1.gcode
+-rw-rw-rw-   1 root  root       434 Jul 17 07:24 1_Tapa_Agujero_Grande_Plate 1.gcode.bbl
+-rw-rw-rw-   1 root  root   3909552 Jul 18 11:37 Bambu_A1_filament_tube_guide_plate_1.gcode
+-rw-rw-rw-   1 root  root       452 Jul 18 11:36 1_Bambu_A1_filament_tube_guide.gcode.bbl
+-rw-rw-rw-   1 root  root   1564092 Jul 20 22:12 Soporte-650MT-GPS-Luces_plate_1.gcode
+-rw-rw-rw-   1 root  root       433 Jul 20 22:12 1_Soporte-650MT-GPS-Luces.stl.gcode.bbl
+-rw-rw-rw-   1 root  root  21028047 Jul 25 05:09 3KG_Filament_Large_Spool_Holder_plate_1.gcode
+-rw-rw-rw-   1 root  root       441 Jul 25 05:08 1_3KG_Filament_Large_Spool_Holder.gcode.bbl
+-rw-rw-rw-   1 root  root   5488962 Sep 11 23:08 Soporte-Altavoz-650-MT_v2_plate_1.gcode
+-rw-rw-rw-   1 root  root       442 Sep 11 23:07 1_Soporte-Altavoz-650-MT_v2.gcode.bbl
+-rw-rw-rw-   1 root  root  41134252 Sep 07 19:41 Soporte-Altavoz-650-MT_v3_plate_1.gcode
+-rw-rw-rw-   1 root  root       430 Sep 07 19:38 1_Soporte-Altavoz-650-MT_v3.gcode.bbl
+# dir /image/md5
+-rw-rw-rw-   1 root  root        32 May 22 03:31 27033504251.md5
+-rw-rw-rw-   1 root  root        32 May 29 23:09 15395292421.md5
+-rw-rw-rw-   1 root  root        32 May 31 06:12 15395292422.md5
+-rw-rw-rw-   1 root  root        32 May 31 19:03 15395292428.md5
+-rw-rw-rw-   1 root  root        32 May 31 21:06 15395292425.md5
+-rw-rw-rw-   1 root  root        32 Jun 06 00:57 29240981277.md5
+-rw-rw-rw-   1 root  root        32 Jun 06 04:02 29240981278.md5
+-rw-rw-rw-   1 root  root        32 Jun 02 02:31 29240981271.md5
+-rw-rw-rw-   1 root  root        32 Jun 02 12:12 29240981272.md5
+-rw-rw-rw-   1 root  root        32 Jun 03 03:02 29240981273.md5
+-rw-rw-rw-   1 root  root        32 Jun 03 16:57 29240981276.md5
+-rw-rw-rw-   1 root  root        32 Jun 04 07:12 29240981279.md5
+-rw-rw-rw-   1 root  root        32 Jun 04 11:15 292409812710.md5
+-rw-rw-rw-   1 root  root        32 Jun 04 13:44 292409812711.md5
+-rw-rw-rw-   1 root  root        32 Jun 04 18:53 292409812713.md5
+-rw-rw-rw-   1 root  root        32 Jun 04 22:45 6289519895.md5
+-rw-rw-rw-   1 root  root        32 Jun 05 19:02 292409812714.md5
+-rw-rw-rw-   1 root  root        32 Jun 07 05:49 2976573901.md5
+-rw-rw-rw-   1 root  root        32 Jun 10 09:24 16098276033.md5
+-rw-rw-rw-   1 root  root        32 Jun 10 11:27 11913551402.md5
+-rw-rw-rw-   1 root  root        32 Jun 10 14:16 31636974971.md5
+-rw-rw-rw-   1 root  root        32 Jun 12 17:56 37651918872.md5
+-rw-rw-rw-   1 root  root        32 Jun 12 19:28 3845135662.md5
+-rw-rw-rw-   1 root  root        32 Jun 13 10:38 29623233561.md5
+-rw-rw-rw-   1 root  root        32 Jun 13 20:48 42599729843.md5
+-rw-rw-rw-   1 root  root        32 Jun 18 19:42 25297195601.md5
+-rw-rw-rw-   1 root  root        32 Jun 18 22:29 1328240653.md5
+-rw-rw-rw-   1 root  root        32 Jun 19 10:31 34216134881.md5
+-rw-rw-rw-   1 root  root        32 Jun 19 14:56 41851158022.md5
+-rw-rw-rw-   1 root  root        32 Jun 24 17:39 26679299413.md5
+-rw-rw-rw-   1 root  root        32 Jun 23 19:52 31816030084.md5
+-rw-rw-rw-   1 root  root        32 Jun 24 01:02 40907338457.md5
+-rw-rw-rw-   1 root  root        32 Jun 24 16:05 2916619964.md5
+-rw-rw-rw-   1 root  root        32 Jun 25 00:29 29179540795.md5
+-rw-rw-rw-   1 root  root        32 Jun 26 19:46 39806562131.md5
+-rw-rw-rw-   1 root  root        32 Jun 27 23:06 20198332161.md5
+-rw-rw-rw-   1 root  root        32 Jul 02 23:26 873673911.md5
+-rw-rw-rw-   1 root  root        32 Jul 02 08:38 21058572731.md5
+-rw-rw-rw-   1 root  root        32 Jul 02 20:58 36632213662.md5
+-rw-rw-rw-   1 root  root        32 Jul 03 03:18 38837765341.md5
+-rw-rw-rw-   1 root  root        32 Jul 03 21:43 8511970131.md5
+-rw-rw-rw-   1 root  root        32 Jul 05 03:51 22796978248.md5
+-rw-rw-rw-   1 root  root        32 Jul 05 19:13 42502608051.md5
+-rw-rw-rw-   1 root  root        32 Jul 07 03:02 19886762481.md5
+-rw-rw-rw-   1 root  root        32 Jul 07 05:56 18044955082.md5
+-rw-rw-rw-   1 root  root        32 Jul 08 01:35 27330255261.md5
+-rw-rw-rw-   1 root  root        32 Jul 12 10:46 13286708743.md5
+-rw-rw-rw-   1 root  root        32 Jul 16 09:56 35785372821.md5
+-rw-rw-rw-   1 root  root        32 Jul 18 00:48 29757147291.md5
+-rw-rw-rw-   1 root  root        32 Jul 19 21:41 14853808861.md5
+-rw-rw-rw-   1 root  root        32 Jul 19 23:57 14853808862.md5
+-rw-rw-rw-   1 root  root        32 Jul 19 00:32 14853808863.md5
+-rw-rw-rw-   1 root  root        32 Jul 21 17:12 772654095.md5
+-rw-rw-rw-   1 root  root        32 Jul 21 02:45 6799796561.md5
+-rw-rw-rw-   1 root  root        32 Jul 21 10:01 6799796562.md5
+-rw-rw-rw-   1 root  root        32 Jul 21 19:02 772654091.md5
+-rw-rw-rw-   1 root  root        32 Jul 21 22:05 772654092.md5
+-rw-rw-rw-   1 root  root        32 Jul 21 23:24 772654093.md5
+-rw-rw-rw-   1 root  root        32 Jul 22 09:42 772654094.md5
+-rw-rw-rw-   1 root  root        32 Jul 22 11:26 772654096.md5
+-rw-rw-rw-   1 root  root        32 Jul 22 14:08 772654097.md5
+-rw-rw-rw-   1 root  root        32 Jul 22 16:00 772654098.md5
+-rw-rw-rw-   1 root  root        32 Jul 22 17:46 772654099.md5
+-rw-rw-rw-   1 root  root        32 Jul 22 19:39 7726540910.md5
+-rw-rw-rw-   1 root  root        32 Jul 27 14:43 33291374525.md5
+-rw-rw-rw-   1 root  root        32 Aug 10 12:11 23303294151.md5
+-rw-rw-rw-   1 root  root        32 Aug 15 22:32 23303294156.md5
+-rw-rw-rw-   1 root  root        32 Aug 19 07:22 37359362251.md5
+-rw-rw-rw-   1 root  root        32 Aug 19 21:40 41722665161.md5
+-rw-rw-rw-   1 root  root        32 Aug 24 23:43 10845110641.md5
+-rw-rw-rw-   1 root  root        32 Aug 25 09:50 24259281662.md5
+-rw-rw-rw-   1 root  root        32 Aug 22 19:24 264380825614.md5
+-rw-rw-rw-   1 root  root        32 Aug 22 23:43 26438082567.md5
+-rw-rw-rw-   1 root  root        32 Aug 23 10:37 26438082561.md5
+-rw-rw-rw-   1 root  root        32 Aug 23 14:18 38002973711.md5
+-rw-rw-rw-   1 root  root        32 Aug 23 15:24 2217866173.md5
+-rw-rw-rw-   1 root  root        32 Aug 24 22:42 1654050613.md5
+-rw-rw-rw-   1 root  root        32 Aug 28 12:59 26565626542.md5
+-rw-rw-rw-   1 root  root        32 Aug 29 19:45 3600046373.md5
+-rw-rw-rw-   1 root  root        32 Aug 28 17:59 1814556801.md5
+-rw-rw-rw-   1 root  root        32 Aug 29 22:12 13201743311.md5
+-rw-rw-rw-   1 root  root        32 Sep 01 08:48 8222454741.md5
+-rw-rw-rw-   1 root  root        32 Sep 05 15:43 10102937031.md5
+-rw-rw-rw-   1 root  root        32 Sep 11 23:07 4717147431.md5
+-rw-rw-rw-   1 root  root        32 Sep 12 23:46 9619277441.md5
+# dir /timelapse/thumbnail
+-rw-rw-rw-   1 root  root     22147 May 30 05:16 video_2026-05-29_15-43-43.jpg
+-rw-rw-rw-   1 root  root     22255 May 30 17:42 video_2026-05-30_10-19-28.jpg
+-rw-rw-rw-   1 root  root     21916 May 31 16:34 video_2026-05-31_03-50-52.jpg
+-rw-rw-rw-   1 root  root     19811 Jun 01 05:50 video_2026-05-31_17-20-58.jpg
+-rw-rw-rw-   1 root  root     19830 Jun 01 06:17 video_2026-06-01_06-11-57.jpg
+-rw-rw-rw-   1 root  root     22149 Jul 20 22:57 video_2026-07-20_22-19-02.jpg
+-rw-rw-rw-   1 root  root     21888 Jul 25 14:05 video_2026-07-25_05-14-39.jpg

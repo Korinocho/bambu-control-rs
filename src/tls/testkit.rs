@@ -429,6 +429,16 @@ pub struct FtpSpec {
     /// NLST of "/" lists the names (every other folder is 550); RETR and
     /// SIZE serve the bytes
     pub files: Vec<(String, Vec<u8>)>,
+    /// LIST replies per directory, as raw `ls -l` lines. While it is empty,
+    /// LIST answers like NLST (the names of `files`)
+    pub listings: Vec<(String, Vec<String>)>,
+    /// MDTM replies: path -> "YYYYMMDDHHMMSS"; every other path is 550
+    pub mdtm: Vec<(String, String)>,
+    /// the reply to PASS, instead of 230
+    pub login_reply: Option<&'static str>,
+    /// the host the 227 reply names; the NAT workaround replaces it with
+    /// the control peer (design doc 3.1)
+    pub pasv_host: [u8; 4],
     /// close control connections right after the ClientHello, without an
     /// alert
     pub drop_after_hello: bool,
@@ -447,6 +457,10 @@ impl FtpSpec {
             data,
             per_session: None,
             files,
+            listings: Vec::new(),
+            mdtm: Vec::new(),
+            login_reply: None,
+            pasv_host: [127, 0, 0, 1],
             drop_after_hello: false,
             data_mode: DataMode::Serve,
             missing: Missing::AcceptData,
@@ -463,6 +477,11 @@ pub struct FtpServer {
     pub accepts: Arc<AtomicUsize>,
     /// control connections on which the client sent TLS bytes
     pub sessions: Arc<AtomicUsize>,
+    /// sessions open right now: a QUIT ends its session before the 221
+    /// reply, so a client that waits for 221 never overlaps two of them
+    pub open: Arc<AtomicUsize>,
+    /// the most sessions this server had open at once
+    pub max_open: Arc<AtomicUsize>,
     /// data connections accepted, over all sessions
     pub data_accepts: Arc<AtomicUsize>,
     /// command words received over all sessions, in order
@@ -479,6 +498,14 @@ impl FtpServer {
 
     pub fn sessions(&self) -> usize {
         self.sessions.load(Ordering::SeqCst)
+    }
+
+    pub fn open_sessions(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    pub fn max_open_sessions(&self) -> usize {
+        self.max_open.load(Ordering::SeqCst)
     }
 
     pub fn accepts(&self) -> usize {
@@ -499,10 +526,50 @@ impl FtpServer {
 struct Shared {
     spec: FtpSpec,
     sessions: Arc<AtomicUsize>,
+    open: Arc<AtomicUsize>,
+    max_open: Arc<AtomicUsize>,
     data_accepts: Arc<AtomicUsize>,
     commands: Arc<Mutex<Vec<String>>>,
     records: Arc<Mutex<Vec<Vec<String>>>>,
     host: String,
+}
+
+/// Counts one control connection while it is open. QUIT ends it before the
+/// 221 reply, so a client that waits for 221 before opening its next
+/// session can never be seen as two open sessions.
+struct OpenSession {
+    open: Arc<AtomicUsize>,
+    ended: bool,
+}
+
+impl OpenSession {
+    fn new(open: Arc<AtomicUsize>, max: &AtomicUsize) -> Self {
+        let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(now, Ordering::SeqCst);
+        Self { open, ended: false }
+    }
+
+    fn end(&mut self) {
+        if !self.ended {
+            self.ended = true;
+            self.open.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Same directory, whatever the leading and trailing slashes.
+fn same_dir(a: &str, b: &str) -> bool {
+    let trim = |dir: &str| {
+        let dir = dir.trim_end_matches('/');
+        dir.strip_prefix('/').unwrap_or(dir).to_string()
+    };
+    trim(a) == trim(b)
 }
 
 pub fn ftp_server(host: &str, spec: FtpSpec) -> FtpServer {
@@ -512,6 +579,8 @@ pub fn ftp_server(host: &str, spec: FtpSpec) -> FtpServer {
         port,
         accepts: Arc::new(AtomicUsize::new(0)),
         sessions: Arc::new(AtomicUsize::new(0)),
+        open: Arc::new(AtomicUsize::new(0)),
+        max_open: Arc::new(AtomicUsize::new(0)),
         data_accepts: Arc::new(AtomicUsize::new(0)),
         commands: Arc::new(Mutex::new(Vec::new())),
         client_records: Arc::new(Mutex::new(Vec::new())),
@@ -519,6 +588,8 @@ pub fn ftp_server(host: &str, spec: FtpSpec) -> FtpServer {
     let shared = Arc::new(Shared {
         spec,
         sessions: server.sessions.clone(),
+        open: server.open.clone(),
+        max_open: server.max_open.clone(),
         data_accepts: server.data_accepts.clone(),
         commands: server.commands.clone(),
         records: server.client_records.clone(),
@@ -563,8 +634,8 @@ impl Write for Tap {
 }
 
 fn serve(tcp: TcpStream, shared: &Shared) -> io::Result<()> {
-    let Shared { spec, sessions, data_accepts, commands, records, host } =
-        shared;
+    let Shared { spec, sessions, open, max_open, data_accepts, commands,
+                 records, host } = shared;
     let host = host.as_str();
     tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -574,6 +645,7 @@ fn serve(tcp: TcpStream, shared: &Shared) -> io::Result<()> {
         return Ok(());
     }
     sessions.fetch_add(1, Ordering::SeqCst);
+    let mut session = OpenSession::new(open.clone(), max_open);
     let (control, data_tls) = match spec.per_session {
         Some(make) => {
             let tls = make();
@@ -616,7 +688,8 @@ fn serve(tcp: TcpStream, shared: &Shared) -> io::Result<()> {
         });
         match verb {
             "USER" => reply(&mut tls, "331 password required")?,
-            "PASS" => reply(&mut tls, "230 logged in")?,
+            "PASS" => reply(&mut tls,
+                            spec.login_reply.unwrap_or("230 logged in"))?,
             "TYPE" => reply(&mut tls, "200 type set")?,
             "SIZE" => match (spec.size_reply, file) {
                 (Some(text), _) => reply(&mut tls, text)?,
@@ -624,34 +697,56 @@ fn serve(tcp: TcpStream, shared: &Shared) -> io::Result<()> {
                     reply(&mut tls, &format!("213 {}", bytes.len()))?,
                 (None, None) => reply(&mut tls, "550 not found")?,
             },
+            "MDTM" => match spec.mdtm.iter()
+                .find(|(path, _)| path == arg
+                    || path.trim_start_matches('/')
+                        == arg.trim_start_matches('/'))
+            {
+                Some((_, stamp)) => reply(&mut tls, &format!("213 {stamp}"))?,
+                None => reply(&mut tls, "550 not found")?,
+            },
+            "CWD" => {
+                let known = arg == "/"
+                    || spec.listings.iter().any(|(dir, _)| same_dir(dir, arg));
+                reply(&mut tls, if known { "250 ok" } else { "550 not found" })?;
+            }
             "PASV" => {
                 let listener = TcpListener::bind((host, 0))?;
                 let p = listener.local_addr()?.port();
+                let [h1, h2, h3, h4] = spec.pasv_host;
                 reply(&mut tls, &format!(
-                    "227 Entering Passive Mode (127,0,0,1,{},{})",
+                    "227 Entering Passive Mode ({h1},{h2},{h3},{h4},{},{})",
                     p >> 8, p & 0xff))?;
                 data_listener = Some(listener);
             }
             "NLST" | "LIST" | "RETR" => {
+                let listed = spec.listings.iter()
+                    .find(|(dir, _)| same_dir(dir, arg))
+                    .map(|(_, lines)| lines.iter()
+                        .map(|line| format!("{line}\r\n"))
+                        .collect::<String>().into_bytes());
                 let body = match (verb, file) {
-                    ("NLST" | "LIST", _) if arg == "/" => spec.files.iter()
-                        .map(|(name, _)| format!("{name}\r\n"))
-                        .collect::<String>().into_bytes(),
-                    ("RETR", Some((_, bytes))) => bytes.clone(),
-                    _ => {
-                        reply(&mut tls, "550 not found")?;
-                        // the app connects the data connection before it
-                        // reads the reply, and closes it unused after a 550
-                        if spec.missing == Missing::AcceptData
-                            && let Some(listener) = data_listener.take()
-                            && let Ok((data, _)) = listener.accept()
-                        {
-                            data_accepts.fetch_add(1, Ordering::SeqCst);
-                            send_data(data, data_tls.clone(), b"",
-                                      DataMode::Serve).ok();
-                        }
-                        continue;
+                    // with listings set, LIST answers them and nothing else
+                    ("LIST", _) if !spec.listings.is_empty() => listed,
+                    ("NLST" | "LIST", _) if arg == "/" => Some(spec.files
+                        .iter().map(|(name, _)| format!("{name}\r\n"))
+                        .collect::<String>().into_bytes()),
+                    ("RETR", Some((_, bytes))) => Some(bytes.clone()),
+                    _ => None,
+                };
+                let Some(body) = body else {
+                    reply(&mut tls, "550 not found")?;
+                    // the app connects the data connection before it reads
+                    // the reply, and closes it unused after a 550
+                    if spec.missing == Missing::AcceptData
+                        && let Some(listener) = data_listener.take()
+                        && let Ok((data, _)) = listener.accept()
+                    {
+                        data_accepts.fetch_add(1, Ordering::SeqCst);
+                        send_data(data, data_tls.clone(), b"",
+                                  DataMode::Serve).ok();
                     }
+                    continue;
                 };
                 let Some(listener) = data_listener.take() else {
                     reply(&mut tls, "425 use PASV first")?;
@@ -666,6 +761,8 @@ fn serve(tcp: TcpStream, shared: &Shared) -> io::Result<()> {
                 }
             }
             "QUIT" => {
+                // the session ends before the client hears 221
+                session.end();
                 reply(&mut tls, "221 bye")?;
                 tls.conn.send_close_notify();
                 tls.flush().ok();
@@ -822,6 +919,29 @@ pub fn trickle_server(config: Arc<ServerConfig>, interval: Duration) -> u16 {
                     std::thread::sleep(interval);
                 }
                 std::thread::sleep(HOLD);
+            });
+        }
+    });
+    port
+}
+
+/// A server that answers every connection with one cleartext line and no
+/// TLS at all, like an FTP service that refuses the connection in the
+/// clear (design doc 5.10, "not TLS"). The socket is held for `hold`.
+pub fn cleartext_server(line: &'static str, hold: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut tcp) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut first = [0u8; 1];
+                if tcp.peek(&mut first).unwrap_or(0) == 0 {
+                    return;
+                }
+                tcp.write_all(format!("{line}\r\n").as_bytes()).ok();
+                tcp.flush().ok();
+                std::thread::sleep(hold);
             });
         }
     });

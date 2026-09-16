@@ -224,8 +224,10 @@ impl ServerProfile {
     pub fn date_rule(self) -> DateRule;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FtpError {
+    NoVerifier(PrinterCertError),      // no serial configured: nothing connects
+    RefusedByName,                     // H2C / P2S / X2D: refused by model name, no connection (5.3)
     Offline,                           // TCP connect timed out
     PortClosed,                        // TCP RST on :990
     HandshakeStall,                    // TCP ok, no TLS record from the server within the IO timeout
@@ -235,11 +237,14 @@ pub enum FtpError {
     AuthRejected,                      // 530
     NeedsTlsResume,                    // 522: third-party report for vsftpd; defensive only
     NotFound,                          // 550
-    SessionLost(String),               // EOF / decrypt error / reset mid-command
-    Cancelled,
+    UnreadableName,                    // '?' or U+FFFD in the path: never sent to the server
+    TooLarge { size: u64, max: u64 },  // above the browse lane's 1 MB cap: nothing was read
     Truncated { got: u64, want: u64 },
-    DiskFull { need: u64, free: u64 },
-    Local(String),                     // rename / create failed
+    SessionLost(String),               // EOF / decrypt error / reset mid-command, named by io::ErrorKind
+    Reply(String),                     // any other reply, without CRLF and capped at 160 characters
+    Local(String),                     // a local step failed: a thumbnail that does not decode, file writes later
+    Cancelled,
+    Poisoned,                          // a call on a session that already failed; nothing was sent
 }
 
 pub struct FtpSession {
@@ -309,7 +314,8 @@ pub fn parse_list_line(dir: &str, line: &str, rule: DateRule, printer_year: i32)
   - before any TLS byte it puts the socket in non-blocking mode and creates the connection's record;
   - every read and write then waits for progress at most the profile's IO timeout, retrying with pauses that double from 1 ms to 100 ms;
   - a handshake ends within 2 IO timeouts from its first byte, however the peer paces its bytes. Before this limit, a peer sending its handshake one byte just inside each IO timeout held the thread for hours (P2);
-  - a close writes the queued alert or close_notify for at most 2 s and never reads.
+  - a close writes the queued alert or close_notify for at most 2 s and never reads;
+  - the IO timeout is the profile's, but a session reads the banner only after its connector exists, so a profile learned from the banner applies to the **next** session of that worker. Nothing changes on BBL-P003 (20 s either way); a vsftpd printer would get its 60 s from its second session on.
 - **Cancel** sets the session's flag (`SessionConns::cancel`). Every waiting read or write sees it within 100 ms, shuts its socket down and fails. Once a connection of the session has failed, the session's reads fail at once too, so a data refusal is reported without waiting for the control reply.
 - Why not `shutdown()` from the cancelling thread: on Windows, `shutdown(Both)` through a `try_clone()` handle returns Ok but does not wake a read blocked in another thread; in P5 the read waited its full 6 s timeout.
 - Why non-blocking sockets rather than short `SO_RCVTIMEO` slices: Microsoft documents a socket as indeterminate after a receive timeout, and a lost byte would surface as a TLS record error, which 5.3 treats as a security failure.
@@ -698,58 +704,61 @@ Connections (stage 1b):
 //! enforcing the section 4 session budget. Replaces files::JobFetcher.
 
 pub enum Cmd {
-    List { dir: String, gen: u64 },
-    Thumb { key: CacheKey, remote: RemoteEntry, max_px: u32, gen: u64 },
-    Details { remote: RemoteEntry, plate_hint: Option<u32> },
-    GcodeHeader { remote: RemoteEntry },                 // retr_head(8 KB)
-    Download { id: u64, remote: RemoteEntry, dest: Dest },
-    JobBundle { job: String, file_name: String },
+    List { dir: String, generation: u64 },              // `gen` is a reserved word in Rust 2024
+    Thumb { remote: RemoteEntry, max_px: u32, generation: u64 },
+    JobBundle { job: String, file_name: String, print_type: String },
     SetPrinting(bool),          // from MQTT gcode_state
+    JobStarting,                // MQTT PREPARE, or a new job name while not RUNNING (section 4, rule 5)
     SetBackground(bool),        // inactive printer: drop prefetch, close idle session
+    Retry,                      // the user pressed Retry on the error or refusal card
     Stop,
+    // with the transfer lane: Details { remote, plate_hint }, GcodeHeader { remote },
+    // Download { id, remote, dest }, and the CacheKey that keys Thumb
 }
 
 pub enum Dest { Cache { open_after: bool }, SaveToPc }
 
 pub enum Event {
     Conn(ConnState),
-    Refused(Refusal),                                  // certificate refused: both lanes stopped (5.3)
-    Listed { dir: String, gen: u64, result: Result<Vec<RemoteEntry>, FtpError> },
-    Thumb { key: CacheKey, result: Result<egui::ColorImage, FtpError> },
-    Details { path: String, result: Result<threemf::ThreeMfInfo, FtpError> },
-    GcodeHeader { path: String, result: Result<gcode::Header, FtpError> },
+    Refused(Refusal),                                  // certificate refused: the lane stops (5.3)
+    Listed { dir: String, generation: u64, result: Result<Vec<RemoteEntry>, FtpError> },
+    Thumb { path: String, generation: u64, result: Result<egui::ColorImage, FtpError> },
     JobBundle { job: String, result: Result<files::JobBundle, FtpError> },
-    Queued { id: u64, reason: QueueReason },           // e.g. PrintingOneDownload
-    Progress { id: u64, done: u64, total: u64, bytes_per_s: f32 },
-    Done { id: u64, result: Result<PathBuf, FtpError> }, // Err(Cancelled) on cancel
-    Growing { path: String, size: u64 },               // "recording" check, 5.5
+    // with the transfer lane: Details, GcodeHeader, Queued, Progress, Done, Growing
 }
 
 pub struct FtpWorker {
     tx: crossbeam_channel::Sender<Cmd>,
     pub events: crossbeam_channel::Receiver<Event>,
-    cancels: Arc<Mutex<HashMap<u64, Arc<SessionConns>>>>,  // cancel() ends that transfer's session (5.2)
-    stop: Arc<AtomicBool>,
+    shared: Arc<Shared>,           // status, stop flag, the open session's SessionConns, the job's progress
+    start: Mutex<Option<Start>>,   // what the lane thread needs, until it is started lazily
 }
 
 impl FtpWorker {
-    /// Spawns the lane threads; returns immediately. No session is opened.
-    pub fn start(cfg: WorkerCfg, cache: Arc<cache::Cache>, ctx: egui::Context) -> Arc<Self>;
+    /// Nothing is connected until a command arrives: the lane thread starts with the first one.
+    pub fn start(cfg: &PrinterCfg, ctx: &egui::Context) -> Self;
+    /// After a connection edit: opens no session until the old lane thread has ended (section 4, rule 3).
+    pub fn start_replacing(cfg: &PrinterCfg, ctx: &egui::Context, previous: &FtpWorker) -> Self;
     pub fn send(&self, cmd: Cmd);
-    /// Cancels the transfer's session (not queued).
-    pub fn cancel(&self, id: u64);
-    /// Sets `stop`, cancels every session, drops the sender. Never joins.
+    /// Session state, open and most-open session counts, handshake kinds, server profile, printer year.
+    pub fn status(&self) -> Status;
+    pub fn job_progress(&self, job: &str) -> Option<u8>;
+    /// Sets `stop`, cancels the session, never joins. `Drop` runs it too.
     pub fn stop(&self);
-    pub fn active_transfers(&self) -> usize;
-}
-
-pub struct WorkerCfg {
-    pub ip: String,
-    pub serial: String,            // normalised; the verifier's CN check (5.3); memory only, never in errors or logs
-    pub access_code: String,       // kept in memory only, never formatted into errors
-    pub printer_key: String,       // cache::Cache::printer_key(serial)
+    pub fn has_ended(&self) -> bool;
+    // with the transfer lane: cancel(id), active_transfers()
 }
 ```
+
+The worker takes the printer's `PrinterCfg` and builds its `ftp::FtpEndpoint` (IP, normalised serial, access code and `PrinterTls`) itself, so there is no separate `WorkerCfg`; `printer_key` arrives with the disk cache.
+
+**Stage 2, part 1 (the browse lane) as built.** Interim choices, listed here because they differ from the sections above:
+- **One session per printer, never two.** The transfer lane does not exist yet, so nothing opens a second session; `Status::max_open_sessions` is asserted to stay 1 in the tests and on the three printers.
+- **`JobBundle` runs on the browse session whatever the size of the 3mf** (an unbounded RETR into memory), exactly as `JobFetch` did. The 1 MB cap of section 4 is enforced for thumbnails (`retr_small`); moving a larger bundle to the transfer lane comes with that lane.
+- **Listings are kept in memory only** (`BrowserState.dirs`); the JSON cache of 5.6 arrives with the disk cache, and so does the "updated 3 min ago" line for a cached listing (the header shows the age of the listing taken this session).
+- `Cmd::JobStarting` and `Cmd::Retry` were added: the first carries section 4 rule 5's signal from `main.rs` (MQTT `PREPARE`, or a new job name while not RUNNING), the second is the Retry of the error and refusal cards.
+- A background printer closes its idle session at once instead of after 12 s, which is what 5.4's `SetBackground` comment asks for.
+- A refusal is reported once and the lane then answers every later command from its stopped state, so a refused printer costs one connection, not one per command.
 
 **Routing and priority (browse lane):** `List` > `Details` for the user's selection > `JobBundle` > `GcodeHeader` > `Thumb`.
 - Thumbnails run LIFO within the latest `gen`, so visible tiles load first; stale generations are dropped.
@@ -766,19 +775,17 @@ pub struct WorkerCfg {
 
 ```rust
 pub struct BrowserState {
-    pub conn: ConnState,                     // Idle | Connecting{since} | Ready | Failed(FtpError)
-    pub dirs: HashMap<String, DirState>,     // Loading | Ready{entries, fetched_at} | Missing | Failed
+    pub conn: ConnState,                     // Closed | Connecting{since} | Open{idle_since} | Stopped(FtpError)
+    pub dirs: HashMap<String, DirState>,     // Loading | Ready{entries, fetched_at} | Missing | Failed(FtpError)
     pub timelapses: Vec<TimelapseItem>,      // derived by stem pairing
     pub recordings: Vec<RemoteEntry>,        // /ipcam, newest first
     pub files: Vec<FileItem>,                // derived; .bbl hidden
     pub other_dirs: Vec<RemoteEntry>,        // root dirs outside the known set
     pub unreadable: HashMap<String, usize>,  // "/timelapse" -> 692
-    pub thumbs: ThumbLru,                    // CacheKey -> TextureHandle, cap ~150
-    pub details: HashMap<String, Result<threemf::ThreeMfInfo, FtpError>>,
-    pub headers: HashMap<String, Result<gcode::Header, FtpError>>,
-    pub transfers: Vec<Transfer>,            // id, name, dest, done, total, rate, state
-    pub rate_bps: f32,                       // rolling, default 200_000
+    pub thumbs: HashMap<String, ThumbState>, // Loading | Ready(ColorImage) | Failed; the texture LRU is the view's
     pub cert_alert: Option<Refusal>,         // shown as the refusal card (section 6)
+    pub error: Option<FtpError>,             // what stopped the lane, shown as an error card with Retry
+    // with the transfer lane: details, headers, transfers, rate_bps
 }
 
 pub struct TimelapseItem {
@@ -786,7 +793,7 @@ pub struct TimelapseItem {
     pub thumb: Option<RemoteEntry>,
     pub started: Option<NaiveDateTime>,      // parsed from video_YYYY-MM-DD_HH-MM-SS
     pub ended: Option<NaiveDateTime>,        // LIST mtime of video/thumb
-    pub recording: bool,                     // confirmed by size growth, 5.5
+    // `recording` comes with the size-growth check of 5.5, a later stage
 }
 
 pub enum FileKind { SentJob, CacheProject, CacheGcode, BuiltIn, PlainGcode, Other }
@@ -1101,6 +1108,14 @@ There is no trust, accept or continue action. Close is the default: focused, and
 - The view follows the selected chip. The previous printer's downloads keep running, badged on its chip.
 - Background printers stop prefetch and close idle sessions after 12 s.
 - Closing the app, removing a printer or editing its connection with a download running asks for confirmation; `.part` files are discarded.
+
+**Stage 2, part 2 (the files view) as built.** Differences from the sections above, all of them because the transfer lane and the player are not built yet:
+- **No action the stage cannot perform is shown.** There is no Download, Save to PC, Load preview, Read header, Open in player, Show in folder, Clear cache or transfer bar, and the detail pane is facts only (name, size, printer-clock time, kind, plate and the root job of a `/cache` companion). No dead buttons, and no per-tile action overlay: a tile shows waiting, its thumbnail, or "no video".
+- **Virtualisation** is a `show_viewport` helper of the view's own, not `ScrollArea::show_rows`: the rows have different heights (month headings, tile rows, `/cache` companion lines, folder rows), which `show_rows` cannot express. It is the "equivalent that does not nest inside the outer `ScrollArea`" this section asks for, and the files view still replaces the panel instead of being drawn inside it.
+- **The header line has no SD state** ("SD ok"): the `print.aux` / `home_flag` bits of 5.10 are not read yet. It shows used space per listed directory, "updated N ago", "(printer clock)", Refresh and the browse session's state.
+- **The texture LRU is the view's** (5.4): a decoded thumbnail is handed over once (`BrowserState::take_ready_thumb`, which leaves `ThumbState::Shown`), the view keeps at most 150 textures and drops them when it closes; a dropped tile is forgotten (`forget_thumb`) so it is fetched again if it comes back.
+- **Recordings have no thumbnails** and no size-growth "recording…" state, which needs the SIZE checks of 5.5.
+- **Debug builds only:** `BAMBU_CONTROL_OPEN_FILES="<printer index>[:timelapses|recordings|files]"` (zero-based index) opens that view at start, for the G4 screenshot. `cfg(debug_assertions)` keeps it out of release builds.
 
 ---
 
