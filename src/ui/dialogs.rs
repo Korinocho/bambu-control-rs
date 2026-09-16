@@ -58,7 +58,7 @@ fn wide_button(ui: &mut egui::Ui, text: &str) -> bool {
         .clicked()
 }
 
-fn accent_button(ui: &mut egui::Ui, text: &str) -> bool {
+pub(crate) fn accent_button(ui: &mut egui::Ui, text: &str) -> bool {
     let btn = egui::Button::new(
         RichText::new(text).color(Color32::from_rgb(0x06, 0x13, 0x0a))
             .font(theme::bold(13.5)))

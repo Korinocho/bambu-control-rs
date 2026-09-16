@@ -65,6 +65,8 @@ pub enum PanelAction {
     SetLight(bool),
     OpenHmsDialog,
     OpenMaintenance,
+    /// the FILES card: the files view of design doc 6
+    OpenFiles,
 }
 
 pub struct PanelView<'a> {
@@ -80,9 +82,13 @@ pub struct PanelView<'a> {
     pub show_humidity: bool,
     pub model: String,
     pub light_shown_on: bool,
+    /// FILES card value: counts from the listing taken this session, else
+    /// the tab names (design doc 6)
+    pub files_summary: String,
 }
 
-fn card_frame(ui: &mut Ui, add: impl FnOnce(&mut Ui)) -> egui::Response {
+pub(crate) fn card_frame(ui: &mut Ui, add: impl FnOnce(&mut Ui))
+                         -> egui::Response {
     egui::Frame::new()
         .fill(theme::CARD)
         .stroke(Stroke::new(1.0, theme::BORDER))
@@ -559,6 +565,10 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             };
             if clickable_card(ui, "MAINTENANCE", &maint_value) {
                 actions.push(PanelAction::OpenMaintenance);
+            }
+            // the printer's SD card: timelapses, recordings, print files
+            if clickable_card(ui, "FILES", &view.files_summary) {
+                actions.push(PanelAction::OpenFiles);
             }
             ams_card(ui, state, view.show_humidity);
         }

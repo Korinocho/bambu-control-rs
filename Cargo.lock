@@ -437,6 +437,7 @@ name = "bambu-control"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crossbeam-channel",
  "eframe",
  "egui",
@@ -451,6 +452,7 @@ dependencies = [
  "suppaftp",
  "toml",
  "ureq",
+ "windows-sys 0.61.2",
  "winresource",
  "x509-cert",
  "zip",
