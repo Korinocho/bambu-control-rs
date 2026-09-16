@@ -469,6 +469,7 @@ pub fn read_3mf(data: Vec<u8>, reported_plate: Option<u32>)
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::io::{Cursor, Write};
 
     use zip::write::SimpleFileOptions;
@@ -488,19 +489,34 @@ mod tests {
 
     /// slice_info with one `<plate>` block per index: (index, id, name).
     fn slice_info(objects: &[(u32, i64, &str)]) -> String {
+        let flagged: Vec<(u32, i64, &str, bool)> = objects.iter()
+            .map(|(index, iid, name)| (*index, *iid, *name, false))
+            .collect();
+        slice_info_with(&flagged, false)
+    }
+
+    /// The same, with each object's `skipped` flag and the
+    /// `label_object_enabled` setting Studio writes into the plate block of
+    /// a job whose objects can be skipped.
+    fn slice_info_with(objects: &[(u32, i64, &str, bool)], label: bool)
+                       -> String {
         let mut xml = String::from("<config>");
         let mut open = None;
-        for (index, iid, name) in objects {
+        for (index, iid, name, skipped) in objects {
             if open != Some(*index) {
                 if open.is_some() {
                     xml += "</plate>\n";
                 }
                 xml += &format!("<plate>\n  \
                     <metadata key=\"index\" value=\"{index}\"/>\n");
+                if label {
+                    xml += "  <metadata key=\"label_object_enabled\" \
+                            value=\"true\"/>\n";
+                }
                 open = Some(*index);
             }
             xml += &format!("  <object identify_id=\"{iid}\" \
-                name=\"{name}\" skipped=\"false\" />\n");
+                name=\"{name}\" skipped=\"{skipped}\" />\n");
         }
         if open.is_some() {
             xml += "</plate>\n";
@@ -557,6 +573,39 @@ mod tests {
         ]);
         let bundle = read_3mf(data, None).unwrap();
         assert_eq!(bundle.plate_png.as_deref(), Some(&b"plate-2"[..]));
+    }
+
+    /// The skip dialog starts from what the job says: the objects
+    /// slice_info already marked skipped, and whether the job can skip at
+    /// all (`label_object_enabled`, which the slicer writes only when the
+    /// gcode labels its objects).
+    #[test]
+    fn skipped_objects_and_the_label_setting_come_from_slice_info() {
+        let info = slice_info_with(&[(1, 11, "part", false),
+                                     (1, 12, "lid", true),
+                                     (1, 13, "base", false)], true);
+        let data = make_3mf(&[
+            ("Metadata/plate_1.gcode", b"; gcode"),
+            ("Metadata/slice_info.config", info.as_bytes()),
+        ]);
+        let bundle = read_3mf(data, None).unwrap();
+        assert_eq!(bundle.objects.len(), 3);
+        assert_eq!(bundle.skipped, HashSet::from([12]),
+                   "only the object the job marked skipped");
+        assert!(bundle.label_objects, "this job can skip objects");
+
+        // without the setting nothing may be skipped, whatever the dialog
+        // is asked to show
+        let info = slice_info_with(&[(1, 11, "part", false),
+                                     (1, 12, "lid", true)], false);
+        let data = make_3mf(&[
+            ("Metadata/plate_1.gcode", b"; gcode"),
+            ("Metadata/slice_info.config", info.as_bytes()),
+        ]);
+        let bundle = read_3mf(data, None).unwrap();
+        assert_eq!(bundle.skipped, HashSet::from([12]));
+        assert!(!bundle.label_objects,
+                "a job without label_object_enabled cannot skip objects");
     }
 
     #[test]

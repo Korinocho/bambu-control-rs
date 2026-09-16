@@ -1,6 +1,14 @@
 //! Single instance (design doc 4, rule 6). A named mutex keeps a second
 //! launch from doubling every printer's FTP session count: the second
 //! process shows a native message and exits without touching a printer.
+//!
+//! It is a courtesy guard, not a security boundary. Any process in this
+//! Windows session can create the name first, and this app would then
+//! believe it is already running; a mutex that cannot be created at all
+//! lets the app run (below), and the `Local\` namespace is per session, so
+//! two logged-in users still get one instance each. All of that is
+//! acceptable: the guard exists to stop a second copy of this app from
+//! doubling the session count, not to keep anyone out.
 
 /// The name of the mutex, in the session namespace: one instance per
 /// Windows session, which is what the session budget is about.

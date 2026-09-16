@@ -29,24 +29,26 @@ Printer serial numbers appear in the file names under `/logger` and
 `/recorder` (design doc 3.2), so those names are replaced before anything is
 committed:
 
-1. Every name under `/logger` and `/recorder`, at any depth, is replaced by a
-   synthetic name of the same shape: `<SERIAL>_MM-DD_HH_MM_SS.mmm_vA.B.C.D_
-   idx_N.log`, `CMN_<SERIAL>_..._idx_N.bin`, `file_NNNN.<ext>` for the other
-   files and `dir_NNNN` for other directories, where `<SERIAL>` is the
-   synthetic `01P00Z9X8W7V6U5` used by the rest of the test suite. Generic
-   directory names (`cache`, `image`, `ipcam`, `model`, `recorder`,
-   `timelapse`, `hms`, `md5`, `latest`, `System Volume Information`) and the
-   unreadable `?` names are kept, because they carry nothing.
-2. Any serial-shaped token (15 characters, `[0-9]{2}[0-9A-Z]{13}`) anywhere
-   else is replaced by the same synthetic serial.
+1. Every name under `/logger` and `/recorder`, at any depth, is replaced by
+   `file_NNNN`, keeping the extension when the name had one (`file_0002.log`,
+   `file_0731.bin`), numbered in the order the names appear. Nothing of the
+   original name survives: not the serial, not the timestamp, not the
+   firmware version, so the shape of a printer's log names cannot be read
+   back from here either. Generic directory names (`cache`, `image`,
+   `ipcam`, `model`, `recorder`, `timelapse`, `hms`, `md5`, `latest`,
+   `System Volume Information`) and the unreadable `?` names are kept,
+   because they carry nothing.
+2. Any serial-shaped token (15 characters, `[0-9]{2}[0-9A-Z]{13}`) left
+   anywhere else would be replaced too; step 1 leaves none.
 3. The permissions, link count, owner, group, size and date of those lines
    are untouched, so 961 names changed and no other byte did.
 
 Checked on the committed files: no configured serial, IP address or access
-code appears; no serial-shaped token other than the synthetic one appears;
-and the longest run of consecutive characters of any real serial found
-anywhere is 4 characters, all of them inside dates and md5-style file names,
-where they are coincidences of hex digits.
+code appears; no serial-shaped token appears at all, not even the synthetic
+`01P00Z9X8W7V6U5` the other fixtures use; and the longest run of consecutive
+characters of any real serial found anywhere is 4 characters, all of them
+inside dates and md5-style file names, where they are coincidences of hex
+digits.
 
 Nothing here is regenerated automatically: a new capture is scrubbed the same
 way before it is committed, and the check above is re-run.

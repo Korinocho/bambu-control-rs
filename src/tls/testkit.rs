@@ -434,6 +434,9 @@ pub struct FtpSpec {
     pub listings: Vec<(String, Vec<String>)>,
     /// MDTM replies: path -> "YYYYMMDDHHMMSS"; every other path is 550
     pub mdtm: Vec<(String, String)>,
+    /// the reply to every MDTM, instead of 213 or 550: a server that does
+    /// not implement it (design doc 5.2)
+    pub mdtm_reply: Option<&'static str>,
     /// the reply to PASS, instead of 230
     pub login_reply: Option<&'static str>,
     /// the host the 227 reply names; the NAT workaround replaces it with
@@ -459,6 +462,7 @@ impl FtpSpec {
             files,
             listings: Vec::new(),
             mdtm: Vec::new(),
+            mdtm_reply: None,
             login_reply: None,
             pasv_host: [127, 0, 0, 1],
             drop_after_hello: false,
@@ -697,13 +701,15 @@ fn serve(tcp: TcpStream, shared: &Shared) -> io::Result<()> {
                     reply(&mut tls, &format!("213 {}", bytes.len()))?,
                 (None, None) => reply(&mut tls, "550 not found")?,
             },
-            "MDTM" => match spec.mdtm.iter()
+            "MDTM" => match (spec.mdtm_reply, spec.mdtm.iter()
                 .find(|(path, _)| path == arg
                     || path.trim_start_matches('/')
-                        == arg.trim_start_matches('/'))
+                        == arg.trim_start_matches('/')))
             {
-                Some((_, stamp)) => reply(&mut tls, &format!("213 {stamp}"))?,
-                None => reply(&mut tls, "550 not found")?,
+                (Some(text), _) => reply(&mut tls, text)?,
+                (None, Some((_, stamp))) =>
+                    reply(&mut tls, &format!("213 {stamp}"))?,
+                (None, None) => reply(&mut tls, "550 not found")?,
             },
             "CWD" => {
                 let known = arg == "/"

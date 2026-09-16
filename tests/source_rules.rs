@@ -83,6 +83,22 @@ fn tls_module_never_calls_the_rustls_signature_helper() {
             found.join("\n"));
 }
 
+/// Design doc 4, rule 6: `main` takes the single-instance mutex before it
+/// opens a window, and a second launch says so and exits without touching a
+/// printer. The mutex itself has unit tests; `main()` has none, so its
+/// wiring is scanned here.
+#[test]
+fn main_takes_the_single_instance_mutex() {
+    let main = root().join("src").join("main.rs");
+    let text = std::fs::read_to_string(&main).expect("utf-8 source");
+    for needle in ["instance::acquire(instance::MUTEX_NAME)",
+                   "instance::show_already_running()",
+                   "Err(instance::AlreadyRunning)"] {
+        assert!(text.contains(needle),
+                "src/main.rs no longer has {needle} (design doc 4, rule 6)");
+    }
+}
+
 /// T24 (the CI grep, locally): no certificate checks disabled in FTPS code,
 /// the vendored suppaftp included.
 #[test]

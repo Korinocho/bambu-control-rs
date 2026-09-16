@@ -30,8 +30,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::config::PrinterCfg;
 use crate::files::{self, JobBundle};
-use crate::ftp::{BROWSE_IDLE_QUIT, FtpEndpoint, FtpError, FtpSession,
-                 Handshakes, RemoteEntry, ServerProfile};
+use crate::ftp::{BROWSE_IDLE_QUIT, BUNDLE_RETR_MAX, FtpEndpoint, FtpError,
+                 FtpSession, Handshakes, RemoteEntry, ServerProfile};
 use crate::tls::{Refusal, SessionConns};
 
 /// A tile is prefetched only once it has been visible this long (section 4).
@@ -159,15 +159,19 @@ pub struct Status {
 }
 
 /// Time limits of the worker, injectable so the tests never wait 12 s.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
     pub idle_quit: Duration,
     pub stall_retry: Duration,
+    /// how long a replacement worker waits for the lane it replaces before
+    /// it starts answering; it opens no session while that lane lives
+    pub predecessor_wait: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { idle_quit: BROWSE_IDLE_QUIT, stall_retry: STALL_RETRY }
+        Self { idle_quit: BROWSE_IDLE_QUIT, stall_retry: STALL_RETRY,
+               predecessor_wait: PREDECESSOR_WAIT }
     }
 }
 
@@ -245,6 +249,15 @@ impl FtpWorker {
         previous.stop();
         Self::build(endpoint, timing, ctx,
                     Some(previous.shared.ended.clone()))
+    }
+
+    /// A worker whose predecessor's lane ends when `ended` says so: the
+    /// tests drive that flag instead of racing a real lane to its end.
+    #[cfg(test)]
+    pub fn for_test_after(endpoint: FtpEndpoint, timing: Timing,
+                          ctx: &egui::Context, ended: Arc<AtomicBool>)
+                          -> Self {
+        Self::build(endpoint, timing, ctx, Some(ended))
     }
 
     fn build(endpoint: FtpEndpoint, timing: Timing, ctx: &egui::Context,
@@ -592,14 +605,27 @@ impl Lane {
     }
 
     /// Section 4, rule 3: the worker this one replaces has its session
-    /// fully dropped before this one opens any.
-    fn wait_for_predecessor(&self) {
+    /// fully dropped before this one opens any. The wait here is only
+    /// politeness — `open_session` is the rule itself, and it refuses while
+    /// the old lane lives, however long that takes.
+    fn wait_for_predecessor(&mut self) {
         let Some(ended) = &self.predecessor else { return };
         let started = Instant::now();
         while !ended.load(Ordering::SeqCst) && !self.stopping()
-            && started.elapsed() < PREDECESSOR_WAIT
+            && started.elapsed() < self.timing.predecessor_wait
         {
             std::thread::sleep(Duration::from_millis(20));
+        }
+        self.forget_ended_predecessor();
+    }
+
+    /// Drops the predecessor once its lane has ended, so nothing is checked
+    /// again afterwards.
+    fn forget_ended_predecessor(&mut self) {
+        if self.predecessor.as_ref()
+            .is_some_and(|ended| ended.load(Ordering::SeqCst))
+        {
+            self.predecessor = None;
         }
     }
 
@@ -736,13 +762,17 @@ impl Lane {
             else {
                 return Ok(None);
             };
-            // SIZE only feeds the progress bar: a 550 leaves it unknown
+            // SIZE feeds the progress bar, and refuses a bundle that is
+            // over the lane's cap before a data connection opens
             let total = match ftp.size(&target) {
+                Ok(size) if size > BUNDLE_RETR_MAX =>
+                    return Err(FtpError::TooLarge { size,
+                                                    max: BUNDLE_RETR_MAX }),
                 Ok(size) => Some(size),
                 Err(FtpError::NotFound) => None,
                 Err(failure) => return Err(failure),
             };
-            let data = ftp.retr_unbounded(&target, &mut |got| {
+            let data = ftp.retr_bounded(&target, BUNDLE_RETR_MAX, &mut |got| {
                 let Some(total) = total.filter(|total| *total > 0) else {
                     return;
                 };
@@ -828,6 +858,15 @@ impl Lane {
     }
 
     fn open_session(&mut self) -> Result<(), FtpError> {
+        self.forget_ended_predecessor();
+        if self.predecessor.is_some() {
+            // the lane this worker replaces still holds its session:
+            // opening one now would be this printer's second (section 4,
+            // rule 3). The next command tries again, so a predecessor that
+            // ends normally costs nothing.
+            return Err(FtpError::Local(
+                "still closing the previous connection".into()));
+        }
         let conns = SessionConns::new();
         *lock(&self.shared.conns) = Some(conns.clone());
         self.set_conn(ConnState::Connecting { since: Instant::now() });
@@ -1078,6 +1117,10 @@ impl BrowserState {
         self.error = None;
         self.dirs.clear();
         self.unreadable.clear();
+        // a request of the older generation is dropped when it comes back,
+        // so its tile would stay "loading" for ever and hold the one
+        // request the view keeps in flight (section 4)
+        self.thumbs.retain(|_, thumb| !matches!(thumb, ThumbState::Loading));
         vec![self.list("/")]
     }
 
@@ -1103,15 +1146,17 @@ impl BrowserState {
         vec![self.list(dir)]
     }
 
-    /// Asks for a tile's thumbnail unless it is already loading or loaded.
-    /// The view calls this for tiles that have been visible for
-    /// `PREFETCH_VISIBLE` (section 4).
+    /// Asks for a tile's thumbnail unless it is already loading, loaded or
+    /// failed. The view calls this for tiles that have been visible for
+    /// `PREFETCH_VISIBLE` (section 4). A tile that failed is asked for
+    /// again only when the user retries it (`forget_thumb`), never once per
+    /// frame for as long as it is on screen.
     pub fn request_thumb(&mut self, remote: &RemoteEntry, max_px: u32)
                          -> Option<Cmd> {
         if remote.unreadable
             || matches!(self.thumbs.get(&remote.path),
                         Some(ThumbState::Loading | ThumbState::Ready(_)
-                             | ThumbState::Shown))
+                             | ThumbState::Shown | ThumbState::Failed(_)))
         {
             return None;
         }
@@ -1138,10 +1183,19 @@ impl BrowserState {
         }
     }
 
-    /// The view dropped this tile's texture (its LRU is the view's, 5.4), so
-    /// a tile that becomes visible again is fetched once more.
+    /// The view dropped this tile's texture (its LRU is the view's, 5.4), or
+    /// the user retried a failed tile, so it is fetched once more.
     pub fn forget_thumb(&mut self, path: &str) {
         self.thumbs.remove(path);
+    }
+
+    /// A thumbnail request is in flight. The worker keeps one prefetch
+    /// (section 4), so the view asks for the next tile only once this is
+    /// false; asking for every visible tile only produces cancellations and
+    /// a new request per frame.
+    pub fn thumb_in_flight(&self) -> bool {
+        self.thumbs.values()
+            .any(|thumb| matches!(thumb, ThumbState::Loading))
     }
 
     /// Folds one worker event in and returns the listings it starts.
@@ -1223,9 +1277,10 @@ impl BrowserState {
                 if let FtpError::CertRefused(refusal) = &err {
                     self.cert_alert = Some(*refusal);
                 }
-                if err.stops_the_worker() {
-                    self.error = Some(err.clone());
-                }
+                // every failure gets the error card of 5.10 with its Retry,
+                // not only the ones that stop the lane: an offline printer
+                // must never read as "no timelapses on this printer"
+                self.error = Some(err.clone());
                 self.dirs.insert(dir, DirState::Failed(err));
             }
         }
@@ -1335,11 +1390,14 @@ impl BrowserState {
     }
 
     /// Bytes listed under `dir` and its listed subdirectories, for the
-    /// header's used-space line (section 6).
+    /// header's used-space line (section 6). "/" is the root's own files,
+    /// so the parts of that line never contain one another; the whole card
+    /// is `total_bytes`.
     pub fn used_bytes(&self, dir: &str) -> u64 {
         let prefix = format!("{}/", dir.trim_end_matches('/'));
         self.dirs.iter()
-            .filter(|(path, _)| *path == dir || path.starts_with(&prefix))
+            .filter(|(path, _)| *path == dir
+                || (dir != "/" && path.starts_with(&prefix)))
             .filter_map(|(_, state)| match state {
                 DirState::Ready { entries, .. } => Some(entries),
                 _ => None,
@@ -1348,6 +1406,40 @@ impl BrowserState {
             .filter(|entry| !entry.is_dir)
             .map(|entry| entry.size)
             .sum()
+    }
+
+    /// Every listing taken so far: the header's "total".
+    pub fn total_bytes(&self) -> u64 {
+        self.dirs.values()
+            .filter_map(|state| match state {
+                DirState::Ready { entries, .. } => Some(entries),
+                _ => None,
+            })
+            .flatten()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.size)
+            .sum()
+    }
+
+    /// The listing of `dir` failed for a reason other than a missing
+    /// folder: the view shows the 5.10 card, never an empty reason.
+    pub fn dir_failed(&self, dir: &str) -> bool {
+        matches!(self.dirs.get(dir), Some(DirState::Failed(_)))
+    }
+
+    /// A listing round is in flight, so nothing starts another one.
+    pub fn is_listing(&self) -> bool {
+        self.dirs.values().any(|state| matches!(state, DirState::Loading))
+    }
+
+    /// `/ipcam` has been listed (or the root says there is none), so the
+    /// Recordings count means something. It is listed on demand (5.5).
+    pub fn recordings_listed(&self) -> bool {
+        match self.root_dir(RECORDINGS_DIR) {
+            Some(dir) => self.dirs.contains_key(&dir),
+            None => matches!(self.dirs.get("/"),
+                             Some(DirState::Ready { .. })),
+        }
     }
 
     /// When the newest listing of this round was taken ("updated N ago").
@@ -1364,6 +1456,14 @@ impl BrowserState {
     /// slicer-warning reason needs a 3mf read and comes later.
     pub fn timelapse_notice(&self) -> Option<&'static str> {
         if self.timelapses.iter().any(|item| item.video.is_some()) {
+            return None;
+        }
+        // a listing that failed is an error card with Retry (5.10): saying
+        // "no timelapses on this printer" about a printer that never
+        // answered would be a statement the app cannot make
+        let timelapse_failed = self.root_dir("timelapse")
+            .is_some_and(|dir| self.dir_failed(&dir));
+        if self.dir_failed("/") || timelapse_failed {
             return None;
         }
         let damaged = self.unreadable.keys()
@@ -1389,9 +1489,14 @@ fn file_stem(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
+/// These names come straight from the card, so the tail is taken on a
+/// character boundary or not at all: slicing at a byte offset panics on a
+/// name that ends in a multi-byte character, and a panic aborts a release
+/// build (5.1, rule 6).
 fn has_extension(name: &str, ext: &str) -> bool {
     name.len() > ext.len()
-        && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
+        && name.get(name.len() - ext.len()..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(ext))
 }
 
 /// A timelapse video: `video_YYYY-MM-DD_HH-MM-SS.avi` (`.mp4` on the
@@ -1623,13 +1728,17 @@ mod tests {
     const ACCESS_CODE: &str = "12345678";
     /// Everything here answers well inside this.
     const BOUND: Duration = Duration::from_secs(5);
-    /// An answer that needs no connection comes back inside this.
-    const AT_ONCE: Duration = Duration::from_millis(400);
+    /// An answer that needs no connection comes back inside this. Any path
+    /// that opens a socket takes at least the 5 s connect timeout or the IO
+    /// timeout, so this separates the two with three orders of magnitude to
+    /// spare and no sensitivity to the machine's load.
+    const AT_ONCE: Duration = Duration::from_secs(1);
     const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
     fn fast() -> Timing {
         Timing { idle_quit: Duration::from_millis(300),
-                 stall_retry: Duration::from_millis(200) }
+                 stall_retry: Duration::from_millis(200),
+                 predecessor_wait: Duration::from_secs(2) }
     }
 
     fn worker_on(port: u16, serial: &str, timing: Timing,
@@ -1824,6 +1933,57 @@ mod tests {
         assert_eq!(dropped[0].remote.name, "old.jpg");
         assert!(matches!(queue.next(), Some(Work::List(_))));
         assert!(queue.next().is_none(), "no stale tile ran");
+    }
+
+    /// Section 4's budget in its own numbers. Every worker test injects
+    /// fast timings, so nothing else here would notice a drifted limit.
+    #[test]
+    fn the_session_budget_keeps_its_documented_limits() {
+        assert_eq!(BROWSE_IDLE_QUIT, Duration::from_secs(12));
+        assert_eq!(STALL_RETRY, Duration::from_secs(2));
+        assert_eq!(PREDECESSOR_WAIT, Duration::from_secs(30));
+        assert_eq!(PREFETCH_VISIBLE, Duration::from_millis(500));
+        assert_eq!(PREFETCH_QUEUE, 1);
+        assert_eq!(REPAINT, Duration::from_millis(100));
+        assert_eq!(Timing::default(), Timing {
+            idle_quit: Duration::from_secs(12),
+            stall_retry: Duration::from_secs(2),
+            predecessor_wait: Duration::from_secs(30),
+        });
+    }
+
+    /// 5.1, rule 6: these names come from the card, so nothing slices them
+    /// at a byte offset. A name ending in a multi-byte character used to
+    /// panic here, on the UI thread, in a build that aborts on a panic.
+    #[test]
+    fn names_that_end_in_a_multi_byte_character_are_not_sliced() {
+        let names = ["模型", "video_模型", "part—", "x.3mf模型", "vídeo…"];
+        let mut videos: Vec<RemoteEntry> = names.iter()
+            .map(|name| entry(&format!("/timelapse/{name}"), 10))
+            .collect();
+        videos.push(entry("/timelapse/video_2026-06-01_06-11-57.avi", 10));
+        let thumbs: Vec<RemoteEntry> = names.iter()
+            .map(|name| entry(&format!("/timelapse/thumbnail/{name}"), 10))
+            .collect();
+        let items = timelapse_items(&videos, &thumbs);
+        assert_eq!(items.len(), 1, "only the one real video");
+
+        let root: Vec<RemoteEntry> = names.iter()
+            .map(|name| entry(&format!("/{name}"), 10)).collect();
+        let cache: Vec<RemoteEntry> = names.iter()
+            .map(|name| entry(&format!("/cache/{name}"), 10)).collect();
+        let listings = vec![("/".to_string(), root),
+                            ("/cache".to_string(), cache)];
+        assert_eq!(file_items(&listings, Some("/cache"), None).len(),
+                   names.len() * 2, "every name is listed, none is hidden");
+
+        // and the helper itself, on the extensions it is asked for
+        for ext in [".bbl", ".avi", ".mp4", ".jpg", ".gcode.3mf"] {
+            for name in names {
+                assert!(!has_extension(name, ext), "{name:?} {ext}");
+            }
+            assert!(has_extension(&format!("模型{ext}"), ext), "{ext}");
+        }
     }
 
     /// The G4 line of section 6.
@@ -2040,7 +2200,12 @@ mod tests {
         // listings already taken (section 6)
         assert_eq!(state.generation(), 1);
         assert_eq!(state.used_bytes("/timelapse"), 4_411_548 + 19_830);
-        assert_eq!(state.used_bytes("/"), 52_341 + 4_411_548 + 19_830);
+        // the root is its own files, so the parts of the header line never
+        // contain one another; the whole card is total_bytes
+        assert_eq!(state.used_bytes("/"), 52_341);
+        assert_eq!(state.total_bytes(), 52_341 + 4_411_548 + 19_830);
+        assert!(!state.recordings_listed(),
+                "the Recordings count is not known before its tab opens");
         assert!(state.updated_at()
             .is_some_and(|when| when.elapsed() < Duration::from_secs(5)));
         assert!(matches!(state.dirs.get("/"),
@@ -2052,8 +2217,86 @@ mod tests {
         let cmds = state.open_recordings();
         let listed = plan(&mut state, cmds, &answers);
         assert_eq!(listed, ["/ipcam"]);
+        assert!(state.recordings_listed());
         let cmds = state.open_recordings();
         assert!(plan(&mut state, cmds, &answers).is_empty());
+    }
+
+    /// 5.10: a listing that failed is the condition's error card with a
+    /// Retry, never an empty tab whose reason states something untrue.
+    #[test]
+    fn a_failed_listing_is_an_error_not_an_empty_reason() {
+        let failures = [
+            FtpError::Offline,
+            FtpError::PortClosed,
+            FtpError::SessionLost("unexpected end of file".into()),
+            FtpError::Reply("421 too many connections".into()),
+        ];
+        for failure in failures {
+            let mut state = BrowserState::default();
+            let _ = state.refresh();
+            let generation = state.generation();
+            state.apply(Event::Listed { dir: "/".into(), generation,
+                                        result: Err(failure.clone()) });
+            assert_eq!(state.error, Some(failure.clone()), "{failure:?}");
+            assert!(state.dir_failed("/"), "{failure:?}");
+            assert_eq!(state.timelapse_notice(), None, "{failure:?}");
+        }
+
+        // a directory that failed under a root that answered
+        let mut state = BrowserState::default();
+        let answers = [("/", Ok(dir_entries("/", &ROOT_LINES))),
+                       ("/cache", Ok(Vec::new())),
+                       ("/timelapse",
+                        Err(FtpError::SessionLost("reset".into())))];
+        let cmds = state.refresh();
+        plan(&mut state, cmds, &answers);
+        assert!(matches!(state.error, Some(FtpError::SessionLost(_))),
+                "{:?}", state.error);
+        assert!(state.dir_failed("/timelapse"));
+        assert_eq!(state.timelapse_notice(), None);
+
+        // a missing folder is not a failure: it keeps its own wording
+        let mut state = BrowserState::default();
+        let _ = state.refresh();
+        let generation = state.generation();
+        state.apply(Event::Listed { dir: "/".into(), generation,
+                                    result: Err(FtpError::NotFound) });
+        assert_eq!(state.error, None);
+        assert!(matches!(state.dirs.get("/"), Some(DirState::Missing)));
+    }
+
+    /// 5.4: a result of an older round never lands in the view, whatever
+    /// the worker's own queue did with it.
+    #[test]
+    fn a_stale_result_never_lands_in_the_view() {
+        let mut state = BrowserState::default();
+        let _ = state.refresh();
+        let old = state.generation();
+        assert!(state.is_listing(), "the round is in flight");
+        let remote = entry("/timelapse/thumbnail/a.jpg", 19_830);
+        state.request_thumb(&remote, 160).expect("a request");
+        assert!(state.thumb_in_flight());
+
+        let _ = state.refresh();
+        assert!(state.generation() > old);
+        assert!(!state.thumb_in_flight(),
+                "a request of the old round no longer holds the lane");
+
+        // the old round's listing does not repopulate this round's state
+        let next = state.apply(Event::Listed {
+            dir: "/".into(), generation: old,
+            result: Ok(dir_entries("/", &ROOT_LINES)) });
+        assert!(next.is_empty(), "{next:?}");
+        assert!(matches!(state.dirs.get("/"), Some(DirState::Loading)));
+        assert!(state.timelapses.is_empty() && state.files.is_empty());
+
+        // nor does its picture
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([2, 2], &[7u8; 16]);
+        state.apply(Event::Thumb { path: remote.path.clone(),
+                                   generation: old, result: Ok(image) });
+        assert!(!state.thumbs.contains_key(&remote.path));
     }
 
     /// 5.5: a /timelapse without a thumbnail directory is never asked for
@@ -2181,6 +2424,11 @@ mod tests {
                                    result: Err(FtpError::NotFound) });
         assert!(matches!(state.thumbs.get(&remote.path),
                          Some(ThumbState::Failed(FtpError::NotFound))));
+        assert!(state.request_thumb(&remote, 160).is_none(),
+                "a failed tile is not asked for again every frame");
+        state.forget_thumb(&remote.path);
+        assert!(state.request_thumb(&remote, 160).is_some(),
+                "the user's retry asks for it once more");
         state.apply(Event::Thumb { path: remote.path.clone(), generation,
                                    result: Err(FtpError::Cancelled) });
         assert!(!state.thumbs.contains_key(&remote.path));
@@ -2358,7 +2606,9 @@ mod tests {
 
         let started = Instant::now();
         worker.stop();
-        assert!(started.elapsed() < Duration::from_millis(100),
+        // it takes two mutexes and sends on a channel; anything that joined
+        // the lane thread would wait for its IO timeout instead
+        assert!(started.elapsed() < Duration::from_millis(250),
                 "stop waited {:?}", started.elapsed());
         assert!(eventually(Duration::from_secs(3), || worker.has_ended()),
                 "the lane thread did not end");
@@ -2577,6 +2827,45 @@ mod tests {
                                     opened its session");
         assert_eq!(server.sessions(), 2);
         assert_eq!(server.max_open_sessions(), 1);
+    }
+
+    /// Section 4, rule 3: while the lane it replaces still lives, the
+    /// replacement opens no session at all. It answers with the reason and
+    /// tries again on the next command, so a predecessor that ends normally
+    /// costs nothing and one that is stuck never doubles the session count.
+    #[test]
+    fn a_replacement_opens_no_session_while_the_old_lane_lives() {
+        let server = ftp_server(HOST, listing_spec(Vec::new()));
+        let ended = Arc::new(AtomicBool::new(false));
+        let timing = Timing { predecessor_wait: Duration::from_millis(100),
+                              ..fast() };
+        let endpoint = crate::ftp::FtpEndpoint::for_test(
+            Ok(test_tls(TEST_CA, TEST_SERIAL)), server.port, TEST_SERIAL,
+            ACCESS_CODE, IO_TIMEOUT);
+        let worker = FtpWorker::for_test_after(endpoint, timing,
+                                               &egui::Context::default(),
+                                               ended.clone());
+        worker.send(Cmd::List { dir: "/".into(), generation: 1 });
+        let started = Instant::now();
+        let (_, result) = listed(next_event(&worker, BOUND, is_listed));
+        let elapsed = started.elapsed();
+        let Err(failure) = result else {
+            panic!("the replacement listed while the old lane lived");
+        };
+        assert_eq!(failure.text(TEST_SERIAL),
+                   "still closing the previous connection");
+        assert!(elapsed >= timing.predecessor_wait, "{elapsed:?}");
+        assert_eq!(server.accepts(), 0, "not even the TCP probe");
+        assert_eq!(worker.status().open_sessions, 0);
+
+        // once the old lane has ended, the next command opens the one
+        // session this printer is allowed
+        ended.store(true, Ordering::SeqCst);
+        worker.send(Cmd::List { dir: "/".into(), generation: 1 });
+        listed(next_event(&worker, BOUND, is_listed)).1.expect("listed");
+        assert_eq!(server.sessions(), 1);
+        assert_eq!(server.max_open_sessions(), 1);
+        assert_eq!(worker.status().max_open_sessions, 1);
     }
 
     /// Live, read-only check on the owner's printers (design doc 4 and 5.5,
