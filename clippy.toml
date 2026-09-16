@@ -1,0 +1,21 @@
+# Crypto provider rule (design doc 5.3). Every rustls config names the ring
+# provider explicitly: the provider-less builders panic when more than one
+# provider is compiled, and a process-wide default would silently change the
+# provider ureq uses.
+# One verification path (5.3, T13): the rustls signature helpers and the
+# webpki verifier reject the printers' X.509 v1 leaves, so they must never
+# replace PrinterCertVerifier's ring checks.
+# CI runs:
+#   cargo clippy --all-targets -- -D clippy::disallowed_methods
+disallowed-methods = [
+  { path = "rustls::crypto::CryptoProvider::install_default", reason = "no process-wide crypto provider (design doc 5.3)" },
+  { path = "rustls::crypto::CryptoProvider::get_default", reason = "no process-wide crypto provider (design doc 5.3)" },
+  { path = "rustls::ClientConfig::builder", reason = "use ClientConfig::builder_with_provider with the ring provider" },
+  { path = "rustls::ClientConfig::builder_with_protocol_versions", reason = "use ClientConfig::builder_with_provider with the ring provider" },
+  { path = "rustls::ServerConfig::builder", reason = "use ServerConfig::builder_with_provider with the ring provider" },
+  { path = "rustls::ServerConfig::builder_with_protocol_versions", reason = "use ServerConfig::builder_with_provider with the ring provider" },
+  { path = "rustls::crypto::verify_tls12_signature", reason = "webpki rejects the printers' v1 leaves: use PrinterCertVerifier (design doc 5.3)" },
+  { path = "rustls::crypto::verify_tls13_signature", reason = "printer connections are TLS 1.2 only, verified by PrinterCertVerifier (design doc 5.3)" },
+  { path = "rustls::client::WebPkiServerVerifier::builder", reason = "webpki rejects the printers' v1 leaves: use PrinterCertVerifier (design doc 5.3)" },
+  { path = "rustls::client::WebPkiServerVerifier::builder_with_provider", reason = "webpki rejects the printers' v1 leaves: use PrinterCertVerifier (design doc 5.3)" },
+]

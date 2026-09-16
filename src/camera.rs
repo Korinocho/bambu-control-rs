@@ -46,6 +46,9 @@ impl Camera {
     }
 
     fn run(&self, ip: &str, access_code: &str, ctx: &egui::Context) {
+        // Accepts any certificate, so the access code goes to whoever
+        // answers on 6000. GitHub issue #2 moves the camera to the printer
+        // certificate verifier in src/tls.rs, which FTPS already uses.
         let connector = native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)

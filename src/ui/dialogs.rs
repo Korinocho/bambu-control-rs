@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Stroke};
 
-use crate::config::PrinterCfg;
+use crate::config::{self, PrinterCfg};
 use crate::files::JobBundle;
 use crate::firmware::is_newer;
 use crate::mqtt::PrinterClient;
@@ -58,13 +58,21 @@ fn wide_button(ui: &mut egui::Ui, text: &str) -> bool {
         .clicked()
 }
 
-fn accent_button(ui: &mut egui::Ui, text: &str) -> bool {
+pub(crate) fn accent_button(ui: &mut egui::Ui, text: &str) -> bool {
+    accent_button_response(ui, text,
+                           egui::vec2(ui.available_width(), 34.0)).clicked()
+}
+
+/// The same accent action at a given size, and with its response: the files
+/// view puts its default button in a row and focuses it (section 6).
+pub(crate) fn accent_button_response(ui: &mut egui::Ui, text: &str,
+                                     min_size: egui::Vec2) -> egui::Response {
     let btn = egui::Button::new(
         RichText::new(text).color(Color32::from_rgb(0x06, 0x13, 0x0a))
             .font(theme::bold(13.5)))
         .fill(theme::ACCENT)
-        .min_size(egui::vec2(ui.available_width(), 34.0));
-    ui.add(btn).clicked()
+        .min_size(min_size);
+    ui.add(btn)
 }
 
 // ------------------------------------------------------------ add/edit
@@ -119,6 +127,8 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                               &mut d.access_code] {
                     *field = field.trim().to_string();
                 }
+                // the value the FTPS certificate check compares with the CN
+                d.serial = config::normalize_serial(&d.serial);
                 if d.ip.is_empty() || d.serial.is_empty()
                     || d.access_code.is_empty()
                 {
