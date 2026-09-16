@@ -145,7 +145,7 @@ fn temp_card(ui: &mut Ui, title: &str, current: Option<f64>,
 fn has_rfid(tray: &Value) -> bool {
     for key in ["tag_uid", "tray_uuid"] {
         if let Some(v) = tray.get(key).and_then(|v| v.as_str())
-            && v.trim_matches('0') != ""
+            && !v.trim_matches('0').is_empty()
         {
             return true;
         }
@@ -188,7 +188,7 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
         });
 
         let mut shown = false;
-        let mut slot_row = |ui: &mut Ui, slot: String, tray: &Value,
+        let slot_row = |ui: &mut Ui, slot: String, tray: &Value,
                             active: bool| {
             ui.horizontal(|ui| {
                 let color_hex = tray.get("tray_color")
