@@ -10,15 +10,17 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use chrono::NaiveDateTime;
-use egui::{Color32, CornerRadius, RichText, Sense, Stroke, Ui, vec2};
+use chrono::{NaiveDateTime, NaiveTime};
+use egui::{Color32, CornerRadius, Modifiers, RichText, Sense, Stroke, Ui,
+           vec2};
 
 use crate::browser::{BrowserState, Cmd, ConnState, DirState, FileItem,
-                     FileKind, RECORDINGS_DIR, VisibleSince};
+                     FileKind, RECORDINGS_DIR, ThumbState, VisibleSince};
 use crate::config;
 use crate::ftp::{FtpError, RemoteEntry, ServerProfile};
 use crate::theme;
 use crate::tls;
+use crate::ui::dialogs::accent_button_response;
 use crate::ui::panel::card_frame;
 
 /// Thumbnails are downscaled to this on the lane thread (design doc 12: A1
@@ -27,8 +29,9 @@ pub const THUMB_PX: u32 = 320;
 /// Textures the view keeps; the least recently shown tiles are dropped and
 /// fetched again if they come back (design doc 12).
 const TEXTURE_CAP: usize = 150;
-/// Directories whose used space the header line sums, in this order.
-const SPACE_DIRS: [&str; 5] = ["timelapse", "ipcam", "cache", "model", "/"];
+/// Directories whose used space the header line sums, in this order. They
+/// do not contain one another; the whole card follows them as "total".
+const SPACE_DIRS: [&str; 4] = ["timelapse", "ipcam", "cache", "model"];
 /// How deep an "Other folder" may be opened, one level at a time (5.5).
 const FOLDER_DEPTH: usize = 4;
 
@@ -38,6 +41,8 @@ const TILE_IMAGE_H: f32 = 94.0;
 /// spacing between the three: a shorter row would clip the size line
 const TILE_H: f32 = TILE_IMAGE_H + 62.0;
 const ROW_H: f32 = 34.0;
+const COMPANION_H: f32 = 26.0;
+const NOTE_H: f32 = 22.0;
 const HEADING_H: f32 = 24.0;
 const DETAIL_W: f32 = 268.0;
 
@@ -52,6 +57,9 @@ pub enum Tab {
 
 impl Tab {
     /// The word `BAMBU_CONTROL_OPEN_FILES` uses for this tab (debug builds).
+    /// Its only caller is gated on `debug_assertions`, so a release build has
+    /// none: dead there on purpose, not by accident.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fn from_word(word: &str) -> Option<Self> {
         match word.trim().to_ascii_lowercase().as_str() {
             "timelapses" => Some(Self::Timelapses),
@@ -142,6 +150,10 @@ pub struct View<'a> {
     pub open_sessions: usize,
     /// MQTT gcode_state RUNNING or PAUSE
     pub printing: bool,
+    /// a dialog is open over the view (the Edit printer one the refusal
+    /// card opens, for example): it owns the keyboard, so the card neither
+    /// takes the focus back nor answers Enter and Esc (section 6)
+    pub dialog_open: bool,
     pub now: Instant,
 }
 
@@ -169,6 +181,27 @@ pub struct FilesUi {
     frame: u64,
     /// the refusal card's Close button holds the focus (section 6)
     close_focused: bool,
+    /// what each kind of row really painted, which is what the next frame
+    /// reserves for it
+    row_h: RowHeights,
+    /// how much the tallest row of the last frame passed the height the
+    /// virtualisation had reserved for it; 0 once they agree
+    overflow: f32,
+}
+
+/// Heights the virtualised list reserves per kind of row. The constants are
+/// the first frame's guess; every later frame uses what the row really
+/// painted, so the scroll range matches the content and the last rows of a
+/// long list can be reached (section 6).
+#[derive(Clone, Copy)]
+struct RowHeights([f32; ROW_KINDS]);
+
+const ROW_KINDS: usize = 7;
+
+impl Default for RowHeights {
+    fn default() -> Self {
+        Self([HEADING_H, TILE_H, ROW_H, COMPANION_H, ROW_H, NOTE_H, ROW_H])
+    }
 }
 
 impl FilesUi {
@@ -200,14 +233,14 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     if let Some(message) = config::files_refused_by_name(view.serial) {
         files.close_focused = false;
         refusal_card(ui, files, "⚠ File access disabled for this model",
-                     &message, &mut out);
+                     &message, view.dialog_open, &mut out);
         return out;
     }
     // a refused certificate replaces the content for this printer (5.3)
     if state.cert_alert.is_some() {
         files.close_focused = false;
         refusal_card(ui, files, "⚠ FTP connection refused", tls::REFUSAL_TEXT,
-                     &mut out);
+                     view.dialog_open, &mut out);
         return out;
     }
     files.close_focused = false;
@@ -232,11 +265,14 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         out.cmds.extend(state.open_recordings());
     }
     // the tabs list the unreadable entries they cannot show (5.10)
-    for (dir, count) in damaged_dirs(state, files.tab) {
+    let damaged = damaged_dirs(state, files.tab);
+    for (dir, count) in &damaged {
         banner(ui, theme::WARN, theme::WARN_BG, &format!(
             "{count} entries in {dir} can't be read; the SD card's file \
              system looks damaged"));
     }
+    // that banner already gives the reason, so nothing repeats it below
+    let damaged = !damaged.is_empty();
 
     let total = ui.available_width();
     let list_w = (total - DETAIL_W - 10.0).max(240.0);
@@ -247,12 +283,13 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     // only orphan thumbnails, or a damaged card: say why above the tiles
     // that are left (5.5)
     if files.tab == Tab::Timelapses && !state.timelapses.is_empty()
+        && !damaged
         && let Some(notice) = state.timelapse_notice()
     {
         banner(ui, theme::TEXT_DIM, theme::CARD, notice);
         ui.add_space(4.0);
     }
-    let rows = build_rows(state, files, columns);
+    let rows = build_rows(state, files, columns, view.serial, damaged);
     ui.horizontal_top(|ui| {
         ui.allocate_ui_with_layout(vec2(list_w, ui.available_height()),
             egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -294,9 +331,15 @@ fn header(ui: &mut Ui, state: &BrowserState, files: &mut FilesUi,
         ui.label(RichText::new(format!("{} / FILES", view.name))
             .font(theme::bold(16.0)));
         ui.add_space(10.0);
+        // /ipcam is listed when its tab opens (5.5), so until then the
+        // Recordings tab shows no number rather than a false zero
+        let recordings = match state.recordings_listed() {
+            true => format!("Recordings {recordings}"),
+            false => "Recordings".to_string(),
+        };
         let tabs = [
             (Tab::Timelapses, format!("Timelapses {timelapses}")),
-            (Tab::Recordings, format!("Recordings {recordings}")),
+            (Tab::Recordings, recordings),
             (Tab::Files, format!("Print files {print_files}")),
         ];
         for (tab, label) in tabs {
@@ -309,18 +352,20 @@ fn status_line(ui: &mut Ui, state: &BrowserState, view: &View<'_>,
                out: &mut Outcome) {
     let mut parts: Vec<String> = Vec::new();
     for name in SPACE_DIRS {
-        let dir = match name {
-            "/" => "/".to_string(),
-            name => format!("/{name}"),
-        };
+        let dir = format!("/{name}");
         if !matches!(state.dirs.get(&dir), Some(DirState::Ready { .. })) {
             continue;
         }
         let bytes = state.used_bytes(&dir);
         if bytes > 0 {
-            let label = if name == "/" { "root" } else { name };
-            parts.push(format!("{label} {}", human_bytes(bytes)));
+            parts.push(format!("{name} {}", human_bytes(bytes)));
         }
+    }
+    // the whole card, after the directories it contains: the parts of this
+    // line never count the same file twice
+    let total = state.total_bytes();
+    if total > 0 {
+        parts.push(format!("total {}", human_bytes(total)));
     }
     if let Some(at) = state.updated_at() {
         parts.push(format!("updated {} ago",
@@ -403,7 +448,9 @@ fn error_card(ui: &mut Ui, error: &FtpError, serial: &str,
             ui.add(egui::Label::new(RichText::new(error.text(serial))
                 .color(theme::DANGER).size(12.5)).wrap());
             ui.add_space(6.0);
-            if ui.button("Retry").clicked() {
+            if accent_button_response(ui, "Retry", vec2(96.0, 28.0))
+                .clicked()
+            {
                 out.actions.push(Action::Retry);
             }
         });
@@ -412,9 +459,14 @@ fn error_card(ui: &mut Ui, error: &FtpError, serial: &str,
 /// The refusal card of section 6. There is no trust, accept or continue
 /// action; Close is the default, focused and bound to Enter and Esc.
 fn refusal_card(ui: &mut Ui, files: &mut FilesUi, title: &str, body: &str,
-                out: &mut Outcome) {
-    let mut close = ui.input(|i| i.key_pressed(egui::Key::Enter)
-        || i.key_pressed(egui::Key::Escape));
+                blocked: bool, out: &mut Outcome) {
+    // the keys are consumed here, so the Edit printer dialog this card
+    // opens keeps its own Enter and Esc, and the card does not answer them
+    // from underneath it (section 6)
+    let mut close = !blocked && ui.input_mut(|i| {
+        i.consume_key(Modifiers::NONE, egui::Key::Enter)
+            | i.consume_key(Modifiers::NONE, egui::Key::Escape)
+    });
     egui::Frame::new()
         .fill(theme::DANGER_BG)
         .stroke(Stroke::new(1.0, theme::DANGER))
@@ -432,9 +484,11 @@ fn refusal_card(ui: &mut Ui, files: &mut FilesUi, title: &str, body: &str,
                     out.actions.push(Action::EditPrinter);
                 }
                 // the default action, and the only other one
-                let response = ui.add(egui::Button::new(
-                    RichText::new("Close").font(theme::bold(13.5))));
-                if !response.has_focus() {
+                let response =
+                    accent_button_response(ui, "Close", vec2(96.0, 30.0));
+                // a dialog over the view owns the keyboard: the card never
+                // takes the focus back from it
+                if !blocked && !response.has_focus() {
                     response.request_focus();
                 }
                 files.close_focused = response.has_focus();
@@ -464,13 +518,16 @@ enum Row {
     Skeleton,
 }
 
-fn row_height(row: &Row) -> f32 {
+/// Which reserved height a row uses; rows of one kind paint alike.
+fn row_kind(row: &Row) -> usize {
     match row {
-        Row::Heading(_) => HEADING_H,
-        Row::Tiles(_) => TILE_H,
-        Row::Item(_) | Row::Folder { .. } | Row::Skeleton => ROW_H,
-        Row::Companion(_) => 26.0,
-        Row::Note(_) => 22.0,
+        Row::Heading(_) => 0,
+        Row::Tiles(_) => 1,
+        Row::Item(_) => 2,
+        Row::Companion(_) => 3,
+        Row::Folder { .. } => 4,
+        Row::Note(_) => 5,
+        Row::Skeleton => 6,
     }
 }
 
@@ -483,13 +540,22 @@ struct Rows {
     loading: bool,
 }
 
-fn build_rows(state: &BrowserState, files: &FilesUi, columns: usize)
-              -> Rows {
+fn build_rows(state: &BrowserState, files: &FilesUi, columns: usize,
+              serial: &str, damaged: bool) -> Rows {
     match files.tab {
-        Tab::Timelapses => timelapse_rows(state, files, columns),
+        Tab::Timelapses => timelapse_rows(state, files, columns, damaged),
         Tab::Recordings => recording_rows(state, files),
-        Tab::Files => file_rows(state, files),
+        Tab::Files => file_rows(state, files, serial),
     }
+}
+
+/// The root, or one of this tab's own directories, failed: the error card
+/// above already gives the condition's text and a Retry (5.10), so the tab
+/// never adds a reason of its own — "no timelapses on this printer" about a
+/// printer that never answered would be untrue.
+fn tab_failed(state: &BrowserState, dirs: &[&str]) -> bool {
+    state.dir_failed("/")
+        || dirs.iter().any(|name| state.dir_failed(&format!("/{name}")))
 }
 
 fn dir_state<'a>(state: &'a BrowserState, name: &str)
@@ -513,8 +579,8 @@ fn matches_filter(name: &str, filter: &str) -> bool {
         || name.to_lowercase().contains(&filter.trim().to_lowercase())
 }
 
-fn timelapse_rows(state: &BrowserState, files: &FilesUi, columns: usize)
-                  -> Rows {
+fn timelapse_rows(state: &BrowserState, files: &FilesUi, columns: usize,
+                  damaged: bool) -> Rows {
     let mut order: Vec<usize> = (0..state.timelapses.len())
         .filter(|index| {
             let item = &state.timelapses[*index];
@@ -550,9 +616,17 @@ fn timelapse_rows(state: &BrowserState, files: &FilesUi, columns: usize)
         rows.push(Row::Tiles(tiles));
     }
     let loading = is_loading(state, "timelapse");
-    let empty = (order.is_empty() && !loading)
-        .then(|| state.timelapse_notice().unwrap_or(
-            "No timelapses on this printer.").to_string());
+    let empty = match order.is_empty() && !loading
+        && !tab_failed(state, &["timelapse"])
+    {
+        false => None,
+        // the damaged-card banner already gave the reason (5.10)
+        true => missing_note(state, "timelapse").or_else(|| match damaged {
+            true => None,
+            false => Some(state.timelapse_notice()
+                .unwrap_or("No timelapses on this printer.").to_string()),
+        }),
+    };
     Rows { rows, order, empty, loading }
 }
 
@@ -590,14 +664,15 @@ fn recording_rows(state: &BrowserState, files: &FilesUi) -> Rows {
         .map(|(position, _)| Row::Item(position))
         .collect();
     let loading = is_loading(state, RECORDINGS_DIR);
-    let empty = (order.is_empty() && !loading).then(|| {
+    let empty = (order.is_empty() && !loading
+        && !tab_failed(state, &[RECORDINGS_DIR])).then(|| {
         missing_note(state, RECORDINGS_DIR).unwrap_or_else(||
             "No recordings on this printer.".to_string())
     });
     Rows { rows, order, empty, loading }
 }
 
-fn file_rows(state: &BrowserState, files: &FilesUi) -> Rows {
+fn file_rows(state: &BrowserState, files: &FilesUi, serial: &str) -> Rows {
     let mut order: Vec<usize> = (0..state.files.len())
         .filter(|index| {
             let item = &state.files[*index];
@@ -638,7 +713,7 @@ fn file_rows(state: &BrowserState, files: &FilesUi) -> Rows {
         }
     }
     if matches!(files.shown, Shown::All | Shown::Folders) {
-        let folders = folder_rows(state, files);
+        let folders = folder_rows(state, files, serial);
         if !folders.is_empty() {
             rows.push(Row::Heading("OTHER FOLDERS".to_string()));
             rows.extend(folders);
@@ -650,18 +725,20 @@ fn file_rows(state: &BrowserState, files: &FilesUi) -> Rows {
         }
     }
     let loading = is_loading(state, "cache");
-    let empty = (rows.is_empty() && !loading)
+    let empty = (rows.is_empty() && !loading
+        && !tab_failed(state, &["cache", "model"]))
         .then(|| "No print files on this printer.".to_string());
     Rows { rows, order, empty, loading }
 }
 
 /// The "Other folders" of 5.5, opened one level at a time.
-fn folder_rows(state: &BrowserState, files: &FilesUi) -> Vec<Row> {
+fn folder_rows(state: &BrowserState, files: &FilesUi, serial: &str)
+               -> Vec<Row> {
     /// Adds this folder and, when it is open, one level of its entries.
     /// Returns whether anything here survived the filter; what did not is
     /// taken back off the row list.
-    fn walk(state: &BrowserState, files: &FilesUi, entry: &RemoteEntry,
-            depth: usize, rows: &mut Vec<Row>) -> bool {
+    fn walk(state: &BrowserState, files: &FilesUi, serial: &str,
+            entry: &RemoteEntry, depth: usize, rows: &mut Vec<Row>) -> bool {
         let start = rows.len();
         let open = files.open_folders.contains(&entry.path);
         rows.push(Row::Folder { entry: entry.clone(), depth, open });
@@ -685,8 +762,9 @@ fn folder_rows(state: &BrowserState, files: &FilesUi) -> Vec<Row> {
                 kept = true;
             }
             Some(DirState::Failed(err)) => {
+                // the model picks the wording, and it is known here (5.10)
                 rows.push(Row::Note(
-                    format!("{}: {}", entry.path, err.text(""))));
+                    format!("{}: {}", entry.path, err.text(serial))));
                 kept = true;
             }
             Some(DirState::Ready { entries, .. }) => {
@@ -695,7 +773,8 @@ fn folder_rows(state: &BrowserState, files: &FilesUi) -> Vec<Row> {
                 }
                 for child in entries {
                     if child.is_dir {
-                        kept |= walk(state, files, child, depth + 1, rows);
+                        kept |= walk(state, files, serial, child, depth + 1,
+                                     rows);
                     } else if matches_filter(&child.name, &files.filter) {
                         rows.push(Row::Folder { entry: child.clone(),
                                                 depth: depth + 1,
@@ -713,7 +792,7 @@ fn folder_rows(state: &BrowserState, files: &FilesUi) -> Vec<Row> {
     }
     let mut rows = Vec::new();
     for entry in &state.other_dirs {
-        walk(state, files, entry, 0, &mut rows);
+        walk(state, files, serial, entry, 0, &mut rows);
     }
     rows
 }
@@ -751,8 +830,15 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         return;
     }
     let mut seen: HashSet<String> = HashSet::new();
-    let heights: Vec<f32> = rows.rows.iter().map(row_height).collect();
-    virtual_rows(ui, &heights, |ui, index| {
+    // the worker keeps one prefetch (section 4), so the view asks for one
+    // tile at a time: every further request comes back Cancelled and is
+    // asked for again on the next frame, which is a stream of commands for
+    // no picture
+    let mut may_request = !state.thumb_in_flight();
+    let heights: Vec<f32> = rows.rows.iter()
+        .map(|row| files.row_h.0[row_kind(row)])
+        .collect();
+    let measured = virtual_rows(ui, &heights, |ui, index| {
         match &rows.rows[index] {
             Row::Heading(text) => {
                 ui.label(RichText::new(text).color(theme::TEXT_DIM)
@@ -769,7 +855,10 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                             vec2(TILE_W, TILE_H),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| timelapse_tile(ui, state, files, view,
-                                                *tile, &mut seen, out));
+                                *tile,
+                                &mut TileCtx { seen: &mut seen,
+                                               may_request: &mut may_request,
+                                               out: &mut *out }));
                     }
                 });
             }
@@ -809,13 +898,28 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             Row::Skeleton => skeleton_row(ui),
         }
     });
+    // what the rows really painted is what the next frame reserves for
+    // them, so the scroll range matches the content and the last rows of a
+    // long list can be reached (section 6)
+    let mut painted = [0f32; ROW_KINDS];
+    let mut overflow: f32 = 0.0;
+    for (index, height) in measured {
+        let kind = row_kind(&rows.rows[index]);
+        painted[kind] = painted[kind].max(height);
+        overflow = overflow.max(height - heights[index]);
+    }
+    for (kind, height) in painted.into_iter().enumerate() {
+        if height > 0.0 {
+            files.row_h.0[kind] = height;
+        }
+    }
+    files.overflow = overflow;
     if files.tab == Tab::Timelapses {
+        // the tiles on screen, for the 500 ms prefetch gate. The texture of
+        // a tile that scrolled away is kept until the cap evicts it (design
+        // doc 12), so scrolling back paints it again instead of fetching it
+        // from the printer once more.
         files.visible.retain(&seen);
-        let stale: Vec<String> = files.textures.keys()
-            .filter(|path| !seen.contains(*path))
-            .cloned()
-            .collect();
-        drop_textures(state, files, stale);
     }
 }
 
@@ -823,8 +927,14 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
 /// different heights (month headings, tile rows, companions), and it must
 /// not nest inside the outer `ScrollArea` (section 6), which is why the
 /// files view replaces the panel instead of being drawn inside it.
+///
+/// Each row is given the height the table reserved for it and reports what
+/// it really took, which is what the caller reserves next frame: a declared
+/// height smaller than the content would shorten the scroll range and put
+/// the tail of a long list out of reach.
 fn virtual_rows(ui: &mut Ui, heights: &[f32],
-                mut render: impl FnMut(&mut Ui, usize)) {
+                mut render: impl FnMut(&mut Ui, usize))
+                -> Vec<(usize, f32)> {
     let spacing = ui.spacing().item_spacing.y;
     let mut offsets: Vec<f32> = Vec::with_capacity(heights.len() + 1);
     let mut y = 0.0;
@@ -834,6 +944,7 @@ fn virtual_rows(ui: &mut Ui, heights: &[f32],
     }
     offsets.push(y);
     let total = (y - spacing).max(0.0);
+    let mut measured: Vec<(usize, f32)> = Vec::new();
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show_viewport(ui, |ui, viewport| {
@@ -853,11 +964,23 @@ fn virtual_rows(ui: &mut Ui, heights: &[f32],
                 ui.max_rect().x_range(),
                 (top + offsets[first])..=(top + offsets[last]));
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                for row in first..last {
-                    ui.push_id(row, |ui| render(ui, row));
+                for (row, &height) in heights.iter().enumerate()
+                    .take(last).skip(first)
+                {
+                    let response = ui.push_id(row, |ui| {
+                        ui.allocate_ui_with_layout(
+                            vec2(ui.available_width(), height),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_height(height);
+                                render(ui, row);
+                            });
+                    });
+                    measured.push((row, response.response.rect.height()));
                 }
             });
         });
+    measured
 }
 
 fn skeletons(ui: &mut Ui, tab: Tab) {
@@ -877,9 +1000,17 @@ fn skeleton_row(ui: &mut Ui) {
     ui.painter().rect_filled(rect, CornerRadius::same(6), theme::CARD_HOVER);
 }
 
+/// What a tile needs from the frame around it: which tiles were painted
+/// (the 500 ms prefetch gate), whether a thumbnail may still be asked for
+/// (one in flight, section 4), and where its commands go.
+struct TileCtx<'a> {
+    seen: &'a mut HashSet<String>,
+    may_request: &'a mut bool,
+    out: &'a mut Outcome,
+}
+
 fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
-                  view: &View<'_>, index: usize, seen: &mut HashSet<String>,
-                  out: &mut Outcome) {
+                  view: &View<'_>, index: usize, tile: &mut TileCtx<'_>) {
     let Some(item) = state.timelapses.get(index) else { return };
     let stem = item.stem().to_string();
     let key = item.video.as_ref().or(item.thumb.as_ref())
@@ -892,7 +1023,7 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         .map_or(0, |entry| entry.size);
     let selected = files.selected.as_deref() == Some(key.as_str());
 
-    let response = egui::Frame::new()
+    let shown = egui::Frame::new()
         .fill(theme::CARD)
         .stroke(Stroke::new(if selected { 2.0 } else { 1.0 },
                             if selected { theme::ACCENT }
@@ -907,11 +1038,14 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                                      Color32::BLACK);
             let texture = match &thumb {
                 Some(entry) => {
-                    seen.insert(entry.path.clone());
-                    tile_texture(ui.ctx(), state, files, view, entry, out)
+                    tile.seen.insert(entry.path.clone());
+                    tile_texture(ui.ctx(), state, files, view, entry, tile)
                 }
                 None => None,
             };
+            let failed = thumb.as_ref().is_some_and(|entry|
+                matches!(state.thumbs.get(&entry.path),
+                         Some(ThumbState::Failed(_))));
             match texture {
                 Some(handle) => {
                     let size = handle.size_vec2();
@@ -923,39 +1057,82 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                             rect.center(), size * scale));
                 }
                 None => {
-                    let caption = match (&thumb, orphan) {
-                        (None, _) => "no thumbnail",
-                        (Some(_), _) => "…",
-                    };
                     ui.painter().text(rect.center(),
-                        egui::Align2::CENTER_CENTER, caption,
+                        egui::Align2::CENTER_CENTER,
+                        tile_caption(state, thumb.as_ref()),
                         egui::FontId::proportional(11.0), theme::TEXT_DIM);
                 }
             }
+            // where the retry sits, for the click below: the tile's own
+            // click is registered over its contents, so a button inside it
+            // would never see the pointer
+            let mut retry_at = None;
             if orphan {
                 ui.label(RichText::new("⚠ no video").color(theme::WARN)
                     .size(11.0));
+            } else if failed {
+                retry_at = Some(ui.add(egui::Label::new(
+                    RichText::new("⟳ retry").color(theme::ACCENT)
+                        .size(11.0))).rect);
             } else {
                 ui.label(RichText::new(when_text(started))
                     .color(theme::TEXT_DIM).size(11.0));
             }
             ui.label(RichText::new(human_bytes(size)).size(11.5));
-        })
-        .response
-        .interact(Sense::click());
+            retry_at
+        });
+    let retry_at = shown.inner;
+    let response = shown.response.interact(Sense::click());
     if response.hovered() {
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
     }
     if response.clicked() {
-        files.selected = Some(key);
+        let on_retry = retry_at.zip(response.interact_pointer_pos())
+            .is_some_and(|(rect, pos)| rect.contains(pos));
+        match (on_retry, &thumb) {
+            // a failed tile is asked for again here and nowhere else:
+            // never once per frame for as long as it is on screen
+            (true, Some(entry)) => state.forget_thumb(&entry.path),
+            _ => files.selected = Some(key),
+        }
     }
 }
 
 /// The tile's texture, built once from the decoded picture the lane sent,
 /// and asked for only after the tile stayed visible (section 4).
+/// What a tile without a picture says: waiting, queued and failed are told
+/// apart (section 6), never one ellipsis for all of them.
+fn tile_caption(state: &BrowserState, thumb: Option<&RemoteEntry>) -> String {
+    let Some(entry) = thumb else {
+        return "no thumbnail".to_string();
+    };
+    if entry.unreadable {
+        return "name can't be read".to_string();
+    }
+    match state.thumbs.get(&entry.path) {
+        Some(ThumbState::Loading) => "loading…".to_string(),
+        Some(ThumbState::Failed(err)) => short_failure(err).to_string(),
+        _ => "queued".to_string(),
+    }
+}
+
+/// A tile is 156 px wide, so a failed one is named in two or three words;
+/// the condition's own 5.10 text is on the error card above.
+fn short_failure(err: &FtpError) -> &'static str {
+    match err {
+        FtpError::NotFound => "thumbnail gone",
+        FtpError::TooLarge { .. } => "too big to show",
+        FtpError::Truncated { .. } | FtpError::SessionLost(_) =>
+            "transfer cut",
+        FtpError::Local(_) => "not a picture",
+        FtpError::UnreadableName => "name can't be read",
+        _ => "couldn't load",
+    }
+}
+
 fn tile_texture(ctx: &egui::Context, state: &mut BrowserState,
                 files: &mut FilesUi, view: &View<'_>, entry: &RemoteEntry,
-                out: &mut Outcome) -> Option<egui::TextureHandle> {
+                tile: &mut TileCtx<'_>) -> Option<egui::TextureHandle> {
     let frame = files.frame;
     if let Some(texture) = files.textures.get_mut(&entry.path) {
         texture.used = frame;
@@ -969,10 +1146,14 @@ fn tile_texture(ctx: &egui::Context, state: &mut BrowserState,
                               Texture { handle: handle.clone(), used: frame });
         return Some(handle);
     }
-    if files.visible.ready(&entry.path, view.now)
+    // every visible tile keeps its 500 ms timer running, but only one
+    // request is in flight (section 4)
+    let ready = files.visible.ready(&entry.path, view.now);
+    if ready && *tile.may_request
         && let Some(cmd) = state.request_thumb(entry, THUMB_PX)
     {
-        out.cmds.push(cmd);
+        *tile.may_request = false;
+        tile.out.cmds.push(cmd);
     }
     None
 }
@@ -1219,9 +1400,13 @@ fn extension(name: &str) -> String {
         .unwrap_or_else(|| "FILE".to_string())
 }
 
-/// Printer-clock time, never converted (section 6).
+/// Printer-clock time, never converted (section 6). A LIST line that
+/// carried a year instead of a clock has no time of day, so it shows the
+/// year rather than a midnight the printer never reported.
 fn when_text(when: Option<NaiveDateTime>) -> String {
     match when {
+        Some(when) if when.time() == NaiveTime::MIN =>
+            when.format("%b %d %Y").to_string(),
         Some(when) => when.format("%b %d %H:%M").to_string(),
         None => "—".to_string(),
     }
@@ -1317,9 +1502,13 @@ mod tests {
     }
 
     fn raw(events: Vec<egui::Event>) -> egui::RawInput {
+        raw_at(Vec2::new(1180.0, 820.0), events)
+    }
+
+    /// The same, on a window of a given size: a short one paints fewer rows.
+    fn raw_at(size: Vec2, events: Vec<egui::Event>) -> egui::RawInput {
         egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                Pos2::ZERO, Vec2::new(1180.0, 820.0))),
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
             events,
             ..Default::default()
         }
@@ -1437,9 +1626,28 @@ mod tests {
         state
     }
 
+    /// A printer with `count` timelapses, each with its thumbnail: more
+    /// tiles than one window shows.
+    fn browsed_tiles(count: usize) -> BrowserState {
+        let mut state = BrowserState::default();
+        let _ = state.refresh();
+        listed(&mut state, "/", &ROOT);
+        let videos: Vec<String> = (0..count).map(|index| format!(
+            "-rw-rw-rw-   1 root  root   4411548 Jun 01 06:17 \
+             video_2026-06-01_06-{index:02}-00.avi")).collect();
+        let thumbs: Vec<String> = (0..count).map(|index| format!(
+            "-rw-rw-rw-   1 root  root     19830 Jun 01 06:17 \
+             video_2026-06-01_06-{index:02}-00.jpg")).collect();
+        let lines: Vec<&str> = videos.iter().map(String::as_str).collect();
+        listed(&mut state, "/timelapse", &lines);
+        let lines: Vec<&str> = thumbs.iter().map(String::as_str).collect();
+        listed(&mut state, "/timelapse/thumbnail", &lines);
+        state
+    }
+
     fn view(serial: &str, now: Instant) -> View<'_> {
         View { name: "P1S #1", serial, profile: Some(ServerProfile::BblP003),
-               open_sessions: 0, printing: false, now }
+               open_sessions: 0, printing: false, dialog_open: false, now }
     }
 
     fn thumb_image() -> egui::ColorImage {
@@ -1503,6 +1711,31 @@ mod tests {
             assert!(answer.out.actions.contains(&Action::Back),
                     "{pressed:?} did not close the card: {:?}",
                     answer.out.actions);
+        }
+    }
+
+    /// Section 6: while a dialog this card opened is on screen, the card
+    /// takes no focus back and answers no key, so the dialog keeps its own
+    /// keyboard.
+    #[test]
+    fn a_dialog_over_the_refusal_card_keeps_the_keyboard() {
+        let ctx = ctx();
+        let mut state = browsed();
+        state.cert_alert = Some(Refusal::HandshakeSignature);
+        let mut files = FilesUi::default();
+        let now = Instant::now();
+        let blocked = View { dialog_open: true, ..view(P1S, now) };
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &blocked);
+        let second = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                           &blocked);
+        assert!(!files.close_has_focus(),
+                "the card took the focus from the dialog");
+        assert!(second.out.actions.is_empty());
+        for pressed in [egui::Key::Enter, egui::Key::Escape] {
+            let answer = frame(&ctx, raw(vec![key(pressed)]), &mut state,
+                               &mut files, &blocked);
+            assert!(answer.out.actions.is_empty(),
+                    "{pressed:?} closed the view under the dialog");
         }
     }
 
@@ -1614,6 +1847,11 @@ mod tests {
         // the 4,411,548 B video and its 19,830 B thumbnail
         assert!(painted.has("timelapse 4.2 MB"), "{:?}", painted.spots);
         assert!(painted.has("cache 39 MB"));
+        // the whole card follows the directories it contains, and the
+        // parts of the line never count the same file twice
+        assert!(painted.has(&format!("total {}",
+                                     human_bytes(state.total_bytes()))));
+        assert!(!painted.has("root "), "the root figure contained the rest");
         assert!(painted.has("updated 0 s ago"));
         assert!(painted.has("(printer clock)"));
         assert!(painted.exact("Refresh"));
@@ -1629,7 +1867,8 @@ mod tests {
         let (timelapses, recordings, print_files) = state.counts();
         assert_eq!((timelapses, recordings), (1, 0));
         assert!(painted.has(&format!("Timelapses {timelapses}")));
-        assert!(painted.has(&format!("Recordings {recordings}")));
+        // /ipcam is listed when its tab opens (5.5), so the count waits
+        assert!(painted.exact("Recordings"));
         assert!(painted.has(&format!("Print files {print_files}")));
     }
 
@@ -1653,9 +1892,11 @@ mod tests {
         let first = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
                           &view(P1S, now));
         assert!(first.lists().is_empty(), "{:?}", first.lists());
+        assert!(first.exact("Recordings"),
+                "a count before /ipcam was listed would be a false zero");
 
         let out = click(&ctx, &mut state, &mut files, &view(P1S, now),
-                        "Recordings 0");
+                        "Recordings");
         assert_eq!(files.tab, Tab::Recordings);
         assert_eq!(out.cmds.iter().filter_map(|cmd| match cmd {
             Cmd::List { dir, .. } => Some(dir.as_str()),
@@ -1672,6 +1913,7 @@ mod tests {
             .collect();
         assert_eq!(rows, ["ipcam-record.2026-06-02.1.avi",
                           "ipcam-record.2026-06-01.1.avi"]);
+        assert!(painted.has("Recordings 2"), "the count arrives with them");
     }
 
     // ------------------------------------------- listings, empty and error
@@ -1715,8 +1957,13 @@ mod tests {
         ]);
         let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
                             &view(P1S, now));
-        assert!(painted.has("the SD card's file system looks damaged"));
         assert!(painted.has("2 entries in /timelapse can't be read"));
+        // the 5.10 banner says it, and nothing repeats it below
+        let said = painted.spots.iter()
+            .filter(|(text, _)| text.contains(
+                "the SD card's file system looks damaged"))
+            .count();
+        assert_eq!(said, 1, "{:?}", painted.spots);
 
         // nothing at all
         let mut state = BrowserState::default();
@@ -1821,6 +2068,10 @@ mod tests {
         assert!(painted.exact("inner"));
         assert!(painted.exact("note.txt"));
         assert!(painted.lists().is_empty(), "a subdirectory was walked");
+        // the folder the user opened is open; the one inside it is not
+        assert!(painted.exact("▾ DIR"), "the opened folder reads as closed");
+        assert!(painted.exact("▸ DIR"),
+                "a folder nobody opened reads as open");
     }
 
     /// Section 4: a tile is prefetched only after it stayed visible, its
@@ -1966,6 +2217,161 @@ mod tests {
         }
     }
 
+    /// 5.10 and section 6: a listing that failed shows the condition's text
+    /// and a Retry on every tab, never "no timelapses on this printer".
+    #[test]
+    fn a_failed_listing_shows_the_error_card_not_an_empty_tab() {
+        let ctx = ctx();
+        for tab in [Tab::Timelapses, Tab::Recordings, Tab::Files] {
+            let mut state = BrowserState::default();
+            let _ = state.refresh();
+            let generation = state.generation();
+            state.apply(Event::Listed { dir: "/".to_string(), generation,
+                                        result: Err(FtpError::Offline) });
+            let mut files = files_ui(tab);
+            let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                                &view(P1S, Instant::now()));
+            assert!(painted.has("printer offline"), "{tab:?}");
+            assert!(painted.exact("Retry"), "{tab:?}");
+            for wrong in ["No timelapses on this printer",
+                          "No recordings on this printer",
+                          "No print files on this printer"] {
+                assert!(!painted.has(wrong), "{tab:?} said {wrong:?}");
+            }
+        }
+    }
+
+    /// Section 4: the worker keeps one prefetch, so the view asks for one
+    /// tile at a time instead of having every other request cancelled and
+    /// issued again on the next frame.
+    #[test]
+    fn only_one_thumbnail_is_asked_for_at_a_time() {
+        let ctx = ctx();
+        let mut state = browsed_tiles(6);
+        let mut files = FilesUi::default();
+        let start = Instant::now();
+        let ready = start + PREFETCH_VISIBLE;
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+              &view(P1S, start));
+        let asked = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                          &view(P1S, ready));
+        assert_eq!(asked.thumbs().len(), 1, "{:?}", asked.thumbs());
+        let again = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                          &view(P1S, ready));
+        assert!(again.thumbs().is_empty(),
+                "asked again while one was in flight: {:?}", again.thumbs());
+
+        // when that one lands, the next tile is asked for
+        let path = asked.thumbs()[0].clone();
+        let generation = state.generation();
+        state.apply(Event::Thumb { path: path.clone(), generation,
+                                   result: Ok(thumb_image()) });
+        let next = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                         &view(P1S, ready));
+        assert_eq!(next.thumbs().len(), 1);
+        assert_ne!(next.thumbs()[0], path);
+    }
+
+    /// Design doc 12: the view's texture LRU keeps tiles that left the
+    /// window, so coming back paints them again instead of fetching them
+    /// from the printer a second time.
+    #[test]
+    fn a_tile_that_leaves_the_window_keeps_its_texture() {
+        let ctx = ctx();
+        let mut state = browsed_tiles(30);
+        let mut files = FilesUi::default();
+        let now = Instant::now();
+        let generation = state.generation();
+        let shown: Vec<String> = state.timelapses.iter().take(6)
+            .filter_map(|item| item.thumb.as_ref())
+            .map(|thumb| thumb.path.clone())
+            .collect();
+        assert_eq!(shown.len(), 6);
+        for path in &shown {
+            state.apply(Event::Thumb { path: path.clone(), generation,
+                                       result: Ok(thumb_image()) });
+        }
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &view(P1S, now));
+        assert_eq!(files.textures.len(), 6, "the pictures became textures");
+
+        // a short window paints fewer rows: the last tiles are off screen
+        frame(&ctx, raw_at(Vec2::new(1180.0, 360.0), Vec::new()), &mut state,
+              &mut files, &view(P1S, now));
+        assert_eq!(files.textures.len(), 6, "a texture was thrown away");
+        let last = shown.last().expect("a tile");
+        assert!(matches!(state.thumbs.get(last), Some(ThumbState::Shown)),
+                "the tile was forgotten, so it would be fetched again");
+
+        // and back, with nothing asked for a second time
+        let back = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                         &view(P1S, now + PREFETCH_VISIBLE));
+        assert!(!back.thumbs().contains(last),
+                "the tile was fetched from the printer again");
+        assert_eq!(files.textures.len(), 6);
+    }
+
+    /// Section 6: a tile without its picture says which state it is in, and
+    /// a failed one is asked for again only when the user says so.
+    #[test]
+    fn a_tile_says_whether_it_is_queued_or_failed_and_retries_on_demand() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = FilesUi::default();
+        let now = Instant::now();
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, now));
+        assert!(painted.has("queued"), "{:?}", painted.spots);
+
+        let generation = state.generation();
+        state.apply(Event::Thumb {
+            path: THUMB_PATH.to_string(), generation,
+            result: Err(FtpError::Local(
+                "thumbnail could not be decoded".into())) });
+        let later = now + PREFETCH_VISIBLE * 4;
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, later));
+        assert!(painted.has("not a picture"), "{:?}", painted.spots);
+        assert!(painted.exact("⟳ retry"));
+        let again = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                          &view(P1S, later));
+        assert!(again.thumbs().is_empty(),
+                "a failed tile was asked for again on its own");
+
+        click(&ctx, &mut state, &mut files, &view(P1S, later), "⟳ retry");
+        let after = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                          &view(P1S, later));
+        assert_eq!(after.thumbs(), [THUMB_PATH], "the retry asks once more");
+    }
+
+    /// Section 6: the virtualised list reserves what its rows really paint,
+    /// so the scroll range matches the content and the tail of a long list
+    /// can be reached.
+    #[test]
+    fn the_reserved_row_heights_match_what_the_rows_paint() {
+        let ctx = ctx();
+        let now = Instant::now();
+        // the first frame measures, the second reserves what it measured
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Files);
+        for _ in 0..2 {
+            frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                  &view(P1S, now));
+        }
+        assert!(files.overflow <= 0.5,
+                "rows paint {} px more than the list reserves",
+                files.overflow);
+
+        let mut state = browsed_tiles(40);
+        let mut files = FilesUi::default();
+        for _ in 0..2 {
+            frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                  &view(P1S, now));
+        }
+        assert!(files.overflow <= 0.5,
+                "tile rows paint {} px more than the grid reserves",
+                files.overflow);
+    }
+
     // --------------------------------------------------------- small parts
 
     #[test]
@@ -1987,6 +2393,21 @@ mod tests {
         assert_eq!(ago(Duration::from_secs(125)), "2 min");
         assert_eq!(ago(Duration::from_secs(7300)), "2 h");
         assert_eq!(ago(Duration::from_secs(200_000)), "2 d");
+    }
+
+    /// Section 6: printer-clock times, and a row that carried a year keeps
+    /// it instead of showing a midnight the printer never reported.
+    #[test]
+    fn a_row_with_a_year_shows_the_year_not_a_midnight() {
+        let dated = parse_list_line(
+            "/", "drw-rw-rw-   1 root  root  0 Oct 08 2025 cache",
+            DateRule::CalendarYear, 2026).expect("a dated row");
+        assert_eq!(when_text(dated.mtime), "Oct 08 2025");
+        let clocked = parse_list_line(
+            "/", "-rw-rw-rw-   1 root  root  9 Sep 07 19:38 job.gcode.3mf",
+            DateRule::CalendarYear, 2026).expect("a row with a clock");
+        assert_eq!(when_text(clocked.mtime), "Sep 07 19:38");
+        assert_eq!(when_text(None), "—");
     }
 
     #[test]

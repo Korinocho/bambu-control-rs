@@ -22,8 +22,8 @@
 
 use std::fmt;
 use std::io::{self, Read};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
@@ -46,6 +46,10 @@ pub const BROWSE_IDLE_QUIT: Duration = Duration::from_secs(12);
 /// Hard cap of a RETR read into memory on the browse lane (design doc 4):
 /// thumbnails and small 3mf files. Larger files need the transfer lane.
 pub const SMALL_RETR_MAX: u64 = 1024 * 1024;
+/// Hard cap of the running job's 3mf, which this stage still reads on the
+/// browse lane (5.4, interim). Above it the skip-objects dialog says the
+/// file is too big instead of growing the process until it aborts.
+pub const BUNDLE_RETR_MAX: u64 = 64 * 1024 * 1024;
 
 type FtpsStream = ImplFtpStream<AnchoredStream>;
 
@@ -115,6 +119,9 @@ pub enum FtpError {
     NoVerifier(PrinterCertError),
     /// H2C / P2S / X2D: refused by model name, no connection (5.3, Models)
     RefusedByName,
+    /// the configured address is not an IP address: nothing is resolved and
+    /// nothing connects (5.2)
+    BadAddress,
     /// TCP connect timed out
     Offline,
     /// TCP reset on the FTPS port
@@ -165,6 +172,8 @@ impl FtpError {
             Self::RefusedByName => config::files_refused_by_name(serial)
                 .unwrap_or_else(|| "file access is disabled for this printer \
                                     model".into()),
+            Self::BadAddress => "the printer's address is not an IP address \
+                                 (LAN mode needs the printer's IP)".into(),
             Self::Offline => "printer offline".into(),
             Self::PortClosed =>
                 "FTP port closed (LAN mode / Developer Mode off?)".into(),
@@ -197,10 +206,12 @@ impl FtpError {
     }
 
     /// A TLS or certificate failure, which is never retried automatically
-    /// (5.3), and a refusal by model name, which never connects.
+    /// (5.3), and the failures only the user can clear: a refusal by model
+    /// name, a missing verifier, an address that is not an IP.
     pub fn stops_the_worker(&self) -> bool {
         matches!(self, Self::CertRefused(_) | Self::TlsRejected | Self::NotTls
-            | Self::NoVerifier(_) | Self::RefusedByName | Self::AuthRejected)
+            | Self::NoVerifier(_) | Self::RefusedByName | Self::AuthRejected
+            | Self::BadAddress)
     }
 }
 
@@ -290,15 +301,25 @@ fn split_fields(line: &str) -> Option<([&str; 8], &str)> {
     (!rest.is_empty()).then_some((fields, rest))
 }
 
+/// The patterns of a LIST line, compiled once: a listing of a damaged card
+/// is thousands of lines, and every one of them is checked here.
+static PERMS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[\-dl][\-rwxsStT]{9}$").expect("pattern"));
+static DIGITS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d+$").expect("pattern"));
+static DAY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d{1,2}$").expect("pattern"));
+static HHMM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d{1,2}):(\d{1,2})$").expect("pattern"));
+static YEAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d{4}$").expect("pattern"));
+
 /// Regex-lite checks of the fixed fields. Anything that does not match is an
 /// error line and is skipped, never turned into an entry (5.2).
 fn parse_fields(line: &str) -> Option<Fields<'_>> {
     let (fields, name) = split_fields(line)?;
-    let perms = Regex::new(r"^[\-dl][\-rwxsStT]{9}$").unwrap();
-    let digits = Regex::new(r"^\d+$").unwrap();
-    let day_re = Regex::new(r"^\d{1,2}$").unwrap();
-    let hhmm = Regex::new(r"^(\d{1,2}):(\d{1,2})$").unwrap();
-    let year_re = Regex::new(r"^\d{4}$").unwrap();
+    let (perms, digits) = (&*PERMS, &*DIGITS);
+    let (day_re, hhmm, year_re) = (&*DAY, &*HHMM, &*YEAR);
     if !perms.is_match(fields[0]) || !digits.is_match(fields[1])
         || fields[2].is_empty() || fields[3].is_empty()
         || !digits.is_match(fields[4]) || !day_re.is_match(fields[6])
@@ -501,10 +522,13 @@ impl FtpEndpoint {
         if conns.is_cancelled() {
             return Err(FtpError::Cancelled);
         }
-        let addr = (self.ip.as_str(), self.port).to_socket_addrs()
-            .map_err(|e| FtpError::SessionLost(e.kind().to_string()))?
-            .next()
-            .ok_or(FtpError::Offline)?;
+        // the configured address is parsed, never resolved: a name lookup
+        // has no timeout and no cancel check, and would hold this lane
+        // (and the worker that replaces it) for as long as the OS resolver
+        // takes (5.2)
+        let ip: IpAddr =
+            self.ip.trim().parse().map_err(|_| FtpError::BadAddress)?;
+        let addr = SocketAddr::new(ip, self.port);
         // suppaftp's control connect has no timeout: probe first
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
             Ok(probe) => drop(probe),
@@ -675,16 +699,15 @@ impl FtpSession {
         // one probe per session, whatever it answers
         self.year_probed = true;
         let path = join_path(dir, newest.name);
-        match self.mdtm(&path) {
-            Ok(stamp) => {
-                self.printer_year = Some(stamp.year());
-                Ok(())
-            }
-            // the entry vanished between LIST and MDTM: date rows keep the
-            // PC's year until the next listing
-            Err(FtpError::NotFound) => Ok(()),
-            Err(e) => Err(e),
+        // the year is a display detail, so nothing it does fails the
+        // listing: a 550 (the entry vanished between LIST and MDTM), a 500
+        // from a server that does not implement MDTM, or a lost session —
+        // which poisons this session anyway and fails the next real call
+        // with its own classification (5.2)
+        if let Ok(stamp) = self.mdtm(&path) {
+            self.printer_year = Some(stamp.year());
         }
+        Ok(())
     }
 
     pub fn size(&mut self, path: &str) -> Result<u64, FtpError> {
@@ -762,12 +785,14 @@ impl FtpSession {
         Ok(data)
     }
 
-    /// The whole file in memory, without a size cap: the job 3mf of
-    /// `Cmd::JobBundle` only, until the transfer lane lands (5.4).
-    /// `progress` gets the bytes read so far.
-    pub fn retr_unbounded(&mut self, path: &str,
-                          progress: &mut dyn FnMut(u64))
-                          -> Result<Vec<u8>, FtpError> {
+    /// A whole file in memory up to `max`: the job 3mf of `Cmd::JobBundle`
+    /// only, until the transfer lane lands (5.4). `progress` gets the bytes
+    /// read so far. A file that passes `max` while it is read is cut off,
+    /// like `retr_small`, so the bytes on the card can never decide how much
+    /// memory this process takes.
+    pub fn retr_bounded(&mut self, path: &str, max: u64,
+                        progress: &mut dyn FnMut(u64))
+                        -> Result<Vec<u8>, FtpError> {
         addressable(path)?;
         let mark = self.conns.mark();
         let mut stream = self.call(|ftp| ftp.retr_as_stream(path))?;
@@ -776,6 +801,13 @@ impl FtpSession {
         loop {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
+                Ok(n) if data.len() as u64 + n as u64 > max => {
+                    // the early close kills the control connection (3.1)
+                    drop(stream);
+                    self.poisoned = true;
+                    return Err(FtpError::TooLarge {
+                        size: data.len() as u64 + n as u64, max });
+                }
                 Ok(n) => {
                     data.extend_from_slice(&chunk[..n]);
                     progress(data.len() as u64);
@@ -867,9 +899,11 @@ fn from_reply(reply: &suppaftp::types::Response) -> FtpError {
         (_, Status::NotLoggedIn) | (530, _) => FtpError::AuthRejected,
         (522, _) => FtpError::NeedsTlsResume,
         _ => {
-            let mut text: String = text.replace(['\r', '\n'], " ")
-                .trim().to_string();
-            text.truncate(REPLY_TEXT_MAX);
+            // the reply is the server's text, so it can be any UTF-8: the
+            // cap counts characters, never bytes, which would panic in the
+            // middle of one (5.1, rule 6)
+            let text: String = text.replace(['\r', '\n'], " ")
+                .trim().chars().take(REPLY_TEXT_MAX).collect();
             FtpError::Reply(text)
         }
     }
@@ -1263,6 +1297,28 @@ mod tests {
         session.quit();
     }
 
+    /// The year probe is a display detail, so a server that answers MDTM
+    /// with anything else still gives its listing (5.2).
+    #[test]
+    fn an_mdtm_failure_never_fails_the_listing() {
+        let mut spec = listing_server(&[("/timelapse", &TIMELAPSE_LINES)],
+                                      &[], Vec::new());
+        spec.mdtm_reply = Some("500 MDTM not understood");
+        let server = ftp_server(HOST, spec);
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let entries = session.list("/timelapse").unwrap();
+        assert_eq!(entries.len(), 3, "the listing arrived");
+        assert_eq!(session.printer_year(), None, "no year was learned");
+        assert_eq!(server.commands().iter()
+                       .filter(|command| *command == "MDTM").count(), 1);
+        // the 500 still poisons the session, as any reply but a 550 does:
+        // the worker drops it and the next command reconnects
+        assert!(session.is_poisoned());
+        assert_eq!(session.list("/timelapse"), Err(FtpError::Poisoned));
+    }
+
     /// 5.10: a 550 on a listed directory is "folder not present", and the
     /// session goes on.
     #[test]
@@ -1348,6 +1404,59 @@ mod tests {
         session.quit();
     }
 
+    /// The caps themselves, in bytes: every other test compares against the
+    /// constants, so a raised limit would pass them all. The live rule for
+    /// this stage is RETR of files of 1 MB or less.
+    #[test]
+    fn the_read_caps_are_the_documented_byte_counts() {
+        assert_eq!(SMALL_RETR_MAX, 1024 * 1024);
+        assert_eq!(BUNDLE_RETR_MAX, 64 * 1024 * 1024);
+        let server = ftp_server(HOST, genuine(one_file()));
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let before = server.commands().len();
+        // one byte over the cap: nothing is sent
+        assert_eq!(session.retr_small("/a.3mf", 1_048_577),
+                   Err(FtpError::TooLarge { size: 1_048_577,
+                                            max: 1_048_576 }));
+        assert_eq!(server.commands().len(), before);
+        // the cap itself is attempted (the file is one byte, so the
+        // transfer ends short — after the RETR went out)
+        assert_eq!(session.retr_small("/a.3mf", 1_048_576),
+                   Err(FtpError::Truncated { got: 1, want: 1_048_576 }));
+        assert!(server.commands().iter().any(|command| command == "RETR"));
+        session.quit();
+    }
+
+    /// 5.4, interim: the job bundle's read is bounded too, so a huge or
+    /// corrupt 3mf on the card cannot decide how much memory this process
+    /// takes.
+    #[test]
+    fn retr_bounded_stops_a_file_above_its_cap() {
+        let big = vec![7u8; 200_000];
+        let server = ftp_server(HOST,
+                                genuine(vec![("big.3mf".into(), big)]));
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let mut seen = 0;
+        let failure = session.retr_bounded("/big.3mf", 100_000,
+                                           &mut |got| seen = got);
+        assert!(matches!(failure, Err(FtpError::TooLarge { size, max })
+                    if size > 100_000 && max == 100_000), "{failure:?}");
+        assert!(seen <= 100_000, "{seen} bytes were kept");
+        assert!(session.is_poisoned(), "the early close killed the session");
+
+        // under its cap it reads the whole file
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let data = session.retr_bounded("/big.3mf", BUNDLE_RETR_MAX,
+                                        &mut |_| {}).unwrap();
+        assert_eq!(data.len(), 200_000);
+        session.quit();
+    }
+
     /// 3.1: PASV can name a host that is not the printer (an all-zero host
     /// on some firmware), and the data connection goes to the control peer.
     #[test]
@@ -1417,6 +1526,48 @@ mod tests {
         assert!(text.contains("500") && text.contains("size unavailable"),
                 "{text}");
         assert!(session.is_poisoned());
+    }
+
+    /// 5.1, rule 6: the reply cap counts characters, so a long reply in
+    /// another alphabet is cut on a character and never in the middle of
+    /// one, which would panic (and abort a release build).
+    #[test]
+    fn a_long_reply_is_cut_on_a_character_boundary() {
+        let text = format!("500 {}", "ñ".repeat(200));
+        let reply = Response::new(Status::Unknown, text.as_bytes().to_vec());
+        let FtpError::Reply(kept) = from_reply(&reply) else {
+            panic!("expected the reply text");
+        };
+        assert_eq!(kept.chars().count(), REPLY_TEXT_MAX);
+        assert!(kept.starts_with("500 ñ"), "{kept}");
+        // and through the failed call it comes from
+        let conns = SessionConns::new();
+        assert!(matches!(
+            classify(&conns, 0, SuppaError::UnexpectedResponse(reply)),
+            FtpError::Reply(_)));
+    }
+
+    /// 5.2: a configured address that is not an IP is a configuration
+    /// error, answered without a name lookup and without a socket.
+    #[test]
+    fn an_address_that_is_not_an_ip_never_resolves_and_never_connects() {
+        let listener = TcpListener::bind((HOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut printer = endpoint(Ok(test_tls(TEST_CA, TEST_SERIAL)), port,
+                                   TEST_SERIAL, IO_TIMEOUT);
+        printer.ip = "printer.local".into();
+        let started = Instant::now();
+        assert_eq!(printer.connect(SessionConns::new(), None).err(),
+                   Some(FtpError::BadAddress));
+        assert!(started.elapsed() < Duration::from_millis(500),
+                "{:?}", started.elapsed());
+        assert!(listener.accept().is_err(), "no connection attempted");
+        // only the user can clear it, so the lane stops until they do
+        assert!(FtpError::BadAddress.stops_the_worker());
+        assert_eq!(FtpError::BadAddress.text(TEST_SERIAL),
+                   "the printer's address is not an IP address (LAN mode \
+                    needs the printer's IP)");
     }
 
     /// T22: every data connection of a session resumes its control
@@ -1962,6 +2113,7 @@ mod tests {
         let errors = [
             FtpError::NoVerifier(PrinterCertError::NoSerialConfigured),
             FtpError::RefusedByName,
+            FtpError::BadAddress,
             FtpError::Offline,
             FtpError::PortClosed,
             FtpError::HandshakeStall,

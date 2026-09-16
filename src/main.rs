@@ -303,6 +303,11 @@ impl App {
     /// listing round. A model refused by name lists nothing and opens no
     /// socket (design doc 5.3, Models).
     fn open_files(&mut self) {
+        /// A listing this old is taken again when the view is opened, so
+        /// reopening never shows "updated 2 h ago" with nothing running
+        /// (design doc 5.5).
+        const STALE: Duration = Duration::from_secs(60);
+
         self.view = AppView::Files;
         let Some(printer) = self.printers.get_mut(self.selected) else {
             return;
@@ -310,7 +315,13 @@ impl App {
         if config::files_refused_by_name(&printer.cfg.serial).is_some() {
             return;
         }
-        if printer.browser.dirs.is_empty() {
+        // nothing listed yet, a round that failed (no listing is Ready), or
+        // one older than STALE — but never while a round is in flight
+        let stale = printer.browser.updated_at()
+            .is_none_or(|at| at.elapsed() >= STALE);
+        if !printer.browser.is_listing()
+            && (printer.browser.dirs.is_empty() || stale)
+        {
             for cmd in printer.browser.refresh() {
                 printer.ftp.send(cmd);
             }
@@ -346,6 +357,9 @@ impl App {
         let selected = self.selected;
         // the session line ticks while a session connects or sits idle
         ctx.request_repaint_after(Duration::from_millis(100));
+        // a dialog is painted over this view (Edit printer, for example):
+        // it owns the keyboard while it is open (design doc 6)
+        let dialog_open = !matches!(self.dialog, Dialog::None);
         let (actions, cmds) = {
             let printer = &mut self.printers[selected];
             let status = printer.ftp.status();
@@ -360,6 +374,7 @@ impl App {
                 profile: status.profile,
                 open_sessions: status.open_sessions,
                 printing,
+                dialog_open,
                 now: Instant::now(),
             };
             let out = files_view::show(ui, &mut printer.browser,

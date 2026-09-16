@@ -79,8 +79,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
 
-Binary releases link many third-party Rust crates and embed fonts; their license texts
-are included in the release archive.
+Binary releases link many third-party Rust crates and embed fonts.
 
-`vendor/suppaftp` is a copy of the suppaftp crate (MIT OR Apache-2.0, license files
-included) with one small patch, described in `vendor/suppaftp/PATCHES.md`.
+`vendor/suppaftp` is a copy of suppaftp 10.0.2 by Christian Visintin
+(<https://github.com/veeso/suppaftp>), MIT OR Apache-2.0, with its license files
+included and one small patch, described in `vendor/suppaftp/PATCHES.md`.
