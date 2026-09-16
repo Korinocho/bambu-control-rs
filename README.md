@@ -17,6 +17,8 @@ through LAN / Developer Mode, which Bambu Lab does not officially support; you u
 your own risk, including any effect on your printer or its warranty. Printer error (HMS)
 descriptions and firmware version information are fetched at runtime from Bambu Lab's
 servers, belong to Bambu Lab, and are not distributed with this project.
+The `BBL CA` certificate embedded in the app belongs to Bambu Lab, is included only to
+verify printers, and is not covered by this project's license.
 
 ## Features
 
@@ -77,5 +79,8 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual
 licensed as above, without any additional terms or conditions.
 
-Binary releases link many third-party Rust crates and embed fonts; their license texts
-are included in the release archive.
+Binary releases link many third-party Rust crates and embed fonts.
+
+`vendor/suppaftp` is a copy of suppaftp 10.0.2 by Christian Visintin
+(<https://github.com/veeso/suppaftp>), MIT OR Apache-2.0, with its license files
+included and one small patch, described in `vendor/suppaftp/PATCHES.md`.

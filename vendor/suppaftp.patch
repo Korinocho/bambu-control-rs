@@ -1,0 +1,15 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -224,6 +224,12 @@
+ pub use types::{FtpError, FtpResult, Mode};
+ pub type FtpStream = ImplFtpStream<NoTlsStream>;
+ pub use sync_ftp::DataStream;
++// -- export secure (connector trait)
++// bambu-control patch (vendor/suppaftp/PATCHES.md): lets applications
++// implement their own TLS connector.
++#[cfg(feature = "secure")]
++#[cfg_attr(docsrs, doc(cfg(feature = "secure")))]
++pub use sync_ftp::TlsConnector;
+ // -- export secure (native-tls)
+ #[cfg(feature = "native-tls")]
+ #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]

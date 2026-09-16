@@ -14,9 +14,17 @@ publish = false
 [dependencies]
 eframe = "0.35.0"
 egui = "0.35.0"
-rumqttc = { version = "0.25.1", features = ["use-native-tls"] }
+# native-tls is used ONLY by MQTT (rumqttc) and the camera, until GitHub
+# issues #1 and #2 move them to the printer certificate verifier. FTPS does
+# not use it; this is not a transition step for FTPS.
 native-tls = "0.2.18"
-suppaftp = { version = "10.0.1", features = ["native-tls", "deprecated"] }
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-native-tls"] }
+suppaftp = { version = "10.0.2", features = ["rustls-ring", "deprecated"] }
+# "tls12" is load-bearing: the printers negotiate only TLS 1.2. Without it no
+# printer handshake can succeed (design doc 5.3).
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+x509-cert = { version = "0.3.0", default-features = false }
+ring = "0.17"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -26,9 +34,27 @@ ureq = "3.3.0"
 anyhow = "1.0.104"
 crossbeam-channel = "0.5.16"
 regex-lite = "0.1.9"
+# LIST dates and MDTM replies are naive printer-clock times, parsed in
+# src/ftp.rs (design doc 5.2). chrono is already built through suppaftp,
+# with the same feature set.
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+# Single instance (design doc 4, rule 6): CreateMutexW for the named mutex
+# and MessageBoxW for the message a second launch shows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 winresource = "0.1"
+
+# suppaftp 10.0.2 with one visibility patch: its TlsConnector trait is
+# exported, so FTPS runs through the app's own connector (design doc 5.3).
+# See vendor/suppaftp/PATCHES.md; drop this once upstream exports the trait.
+[patch.crates-io]
+suppaftp = { path = "vendor/suppaftp" }
 
 [profile.release]
 opt-level = 3

@@ -4,25 +4,38 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod browser;
 mod camera;
 mod config;
 mod files;
 mod firmware;
+mod ftp;
 mod hms;
+mod instance;
 mod mqtt;
 mod theme;
+mod tls;
 mod ui;
 
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::{Color32, CornerRadius, RichText, Sense, Stroke, StrokeKind};
 
+use browser::{BrowserState, Cmd, Event, FtpWorker};
 use config::{Config, PrinterCfg, model_from_serial};
 use ui::dialogs::{self, Dialog};
+use ui::files_view::{self, FilesUi};
 use ui::panel::{self, PanelAction, PanelView};
+
+/// What the central panel shows: the printer panel, or the files view of
+/// design doc 6 for the selected printer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppView {
+    Panel,
+    Files,
+}
 
 struct PrinterUi {
     cfg: PrinterCfg,
@@ -31,15 +44,39 @@ struct PrinterUi {
     cam_texture: Option<egui::TextureHandle>,
     fw_latest_slot: Arc<Mutex<Option<String>>>,
     fw_latest: String,
-    job_fetch: Option<Arc<files::JobFetch>>,
+    /// browse lane: listings, thumbnails and the running job's bundle, on
+    /// one session at a time (design doc 4, rule 1)
+    ftp: FtpWorker,
+    /// what the files view shows
+    browser: BrowserState,
+    /// the files view's own state: tab, filter, selection and textures
+    files: FilesUi,
     job_bundle: Option<files::JobBundle>,
     plate_texture: Option<egui::TextureHandle>,
     current_job: String,
+    /// last job name and state seen on MQTT, to tell the worker when a job
+    /// is starting (design doc 4, rule 5)
+    last_job: String,
+    last_gcode_state: String,
     light_pending: Option<(bool, Instant)>,
 }
 
 impl PrinterUi {
     fn new(cfg: PrinterCfg, ctx: &egui::Context) -> Self {
+        Self::with_worker(cfg.clone(), ctx, FtpWorker::start(&cfg, ctx))
+    }
+
+    /// The printer that replaces one whose connection was edited: its
+    /// worker opens no session until the old lane thread has ended
+    /// (design doc 4, rule 3).
+    fn new_replacing(cfg: PrinterCfg, ctx: &egui::Context,
+                     previous: &PrinterUi) -> Self {
+        let ftp = FtpWorker::start_replacing(&cfg, ctx, &previous.ftp);
+        Self::with_worker(cfg, ctx, ftp)
+    }
+
+    fn with_worker(cfg: PrinterCfg, ctx: &egui::Context,
+                   ftp: FtpWorker) -> Self {
         let client = mqtt::PrinterClient::start(
             &cfg.ip, &cfg.serial, &cfg.access_code, ctx.clone());
         let fw_latest_slot = Arc::new(Mutex::new(None));
@@ -52,15 +89,21 @@ impl PrinterUi {
             cam_texture: None,
             fw_latest_slot,
             fw_latest: String::new(),
-            job_fetch: None,
+            ftp,
+            browser: BrowserState::default(),
+            files: FilesUi::default(),
             job_bundle: None,
             plate_texture: None,
             current_job: String::new(),
+            last_job: String::new(),
+            last_gcode_state: String::new(),
             light_pending: None,
         }
     }
 
     fn set_active(&mut self, active: bool, ctx: &egui::Context) {
+        // a background printer drops its prefetch and closes its session
+        self.ftp.send(Cmd::SetBackground(!active));
         if active && self.camera.is_none() {
             self.camera = Some(camera::Camera::start(
                 self.cfg.ip.clone(), self.cfg.access_code.clone(),
@@ -71,11 +114,14 @@ impl PrinterUi {
         }
     }
 
+    /// Stops everything without waiting: the FTP session is cancelled and
+    /// its lane thread ends on its own (design doc 5.1, rule 7).
     fn shutdown(&mut self) {
         if let Some(cam) = self.camera.take() {
             cam.stop();
         }
         self.client.stop();
+        self.ftp.stop();
     }
 
     /// Per-frame sync of async results into UI state.
@@ -95,9 +141,24 @@ impl PrinterUi {
                 }
             }
         }
-        let fetched = self.job_fetch.as_ref()
-            .and_then(|f| f.result.lock().unwrap().take());
-        if let Some(bundle) = fetched {
+        // at most 64 worker events per frame (design doc 5.9)
+        for _ in 0..64 {
+            let Ok(event) = self.ftp.events.try_recv() else { break };
+            let bundle = match event {
+                Event::JobBundle { job, result } if job == self.current_job =>
+                    result.unwrap_or_else(|e| files::JobBundle {
+                        error: e.text(&self.cfg.serial),
+                        ..Default::default()
+                    }),
+                // the files view (stage 2 part 2) shows the rest; a bundle
+                // for another job is dropped, as JobFetcher dropped it
+                event => {
+                    for cmd in self.browser.apply(event) {
+                        self.ftp.send(cmd);
+                    }
+                    continue;
+                }
+            };
             if let Some(png) = &bundle.plate_png
                 && let Ok(img) = image::load_from_memory(png)
             {
@@ -110,7 +171,6 @@ impl PrinterUi {
                     Default::default()));
             }
             self.job_bundle = Some(bundle);
-            self.job_fetch = None;
         }
 
         // auto-fetch job data when a new print shows up
@@ -124,16 +184,37 @@ impl PrinterUi {
                 s
             }
         }.to_string();
+        // a job preparing or starting closes an idle session at once
+        // (design doc 4, rule 5)
+        if gcode_state != self.last_gcode_state || job != self.last_job {
+            let starting = gcode_state == "PREPARE"
+                || (job != self.last_job && !job.is_empty()
+                    && gcode_state != "RUNNING");
+            if starting {
+                self.ftp.send(Cmd::JobStarting);
+            }
+            let printing = matches!(gcode_state.as_str(), "RUNNING" | "PAUSE");
+            let was_printing = matches!(self.last_gcode_state.as_str(),
+                                        "RUNNING" | "PAUSE");
+            if printing != was_printing {
+                self.ftp.send(Cmd::SetPrinting(printing));
+            }
+            self.last_gcode_state = gcode_state.clone();
+            self.last_job = job.clone();
+        }
         if !job.is_empty() && job != self.current_job
             && matches!(gcode_state.as_str(), "RUNNING" | "PAUSE")
         {
             self.current_job = job.clone();
             self.job_bundle = None;
             self.plate_texture = None;
-            self.job_fetch = Some(files::JobFetch::spawn(
-                self.cfg.ip.clone(), self.cfg.access_code.clone(), job,
-                panel::s_str(&state, "gcode_file").to_string(),
-                ctx.clone()));
+            // a fetch still running for the previous job name is cancelled,
+            // and this one runs on the browse session (design doc 5.4)
+            self.ftp.send(Cmd::JobBundle {
+                job,
+                file_name: panel::s_str(&state, "gcode_file").to_string(),
+                print_type: panel::s_str(&state, "print_type").to_string(),
+            });
         }
     }
 }
@@ -149,18 +230,30 @@ struct App {
     printers: Vec<PrinterUi>,
     selected: usize,
     dialog: Dialog,
+    /// the printer panel, or the files view of the selected printer
+    view: AppView,
     started: bool,
+    /// config.toml; writes nothing after a failed load
+    store: config::Store,
+    /// a failed save, or an unreadable config.toml; shown above the panel
+    config_error: Option<String>,
 }
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
         theme::install_fonts(ctx);
         theme::apply(ctx);
-        let cfg = config::load();
+        let (store, loaded) = config::Store::load();
+        let (cfg, migrated, config_error) = match loaded {
+            Ok(loaded) => (loaded.cfg, loaded.migrated, None),
+            Err(e) => (Config::default(), false, Some(format!(
+                "config.toml can't be read; nothing is written until it is \
+                 fixed ({e})"))),
+        };
         let printers: Vec<PrinterUi> = cfg.printers.iter()
             .map(|p| PrinterUi::new(p.clone(), ctx))
             .collect();
-        let dialog = if printers.is_empty() {
+        let dialog = if printers.is_empty() && !store.is_blocked() {
             Dialog::AddPrinter(dialogs::AddPrinterDlg {
                 draft: PrinterCfg::default(),
                 editing: None,
@@ -169,13 +262,27 @@ impl App {
         } else {
             Dialog::None
         };
-        Self { cfg, printers, selected: 0, dialog, started: false }
+        let mut app = Self {
+            cfg, printers, selected: 0, dialog, view: AppView::Panel,
+            started: false, store, config_error,
+        };
+        if migrated {
+            app.save_config();
+        }
+        app
     }
 
+    /// Saves atomically and shows a failure. While config.toml is unreadable
+    /// the store writes nothing, and the load error stays on screen.
     fn save_config(&mut self) {
         self.cfg.printers =
             self.printers.iter().map(|p| p.cfg.clone()).collect();
-        config::save(&self.cfg);
+        match self.store.save(&self.cfg) {
+            Ok(()) => self.config_error = None,
+            Err(_) if self.store.is_blocked() => {}
+            Err(e) => self.config_error =
+                Some(format!("settings couldn't be saved: {e}")),
+        }
     }
 
     fn select(&mut self, index: usize, ctx: &egui::Context) {
@@ -185,6 +292,126 @@ impl App {
         self.selected = index;
         for (i, p) in self.printers.iter_mut().enumerate() {
             p.set_active(i == index, ctx);
+        }
+        // the files view follows the selected chip (design doc 6)
+        if self.view == AppView::Files {
+            self.open_files();
+        }
+    }
+
+    /// Opens the files view for the selected printer and starts its first
+    /// listing round. A model refused by name lists nothing and opens no
+    /// socket (design doc 5.3, Models).
+    fn open_files(&mut self) {
+        /// A listing this old is taken again when the view is opened, so
+        /// reopening never shows "updated 2 h ago" with nothing running
+        /// (design doc 5.5).
+        const STALE: Duration = Duration::from_secs(60);
+
+        self.view = AppView::Files;
+        let Some(printer) = self.printers.get_mut(self.selected) else {
+            return;
+        };
+        if config::files_refused_by_name(&printer.cfg.serial).is_some() {
+            return;
+        }
+        // nothing listed yet, a round that failed (no listing is Ready), or
+        // one older than STALE — but never while a round is in flight
+        let stale = printer.browser.updated_at()
+            .is_none_or(|at| at.elapsed() >= STALE);
+        if !printer.browser.is_listing()
+            && (printer.browser.dirs.is_empty() || stale)
+        {
+            for cmd in printer.browser.refresh() {
+                printer.ftp.send(cmd);
+            }
+        }
+    }
+
+    /// `BAMBU_CONTROL_OPEN_FILES="<printer index>[:timelapses|recordings|
+    /// files]"` opens that view at start, for the G4 screenshot. The index
+    /// is zero-based. Debug builds only: nothing of this exists in a
+    /// release build.
+    #[cfg(debug_assertions)]
+    fn open_files_from_env(&mut self, ctx: &egui::Context) {
+        let Ok(value) = std::env::var("BAMBU_CONTROL_OPEN_FILES") else {
+            return;
+        };
+        let (index, tab) = match value.split_once(':') {
+            Some((index, tab)) => (index, files_view::Tab::from_word(tab)),
+            None => (value.as_str(), None),
+        };
+        let Ok(index) = index.trim().parse::<usize>() else { return };
+        if index >= self.printers.len() {
+            return;
+        }
+        self.select(index, ctx);
+        if let Some(tab) = tab {
+            self.printers[index].files.tab = tab;
+        }
+        self.open_files();
+    }
+
+    /// The files view of design doc 6, in place of the printer panel.
+    fn show_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let selected = self.selected;
+        // the session line ticks while a session connects or sits idle
+        ctx.request_repaint_after(Duration::from_millis(100));
+        // a dialog is painted over this view (Edit printer, for example):
+        // it owns the keyboard while it is open (design doc 6)
+        let dialog_open = !matches!(self.dialog, Dialog::None);
+        let (actions, cmds) = {
+            let printer = &mut self.printers[selected];
+            let status = printer.ftp.status();
+            let printing = {
+                let state = printer.client.state.lock().unwrap();
+                matches!(panel::s_str(&state, "gcode_state"),
+                         "RUNNING" | "PAUSE")
+            };
+            let view = files_view::View {
+                name: &printer.cfg.name,
+                serial: &printer.cfg.serial,
+                profile: status.profile,
+                open_sessions: status.open_sessions,
+                printing,
+                dialog_open,
+                now: Instant::now(),
+            };
+            let out = files_view::show(ui, &mut printer.browser,
+                                       &mut printer.files, &view);
+            (out.actions, out.cmds)
+        };
+        for cmd in cmds {
+            self.printers[selected].ftp.send(cmd);
+        }
+        for action in actions {
+            match action {
+                files_view::Action::Back => {
+                    self.printers[selected].files.close();
+                    self.view = AppView::Panel;
+                }
+                files_view::Action::Refresh => {
+                    let printer = &mut self.printers[selected];
+                    for cmd in printer.browser.refresh() {
+                        printer.ftp.send(cmd);
+                    }
+                }
+                files_view::Action::Retry => {
+                    let printer = &mut self.printers[selected];
+                    // the lane stopped until the user acted (5.3)
+                    printer.ftp.send(Cmd::Retry);
+                    for cmd in printer.browser.refresh() {
+                        printer.ftp.send(cmd);
+                    }
+                }
+                files_view::Action::EditPrinter => {
+                    self.dialog = Dialog::AddPrinter(dialogs::AddPrinterDlg {
+                        draft: self.printers[selected].cfg.clone(),
+                        editing: Some(selected),
+                        error: String::new(),
+                    });
+                }
+            }
         }
     }
 
@@ -432,8 +659,11 @@ impl App {
                                 || new_cfg.access_code != old.access_code;
                             if conn_changed {
                                 self.printers[index].shutdown();
-                                self.printers[index] =
-                                    PrinterUi::new(new_cfg, ctx);
+                                // the replacement opens no session until the
+                                // old lane thread has ended (4, rule 3)
+                                let replacement = PrinterUi::new_replacing(
+                                    new_cfg, ctx, &self.printers[index]);
+                                self.printers[index] = replacement;
                                 if index == self.selected {
                                     self.printers[index]
                                         .set_active(true, ctx);
@@ -665,6 +895,7 @@ impl App {
                 printer.light_pending = Some((on, Instant::now()));
                 printer.client.set_light(on);
             }
+            PanelAction::OpenFiles => self.open_files(),
         }
     }
 }
@@ -676,6 +907,8 @@ impl eframe::App for App {
             if !self.printers.is_empty() {
                 self.select(0, ctx);
             }
+            #[cfg(debug_assertions)]
+            self.open_files_from_env(ctx);
         }
         for printer in &mut self.printers {
             printer.sync(ctx);
@@ -734,6 +967,16 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(theme::BG)
                 .inner_margin(10))
             .show(root, |ui| {
+                if let Some(error) = &self.config_error {
+                    ui.label(RichText::new(error).color(theme::DANGER));
+                }
+                // the files view is a full page, outside the panel's
+                // ScrollArea: a nested show_rows inside it would break the
+                // grid's virtualisation (design doc 6)
+                if self.view == AppView::Files && !self.printers.is_empty() {
+                    self.show_files(ui, ctx);
+                    return;
+                }
                 egui::ScrollArea::vertical().auto_shrink(false)
                     .show(ui, |ui| {
                 if self.printers.is_empty() {
@@ -763,6 +1006,14 @@ impl eframe::App for App {
                 }
 
                 let model = model_from_serial(&printer.cfg.serial);
+                // FILES card: counts from the listing taken this session
+                let (timelapses, _, print_files) = printer.browser.counts();
+                let files_summary = match printer.browser.updated_at() {
+                    Some(_) => format!(
+                        "{timelapses} timelapses  ·  {print_files} files"),
+                    None =>
+                        "Timelapses · Recordings · Print files".to_string(),
+                };
                 let view = PanelView {
                     state: &state,
                     connected: printer.client.conn.lock().unwrap()
@@ -772,8 +1023,8 @@ impl eframe::App for App {
                         .map(|c| c.status.lock().unwrap().clone())
                         .unwrap_or_else(|| "camera paused".into()),
                     plate_texture: printer.plate_texture.as_ref(),
-                    fetch_progress: printer.job_fetch.as_ref()
-                        .map(|f| f.progress.load(Ordering::Relaxed)),
+                    fetch_progress: printer.ftp
+                        .job_progress(&printer.current_job),
                     object_count: printer.job_bundle.as_ref()
                         .map(|b| b.objects.len()).unwrap_or(0),
                     fw_current: panel::ota_version(&device_info),
@@ -781,6 +1032,7 @@ impl eframe::App for App {
                     show_humidity: !model.contains("A1"),
                     model,
                     light_shown_on: shown_on,
+                    files_summary,
                 };
                 let actions = panel::show(ui, &view);
                 for action in actions {
@@ -815,6 +1067,16 @@ fn load_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // design doc 4, rule 6: a second instance would double every printer's
+    // FTP session count, so it says so and exits without connecting
+    let _instance: instance::Instance =
+        match instance::acquire(instance::MUTEX_NAME) {
+            Ok(instance) => instance,
+            Err(instance::AlreadyRunning) => {
+                instance::show_already_running();
+                return Ok(());
+            }
+        };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1080.0, 780.0])
