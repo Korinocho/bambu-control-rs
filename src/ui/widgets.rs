@@ -246,14 +246,14 @@ pub fn plate_map(ui: &mut Ui, objects: &[(i64, String)],
         }
     }
 
-    if let Some(id) = hover_id {
-        if !locked.contains(&id) {
-            ui.output_mut(|o| {
-                o.cursor_icon = egui::CursorIcon::PointingHand;
-            });
-            if response.clicked() {
-                clicked = Some(id);
-            }
+    if let Some(id) = hover_id
+        && !locked.contains(&id)
+    {
+        ui.output_mut(|o| {
+            o.cursor_icon = egui::CursorIcon::PointingHand;
+        });
+        if response.clicked() {
+            clicked = Some(id);
         }
     }
     clicked

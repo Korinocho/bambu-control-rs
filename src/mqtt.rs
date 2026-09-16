@@ -53,7 +53,7 @@ impl PrinterClient {
             .build()
             .expect("tls connector");
         options.set_transport(Transport::tls_with_config(
-            rumqttc::TlsConfiguration::NativeConnector(connector.into())));
+            rumqttc::TlsConfiguration::NativeConnector(connector)));
 
         let (client, mut connection) = Client::new(options, 32);
         let me = Arc::new(Self {
