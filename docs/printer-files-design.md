@@ -632,6 +632,7 @@ Fixtures:
 - **Local only.**
   - The owner's three real leaves carry serials, so they are never committed.
   - Tests marked (local) read the DERs and serials from a directory outside the repository named by `BAMBU_REAL_CERTS`. They are `#[ignore]` in CI and run with `cargo test -- --ignored` before merging any change to `src/tls.rs`.
+  - **Where they live (2026-09-16):** `C:\Users\Anton\bambu-test-certs\`, outside the repository and outside the session scratchpad, which is temporary and gets deleted. `leaves\` holds the three X.509 v1 leaves and the rest of the per-printer material, `anchor-spike\` the CA-anchor spike's copies, and `config.toml` is a copy of the app's config, read for the serials only. Run them with `BAMBU_REAL_CERTS` pointing at `leaves\`, `BAMBU_REAL_CONFIG` at that `config.toml`, and, for the live browse test of 5.4, `BAMBU_LIVE_CONFIG` at the same file. All four `#[ignore]` tests passed from there on 2026-09-16. They are the only tests that check the verifier against real printer hardware, so the directory outlives any one session and is never deleted with the scratchpad.
   - Each local test has a committed test-PKI twin that runs in CI.
 - **Test anchor.** The verifier takes its anchor internally, so tests can anchor it on a test CA. The public constructor has no anchor parameter and always uses `BBL_CA_DER`.
 - **Servers.** In-process rustls TLS 1.2 servers built with `builder_with_provider`. `DigitallySignedStruct::new` is crate-private, so handshake signatures are tampered with inside the test server's signer.
