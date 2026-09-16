@@ -1038,6 +1038,9 @@ mod tests {
     }
 
     #[test]
+    // the fixture's type is written out on purpose: clearer here than an
+    // alias used once
+    #[allow(clippy::type_complexity)]
     fn one_sided_duplicates_and_bad_boxes_get_no_box() {
         let cases: [(&[(u32, i64, &str)], &str); 3] = [
             (&[(1, 11, "part"), (1, 12, "part")],

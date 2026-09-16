@@ -574,10 +574,9 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
                 if let Some(id) = widgets::plate_map(
                     ui, &bundle.objects, &bundle.bboxes, &locked,
                     &dlg.selected)
+                    && !dlg.selected.remove(&id)
                 {
-                    if !dlg.selected.remove(&id) {
-                        dlg.selected.insert(id);
-                    }
+                    dlg.selected.insert(id);
                 }
             });
             ui.add_space(6.0);
