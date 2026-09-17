@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use bytes::BytesMut;
+use rumqttc::{ConnAck, ConnectReturnCode, Login, Packet, Publish, QoS, SubAck,
+              SubscribeReasonCode};
 use rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -895,6 +898,343 @@ pub fn holding_server(config: Arc<ServerConfig>, hold: Duration) -> u16 {
                 }
                 std::thread::sleep(hold);
                 drop(tcp);
+            });
+        }
+    });
+    port
+}
+
+/// What the in-process MQTT broker does with a SUBSCRIBE. Four of these
+/// exist because a subscription can fail in more than one way, and the worst
+/// of them looks like success (design doc 5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubAckMode {
+    /// SUBACK carrying the client's own pkid and `Success`
+    Grant,
+    /// no SUBACK at all: acknowledged by nothing
+    Withhold,
+    /// SUBACK carrying a pkid the client never sent
+    WrongPkid,
+    /// SUBACK that acknowledges and grants nothing (return code 0x80).
+    /// Something comes back, so this reads as success to a client that only
+    /// checks whether a SUBACK arrived.
+    Failure,
+}
+
+/// What the in-process MQTT broker serves.
+pub struct MqttSpec {
+    pub tls: Arc<ServerConfig>,
+    pub subscribe: SubAckMode,
+    /// published to the client immediately after the SUBACK, in order
+    pub reports: Vec<Vec<u8>>,
+    /// answer PINGREQ with PINGRESP; false models a broker that ignores them
+    pub answer_pings: bool,
+}
+
+impl MqttSpec {
+    /// Grants the subscription and publishes `reports`.
+    pub fn new(tls: Arc<ServerConfig>, reports: Vec<Vec<u8>>) -> Self {
+        Self { tls, subscribe: SubAckMode::Grant, reports, answer_pings: true }
+    }
+}
+
+/// What one broker saw, for the assertions.
+pub struct MqttBroker {
+    pub port: u16,
+    /// (client_id, username, password) per CONNECT
+    pub logins: Arc<Mutex<Vec<(String, String, String)>>>,
+    /// keep_alive seconds per CONNECT, as it went on the wire
+    pub keep_alives: Arc<Mutex<Vec<u16>>>,
+    /// the pkid of every SUBSCRIBE, in order
+    pub subscribe_pkids: Arc<Mutex<Vec<u16>>>,
+    pub pings: Arc<AtomicUsize>,
+}
+
+impl MqttBroker {
+    pub fn logins(&self) -> Vec<(String, String, String)> {
+        self.logins.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    pub fn keep_alives(&self) -> Vec<u16> {
+        self.keep_alives.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    pub fn subscribe_pkids(&self) -> Vec<u16> {
+        self.subscribe_pkids.lock().unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn pings(&self) -> usize {
+        self.pings.load(Ordering::SeqCst)
+    }
+}
+
+/// Largest MQTT packet this broker will frame.
+const MQTT_MAX: usize = 1024 * 1024;
+
+/// An MQTT 3.1.1 broker on 127.0.0.1 behind the printer's TLS, for the
+/// connection loop of issue #1.
+///
+/// It frames packets with a loop of its own rather than sharing the client's:
+/// two sides that share their framing can hide a bug in it, because the same
+/// mistake cancels out at both ends. Only rumqttc's codec is shared, and that
+/// is not what these tests are checking.
+pub fn mqtt_broker(spec: MqttSpec) -> MqttBroker {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let broker = MqttBroker {
+        port,
+        logins: Arc::new(Mutex::new(Vec::new())),
+        keep_alives: Arc::new(Mutex::new(Vec::new())),
+        subscribe_pkids: Arc::new(Mutex::new(Vec::new())),
+        pings: Arc::new(AtomicUsize::new(0)),
+    };
+    let spec = Arc::new(spec);
+    let logins = broker.logins.clone();
+    let keep_alives = broker.keep_alives.clone();
+    let pkids = broker.subscribe_pkids.clone();
+    let pings = broker.pings.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(tcp) = stream else { continue };
+            let (spec, logins, keep_alives, pkids, pings) =
+                (spec.clone(), logins.clone(), keep_alives.clone(),
+                 pkids.clone(), pings.clone());
+            std::thread::spawn(move || {
+                serve_mqtt(tcp, &spec, &logins, &keep_alives, &pkids, &pings)
+                    .ok();
+            });
+        }
+    });
+    broker
+}
+
+fn serve_mqtt(tcp: TcpStream, spec: &MqttSpec,
+              logins: &Mutex<Vec<(String, String, String)>>,
+              keep_alives: &Mutex<Vec<u16>>,
+              pkids: &Mutex<Vec<u16>>,
+              pings: &AtomicUsize) -> io::Result<()> {
+    tcp.set_read_timeout(Some(HOLD))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let conn = ServerConnection::new(spec.tls.clone())
+        .map_err(io::Error::other)?;
+    let mut tls = StreamOwned::new(conn, tcp);
+    while tls.conn.is_handshaking() {
+        tls.conn.complete_io(&mut tls.sock)?;
+    }
+    let mut buf = BytesMut::new();
+    // CONNECT first, or this is not an MQTT client
+    match next_packet(&mut tls, &mut buf)? {
+        Packet::Connect(connect) => {
+            let login = connect.login.unwrap_or(Login {
+                username: String::new(), password: String::new() });
+            logins.lock().unwrap_or_else(PoisonError::into_inner).push((
+                connect.client_id, login.username, login.password));
+            keep_alives.lock().unwrap_or_else(PoisonError::into_inner)
+                .push(connect.keep_alive);
+        }
+        _ => return Err(io::Error::other("first packet was not CONNECT")),
+    }
+    send(&mut tls, &Packet::ConnAck(
+        ConnAck::new(ConnectReturnCode::Success, false)))?;
+    loop {
+        match next_packet(&mut tls, &mut buf)? {
+            Packet::Subscribe(subscribe) => {
+                pkids.lock().unwrap_or_else(PoisonError::into_inner)
+                    .push(subscribe.pkid);
+                let ack = match spec.subscribe {
+                    SubAckMode::Withhold => None,
+                    SubAckMode::Grant => Some(SubAck::new(
+                        subscribe.pkid,
+                        vec![SubscribeReasonCode::Success(QoS::AtMostOnce)])),
+                    SubAckMode::WrongPkid => Some(SubAck::new(
+                        subscribe.pkid.wrapping_add(7),
+                        vec![SubscribeReasonCode::Success(QoS::AtMostOnce)])),
+                    SubAckMode::Failure => Some(SubAck::new(
+                        subscribe.pkid, vec![SubscribeReasonCode::Failure])),
+                };
+                if let Some(ack) = ack {
+                    send(&mut tls, &Packet::SubAck(ack))?;
+                }
+                // a broker that granted nothing publishes nothing
+                if spec.subscribe == SubAckMode::Grant {
+                    for report in &spec.reports {
+                        send(&mut tls, &Packet::Publish(Publish::new(
+                            "device/test/report", QoS::AtMostOnce,
+                            report.clone())))?;
+                    }
+                }
+            }
+            Packet::PingReq => {
+                pings.fetch_add(1, Ordering::SeqCst);
+                if spec.answer_pings {
+                    send(&mut tls, &Packet::PingResp)?;
+                }
+            }
+            Packet::Disconnect => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+/// Reads until one whole packet is framed. `InsufficientBytes` is the codec
+/// asking for more bytes, not an error.
+fn next_packet(tls: &mut StreamOwned<ServerConnection, TcpStream>,
+               buf: &mut BytesMut) -> io::Result<Packet> {
+    loop {
+        match Packet::read(buf, MQTT_MAX) {
+            Ok(packet) => return Ok(packet),
+            Err(rumqttc::Error::InsufficientBytes(_)) => {}
+            Err(e) => return Err(io::Error::other(e.to_string())),
+        }
+        let mut chunk = [0u8; 4096];
+        let n = tls.read(&mut chunk)?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+fn send(tls: &mut StreamOwned<ServerConnection, TcpStream>, packet: &Packet)
+        -> io::Result<()> {
+    let mut out = BytesMut::new();
+    packet.write(&mut out, MQTT_MAX).map_err(io::Error::other)?;
+    tls.write_all(&out)?;
+    tls.flush()
+}
+
+/// What a `recording_server` connection does once its handshake ends. A
+/// handshake that failed always ends as `Drain`, whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterHandshake {
+    /// read until the client closes, recording every record it sent
+    Drain,
+    /// read that many plaintext bytes, keep them, then close both
+    /// directions, so a client waiting for a reply fails at once rather
+    /// than at its IO timeout
+    ReadThenClose(usize),
+}
+
+/// One connection of a `recording_server`, as the server saw it.
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    /// the TLS records the client wrote, named by `describe_records`
+    pub records: Vec<String>,
+    /// the plaintext read under `AfterHandshake::ReadThenClose`, empty
+    /// otherwise or if the read failed
+    pub plaintext: Vec<u8>,
+}
+
+impl Recorded {
+    /// Records of content type 23 (application_data): what the client sent
+    /// above the handshake. Counting raw bytes on the socket would not do,
+    /// since a handshake and an alert are bytes too.
+    ///
+    /// Only meaningful while TLS 1.2 is negotiated, where every record
+    /// carries its type in the clear. Under TLS 1.3 the outer type of every
+    /// record after the ClientHello is 23 and this counts nearly all of
+    /// them (design doc 5.3).
+    pub fn application_data(&self) -> usize {
+        self.records.iter().filter(|r| r.starts_with("ApplicationData"))
+            .count()
+    }
+}
+
+/// A TLS server on 127.0.0.1 that records, per connection, the TLS records
+/// the client wrote and any plaintext it read. It speaks no protocol above
+/// TLS, unlike `ftp_server`: it is for the camera, whose own first bytes
+/// after the handshake carry the access code (design doc 5.3).
+pub struct RecordingServer {
+    pub port: u16,
+    seen: Arc<Mutex<Vec<Recorded>>>,
+}
+
+impl RecordingServer {
+    /// One entry per connection, in the order the connections ended.
+    pub fn connections(&self) -> Vec<Recorded> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+pub fn recording_server(config: Arc<ServerConfig>, after: AfterHandshake)
+                        -> RecordingServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(tcp) = stream else { continue };
+            let (config, sink) = (config.clone(), sink.clone());
+            std::thread::spawn(move || {
+                record_connection(tcp, config, after, &sink).ok();
+            });
+        }
+    });
+    RecordingServer { port, seen }
+}
+
+fn record_connection(tcp: TcpStream, config: Arc<ServerConfig>,
+                     after: AfterHandshake, sink: &Mutex<Vec<Recorded>>)
+                     -> io::Result<()> {
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let conn = ServerConnection::new(config).map_err(io::Error::other)?;
+    let mut tls = StreamOwned::new(conn, Tap { sock: tcp, seen: Vec::new() });
+    let handshake = complete_handshake(&mut tls.conn, &mut tls.sock);
+    let mut plaintext = Vec::new();
+    match after {
+        AfterHandshake::ReadThenClose(n) if handshake.is_ok() => {
+            plaintext = vec![0u8; n];
+            if tls.read_exact(&mut plaintext).is_err() {
+                plaintext.clear();
+            }
+            tls.sock.sock.shutdown(Shutdown::Both).ok();
+        }
+        // a refused handshake ends here too: keep reading, so the client's
+        // alert and anything it sends after it are recorded as well
+        _ => {
+            tls.sock.read_to_end(&mut Vec::new()).ok();
+        }
+    }
+    sink.lock().unwrap_or_else(PoisonError::into_inner).push(Recorded {
+        records: describe_records(&tls.sock.seen),
+        plaintext,
+    });
+    Ok(())
+}
+
+/// A TLS server on 127.0.0.1 that waits `delay` before it touches the
+/// handshake at all, then completes it and sends one byte, then holds the
+/// socket. The client's handshake blocks for `delay` in one piece, which a
+/// per-byte trickle cannot express: `trickle_server` paces every byte, so
+/// no single wait is long. The app's TCP probe is let go.
+pub fn slow_handshake_server(config: Arc<ServerConfig>, delay: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(tcp) = stream else { continue };
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let mut first = [0u8; 1];
+                if tcp.peek(&mut first).unwrap_or(0) == 0 {
+                    return;
+                }
+                std::thread::sleep(delay);
+                let Ok(conn) = ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = StreamOwned::new(conn, tcp);
+                while tls.conn.is_handshaking() {
+                    if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        return;
+                    }
+                }
+                tls.write_all(b"x").ok();
+                tls.flush().ok();
+                std::thread::sleep(HOLD);
             });
         }
     });

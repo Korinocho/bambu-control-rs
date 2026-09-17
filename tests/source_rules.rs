@@ -99,21 +99,69 @@ fn main_takes_the_single_instance_mutex() {
     }
 }
 
-/// T24 (the CI grep, locally): no certificate checks disabled in FTPS code,
-/// the vendored suppaftp included.
+/// The `port` parameter of `Session::open` exists so the tests can reach an
+/// in-process broker. That makes it the one argument no test can check: to
+/// reach a broker a test must pass a different port by construction, so the
+/// parity test asserts the timing, the credentials and the client id, and
+/// structurally cannot assert this. It is asserted from the source instead.
+///
+/// Without this, the port parameter is the single way production could talk
+/// to the wrong port with every test still green.
+#[test]
+fn production_mqtt_sites_pass_the_port_constant() {
+    let text = std::fs::read_to_string(root().join("src").join("mqtt.rs"))
+        .expect("utf-8 source");
+    // the test module has call sites of its own, and those are supposed to
+    // pass a broker's port; only the callers above it are production
+    let production = text.split("\nmod tests {").next().unwrap_or(&text);
+    // every call that names a port must name the constant: Session::open in
+    // PrinterClient::run and in the probe, and the public probe delegating
+    // to its port-taking form
+    for (at, _) in production.match_indices("Session::open(") {
+        let call = &production[at..(at + 240).min(production.len())];
+        assert!(call.contains("MQTT_PORT") || call.contains(", port,"),
+                "a Session::open call site passes neither MQTT_PORT nor a \
+                 port threaded from one:\n{call}");
+    }
+    // the entry point must hand its inner form BOTH the anchor built from
+    // the configured serial and the real port: those are the two arguments
+    // the parity test cannot check, because it must pass others to run
+    assert!(production.contains(
+                "subscribe_gcode_state_at(&tls, ip, MQTT_PORT, serial,"),
+            "the public probe must pass PrinterTls::new(serial)'s anchor and \
+             MQTT_PORT to its inner form");
+    assert!(production.contains("let tls = match PrinterTls::new(serial)"),
+            "the public probe must build its anchor from the configured \
+             serial, not take one");
+    // prose may name the port; code may not. A literal at a call site is
+    // the failure this counts, and a doc comment is not one.
+    let literals = production.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| line.contains("8883"))
+        .count();
+    assert_eq!(literals, 1,
+               "8883 belongs only in the MQTT_PORT constant, found \
+                {literals} outside comments");
+}
+
+/// T24 (the CI grep, locally): no certificate checks disabled anywhere.
+///
+/// Every path to a printer verifies now -- FTPS on 990, the camera on 6000
+/// (issue #2) and MQTT on 8883 (issue #1) -- so this scans all of `src`
+/// plus the vendored suppaftp, exactly as `.github/workflows/ci.yml` does.
+///
+/// The two lists must stay equal. A local mirror that has drifted is worse
+/// than no mirror at all: it passes for a file CI would fail on, so whoever
+/// adds a danger flag there is told "green" locally and cannot see why the
+/// build broke.
 #[test]
 fn ftps_code_never_disables_certificate_checks() {
     let src = root().join("src");
-    let mut files = vec![src.join("tls.rs"), src.join("files.rs")];
-    rust_files(&src.join("tls"), &mut files);
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
     files.extend(vendored_files());
-    for later in ["ftp.rs", "browser.rs"] {
-        if src.join(later).exists() {
-            files.push(src.join(later));
-        }
-    }
     let found = hits(&files, &["danger_accept_invalid_certs",
                                "danger_accept_invalid_hostnames"]);
-    assert!(found.is_empty(), "danger flags in FTPS code:\n{}",
+    assert!(found.is_empty(), "certificate checks disabled:\n{}",
             found.join("\n"));
 }

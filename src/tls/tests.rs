@@ -1053,6 +1053,105 @@ fn trickling_peer_is_bounded_by_the_handshake_limit() {
     }
 }
 
+/// 5.2, condition 1 and the one that matters: the caller's command budget
+/// governs data, never the handshake. A 50 ms UI budget must not be able to
+/// kill a handshake that legitimately takes 300 ms, which would be the
+/// io_timeout defect again with more steps.
+///
+/// It has to be a data connection: a control connection completes its
+/// handshake inside `connect_stream`, before any caller holds the stream, so
+/// a budget can only ever meet a deferred handshake.
+#[test]
+fn a_command_budget_never_shortens_the_handshake() {
+    use std::io::Read as _;
+    let io_timeout = Duration::from_secs(2);
+    let tls = test_tls(TEST_CA, TEST_SERIAL);
+    let port = slow_handshake_server(
+        ticket_server(&[LEAF_V1, TEST_CA], LEAF_KEY),
+        Duration::from_millis(300));
+    let (conns, connector) = session_connector(&tls, io_timeout);
+    let _control = connector.connect_stream("127.0.0.1", tcp(port))
+        .expect("genuine leaf accepted");
+    let mut data = connector.connect_stream("127.0.0.1", tcp(port))
+        .expect("a data connection opens before its handshake");
+    data.set_command_budget(Some(Duration::from_millis(50)));
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 1];
+    let read = data.read(&mut buf);
+    let elapsed = started.elapsed();
+    assert!(read.is_ok(),
+            "a 50 ms command budget killed a 300 ms handshake: {read:?}");
+    assert!(elapsed >= Duration::from_millis(300),
+            "the handshake did not actually wait: {elapsed:?}");
+    assert_eq!(conns.failure_since(0), None);
+}
+
+/// 5.2, condition 2, tightening: a budget under the construction timeout is
+/// what bounds the read.
+#[test]
+fn a_shorter_command_budget_is_honoured() {
+    use std::io::Read as _;
+    let io_timeout = Duration::from_secs(5);
+    let tls = test_tls(TEST_CA, TEST_SERIAL);
+    let port = holding_server(ticket_server(&[LEAF_V1, TEST_CA], LEAF_KEY),
+                              Duration::from_secs(30));
+    let (_conns, connector) = session_connector(&tls, io_timeout);
+    let mut stream = connector.connect_stream("127.0.0.1", tcp(port))
+        .expect("genuine leaf accepted");
+    stream.set_command_budget(Some(Duration::from_millis(200)));
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 1];
+    assert!(stream.read(&mut buf).is_err(), "the peer sent nothing");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(200)
+                && elapsed < Duration::from_secs(1),
+            "bounded by the budget, not the 5 s timeout: {elapsed:?}");
+}
+
+/// 5.2, condition 2, the other direction: a budget over the construction
+/// timeout changes nothing, because `io_timeout` is a ceiling. Without that,
+/// one distracted caller could hold a lane open indefinitely.
+#[test]
+fn a_longer_command_budget_is_still_capped_by_construction() {
+    use std::io::Read as _;
+    let io_timeout = Duration::from_millis(500);
+    let tls = test_tls(TEST_CA, TEST_SERIAL);
+    let port = holding_server(ticket_server(&[LEAF_V1, TEST_CA], LEAF_KEY),
+                              Duration::from_secs(30));
+    let (_conns, connector) = session_connector(&tls, io_timeout);
+    let mut stream = connector.connect_stream("127.0.0.1", tcp(port))
+        .expect("genuine leaf accepted");
+    stream.set_command_budget(Some(Duration::from_secs(30)));
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 1];
+    assert!(stream.read(&mut buf).is_err(), "the peer sent nothing");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= io_timeout && elapsed < Duration::from_secs(2),
+            "the 30 s ask did not lengthen the 500 ms ceiling: {elapsed:?}");
+}
+
+/// 5.2, condition 3: with no budget the effective limit is exactly the
+/// construction timeout. The FTP tests passing is necessary and not
+/// sufficient -- they would pass whether or not the default path changed, so
+/// "the default is preserved" is asserted here rather than declared.
+#[test]
+fn without_a_command_budget_the_limit_is_the_construction_timeout() {
+    use std::io::Read as _;
+    let io_timeout = Duration::from_millis(600);
+    let tls = test_tls(TEST_CA, TEST_SERIAL);
+    let port = holding_server(ticket_server(&[LEAF_V1, TEST_CA], LEAF_KEY),
+                              Duration::from_secs(30));
+    let (_conns, connector) = session_connector(&tls, io_timeout);
+    let mut stream = connector.connect_stream("127.0.0.1", tcp(port))
+        .expect("genuine leaf accepted");
+    let started = std::time::Instant::now();
+    let mut buf = [0u8; 1];
+    assert!(stream.read(&mut buf).is_err(), "the peer sent nothing");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= io_timeout && elapsed < io_timeout * 3,
+            "the default is the construction timeout: {elapsed:?}");
+}
+
 /// Stage 1b mutation review: a write to a peer that never reads fails within
 /// the IO timeout once the socket buffers are full, and the drop after it
 /// writes for at most CLOSE_LIMIT. This bound is what keeps the close safe.
