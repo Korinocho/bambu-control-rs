@@ -405,7 +405,14 @@ pub enum DataMode {
     /// a failed handshake keeps both connections open without a reply, like
     /// an interceptor that never lets go
     HoldAfterFailure,
+    /// handshake, then the body in 64 KB pieces with a pause between them,
+    /// then close_notify and 226: a transfer long enough to be cancelled
+    /// while it runs, without needing a real slow printer (design doc 5.4)
+    Slow,
 }
+
+/// The pause `DataMode::Slow` leaves between two pieces of the body.
+pub const SLOW_PIECE: Duration = Duration::from_millis(60);
 
 /// What the in-process FTPS server does with the data connection of a data
 /// command it answers with 550.
@@ -823,6 +830,17 @@ fn send_data(tcp: TcpStream, config: Arc<ServerConfig>, body: &[u8],
             tls.sock.shutdown(Shutdown::Both).ok();
             std::thread::sleep(Duration::from_millis(300));
             Ok(())
+        }
+        DataMode::Slow => {
+            // a client that cancels closes its end, so write_all fails and
+            // the control connection answers 426, exactly as a printer does
+            for piece in body.chunks(64 * 1024) {
+                tls.write_all(piece)?;
+                tls.flush()?;
+                std::thread::sleep(SLOW_PIECE);
+            }
+            tls.conn.send_close_notify();
+            tls.flush()
         }
         _ => {
             tls.write_all(body)?;

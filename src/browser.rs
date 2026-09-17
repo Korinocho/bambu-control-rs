@@ -21,17 +21,23 @@
     reason = "the files view (stage 2, part 2) is the first caller"))]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
+use crate::cache::{self, Cache, CacheKey, Kind};
 use crate::config::PrinterCfg;
 use crate::files::{self, JobBundle};
 use crate::ftp::{BROWSE_IDLE_QUIT, BUNDLE_RETR_MAX, FtpEndpoint, FtpError,
-                 FtpSession, Handshakes, RemoteEntry, ServerProfile};
+                 FtpSession, Handshakes, RemoteEntry, SMALL_RETR_MAX,
+                 ServerProfile};
+use crate::gcode::{self, HEADER_READ_MAX};
+use crate::threemf::{self, ThreeMfInfo};
 use crate::tls::{Refusal, SessionConns};
 
 /// A tile is prefetched only once it has been visible this long (section 4).
@@ -46,9 +52,67 @@ const REPAINT: Duration = Duration::from_millis(100);
 /// Longest a replacement worker waits for the worker it replaces to end
 /// before it opens its own session (section 4, rule 3).
 const PREDECESSOR_WAIT: Duration = Duration::from_secs(30);
+/// The browse lane only takes work of this size or less; anything larger
+/// goes to the transfer lane, which can be cancelled without killing the
+/// browse session (5.4).
+pub const LANE_MAX: u64 = SMALL_RETR_MAX;
+/// The ETA's rate before a transfer has measured one (5.4).
+pub const DEFAULT_RATE_BPS: f64 = 200_000.0;
+/// The sliced plate's picture is downscaled to this on the lane thread: the
+/// detail pane is 268 px wide, and this leaves room for a HiDPI screen.
+const PLATE_PX: u32 = 512;
+/// How far back the rolling rate looks. Long enough to ride out one slow
+/// chunk, short enough to follow a printer whose Wi-Fi changes.
+const RATE_WINDOW: Duration = Duration::from_secs(5);
+/// Why a transfer is waiting (5.10), while the printer prints.
+const QUEUED_PRINTING: &str =
+    "waiting: printer is printing, one download at a time";
+/// Why a transfer is waiting the rest of the time (section 4, rule 2).
+const QUEUED_ONE_AT_A_TIME: &str = "waiting: one download at a time";
 
-/// What the UI asks the worker to do. `Download`, `Details` and
-/// `GcodeHeader` arrive with the transfer lane (5.4).
+/// Where a download goes (design doc 5.6). `Details` and `GcodeHeader`
+/// arrive with the detail pane of stage 3, part 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dest {
+    /// the disk cache; `open_after` means the player opens it when it lands
+    Cache { open_after: bool },
+    /// `Downloads\Bambu Control\<printer>`, never evicted
+    SaveToPc,
+}
+
+/// What the detail pane shows about a 3mf: everything `threemf::inspect`
+/// read, plus the sliced plate's picture (design doc 5.7).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ThreeMf {
+    pub info: ThreeMfInfo,
+    /// `Metadata/plate_N.png` of the sliced plate, already decoded
+    pub plate: Option<Picture>,
+}
+
+/// A picture decoded on a lane thread, which the UI thread only uploads
+/// (5.1, rule 5). `egui::ColorImage` has no `Debug`, and a megabyte of
+/// pixels would be no use in one, so this names its size instead.
+#[derive(Clone, PartialEq)]
+pub struct Picture(pub egui::ColorImage);
+
+impl std::fmt::Debug for Picture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [width, height] = self.0.size;
+        write!(f, "picture {width}x{height}")
+    }
+}
+
+/// A finished transfer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transferred {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub dest: Dest,
+    /// a complete copy was already in the cache, so nothing was downloaded
+    pub from_cache: bool,
+}
+
+/// What the UI asks the worker to do.
 #[derive(Clone, Debug)]
 pub enum Cmd {
     /// List one directory; `generation` is the listing generation of the view
@@ -67,6 +131,18 @@ pub enum Cmd {
     SetBackground(bool),
     /// The user pressed Retry on the error or refusal card
     Retry,
+    /// A user-started download, on the transfer lane (section 4, rule 2).
+    /// `id` is the UI's, and `Cancel` and every event carry it back.
+    Download { id: u64, remote: RemoteEntry, dest: Dest },
+    /// Cancels one transfer, running or queued (5.4)
+    Cancel(u64),
+    /// The detail pane's 3mf inspection (5.7). A file of `LANE_MAX` or less
+    /// is read on the browse session; a larger one is a user-started
+    /// download and moves to the transfer lane (5.4).
+    Details { remote: RemoteEntry, plate_hint: Option<u32> },
+    /// "Read header (~2 s)" (5.7): `retr_head` on a browse session of its
+    /// own, because the early close kills the control connection.
+    GcodeHeader { remote: RemoteEntry },
     Stop,
 }
 
@@ -80,6 +156,16 @@ pub enum Event {
     Thumb { path: String, generation: u64,
             result: Result<egui::ColorImage, FtpError> },
     JobBundle { job: String, result: Result<JobBundle, FtpError> },
+    /// the transfer is waiting its turn, with the reason of 5.10
+    Queued { id: u64, reason: String },
+    /// real bytes off the socket, never an estimate, at most one every
+    /// 100 ms (5.4)
+    Progress { id: u64, done: u64, total: u64, bytes_per_s: f64 },
+    Done { id: u64, result: Result<Transferred, FtpError> },
+    /// what a 3mf says about itself, for the detail pane (5.7)
+    Details { path: String, result: Result<ThreeMf, FtpError> },
+    /// the `HEADER_BLOCK` of a plain `.gcode` file (5.7)
+    GcodeHeader { path: String, result: Result<gcode::Header, FtpError> },
 }
 
 /// Neither a decoded picture nor a job bundle is worth printing, so the
@@ -105,6 +191,23 @@ impl std::fmt::Debug for Event {
                 "JobBundle {{ job: {job:?}, result: {} }}",
                 ok_or(result.as_ref()
                     .map(|bundle| bundle.error.as_str()))),
+            Self::Queued { id, reason } =>
+                write!(f, "Queued {{ id: {id}, reason: {reason:?} }}"),
+            Self::Progress { id, done, total, .. } =>
+                write!(f, "Progress {{ id: {id}, done: {done}, \
+                           total: {total} }}"),
+            Self::Done { id, result } => write!(f,
+                "Done {{ id: {id}, result: {} }}",
+                match result {
+                    Ok(done) => format!("{} B", done.bytes),
+                    Err(err) => format!("{err:?}"),
+                }),
+            Self::Details { path, result } => write!(f,
+                "Details {{ path: {path:?}, result: {} }}",
+                ok_or(result.as_ref().map(|_| "3mf"))),
+            Self::GcodeHeader { path, result } => write!(f,
+                "GcodeHeader {{ path: {path:?}, result: {} }}",
+                ok_or(result.as_ref().map(|_| "header"))),
         }
     }
 }
@@ -143,10 +246,15 @@ impl ConnState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
     pub conn: ConnState,
-    /// sessions open right now: never more than one in this stage
+    /// sessions open right now, over both lanes: never more than two
+    /// (section 4, rule 3)
     pub open_sessions: usize,
     /// the most this worker ever had open at once (section 4, rule 3)
     pub max_open_sessions: usize,
+    /// a transfer is running now
+    pub transferring: bool,
+    /// transfers waiting their turn
+    pub queued_transfers: usize,
     pub sessions_opened: usize,
     pub idle_quits: usize,
     /// handshake kinds of every connection this worker made (5.3)
@@ -186,17 +294,276 @@ struct JobState {
     running: bool,
 }
 
-/// State the UI thread and the lane thread share.
+/// What the transfer lane is asked to do. It is internal, because the
+/// browse lane hands it the running job's 3mf too when that file is over
+/// the browse lane's cap (5.4).
+enum Job {
+    /// a user-started download
+    Download { id: u64, remote: RemoteEntry, dest: Dest },
+    /// the running job's 3mf, too big for the browse lane. It counts as
+    /// that printer's one download while it runs (section 4).
+    Bundle { job: String, path: String, size: u64, plate: Option<u32> },
+    /// a 3mf the detail pane asked for that is over the browse lane's cap:
+    /// downloaded into the cache, then inspected from there (5.4, 5.7)
+    Details { remote: RemoteEntry, plate_hint: Option<u32> },
+    Cancel(u64),
+    Stop,
+}
+
+/// The transfer queue as the UI thread sees it.
+#[derive(Default)]
+struct TransferState {
+    /// the transfer running now
+    running: Option<u64>,
+    /// the running transfer's cancel flag, checked between chunks (5.2)
+    cancel: Option<Arc<AtomicBool>>,
+    /// ids cancelled before their turn came
+    cancelled: HashSet<u64>,
+    queued: usize,
+}
+
+/// Forgets cancelled ids once nothing is queued or running. Every transfer
+/// is counted in `queued` before its job is sent, so an empty queue means
+/// no id can still be waiting for its turn; without this the set keeps
+/// every id ever cancelled after its transfer had already finished, for the
+/// life of the worker.
+fn prune_cancelled(state: &mut TransferState) {
+    if state.running.is_none() && state.queued == 0 {
+        state.cancelled.clear();
+    }
+}
+
+/// The rolling transfer rate the ETA is built from (5.4). Until a transfer
+/// has measured one it is the documented default.
+struct Rate {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl Rate {
+    fn new() -> Self {
+        Self { samples: VecDeque::new() }
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    /// Records the running byte count and returns the rate over the window.
+    fn sample(&mut self, done: u64) -> f64 {
+        let now = Instant::now();
+        self.samples.push_back((now, done));
+        while self.samples.front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > RATE_WINDOW)
+            && self.samples.len() > 2
+        {
+            self.samples.pop_front();
+        }
+        self.bytes_per_s()
+    }
+
+    fn bytes_per_s(&self) -> f64 {
+        let (Some((first_at, first)), Some((last_at, last))) =
+            (self.samples.front(), self.samples.back())
+        else { return DEFAULT_RATE_BPS };
+        let seconds = last_at.duration_since(*first_at).as_secs_f64();
+        let bytes = last.saturating_sub(*first) as f64;
+        match seconds > 0.05 && bytes > 0.0 {
+            true => bytes / seconds,
+            // too little to measure yet: the documented default, so the
+            // first ETA is a number and not a division by zero
+            false => DEFAULT_RATE_BPS,
+        }
+    }
+}
+
+/// What the lane thread needs to run transfers, until it is started.
+struct TransferStart {
+    rx: Receiver<Job>,
+    endpoint: FtpEndpoint,
+    timing: Timing,
+    predecessor: Option<Arc<AtomicUsize>>,
+}
+
+/// State the UI thread and the lane threads share.
 struct Shared {
     status: Mutex<Status>,
     stop: AtomicBool,
-    /// the open session's records: cancelling them ends it from any thread
+    /// the browse session's records: cancelling them ends it from any
+    /// thread
     conns: Mutex<Option<Arc<SessionConns>>>,
+    /// the transfer session's records, cancelled on its own (5.4)
+    transfer_conns: Mutex<Option<Arc<SessionConns>>>,
     job: Mutex<JobState>,
-    /// set when the lane thread has ended, however it ended
-    ended: Arc<AtomicBool>,
+    transfers: Mutex<TransferState>,
+    rate: Mutex<Rate>,
+    /// Lane threads running now, shared with the worker that replaces this
+    /// one: it may open no session while any of them lives (section 4,
+    /// rule 3). `has_ended()` is this counter and not a flag beside it —
+    /// a separate latch could be set by a lane that was ending while
+    /// another was starting, which would open the gate with a session still
+    /// held.
+    lanes_live: Arc<AtomicUsize>,
+    /// which lane holds a session right now, so `open_sessions` is the sum
+    /// over both and never one lane's view of the other
+    browse_open: AtomicBool,
+    transfer_open: AtomicBool,
+    /// the disk cache and this printer's hashed key (5.6)
+    cache: Arc<Cache>,
+    printer_key: String,
+    /// for `Downloads\Bambu Control\<printer>`; sanitised before use
+    printer_name: String,
+    /// where "Save to PC" writes. None is the user's Downloads folder,
+    /// which is the app's behaviour; the tests give a directory of their
+    /// own so no test ever writes into it.
+    save_root: Option<PathBuf>,
+    /// the transfer lane's queue, filled by the UI and by the browse lane
+    transfer_tx: Sender<Job>,
+    transfer_start: Mutex<Option<TransferStart>>,
+    /// handshake counts per lane; the status shows their sum, so neither
+    /// lane can overwrite the other's (5.3)
+    browse_handshakes: Mutex<Handshakes>,
+    transfer_handshakes: Mutex<Handshakes>,
     /// H2C / P2S / X2D: no thread, no connection (5.3, Models)
     refused_by_name: bool,
+}
+
+impl Shared {
+    /// Recomputes the session counts from both lanes (section 4, rule 3).
+    fn note_sessions(&self) {
+        let open = usize::from(self.browse_open.load(Ordering::SeqCst))
+            + usize::from(self.transfer_open.load(Ordering::SeqCst));
+        let mut status = lock(&self.status);
+        status.open_sessions = open;
+        status.max_open_sessions = status.max_open_sessions.max(open);
+    }
+
+    /// Mirrors the transfer queue into the status the UI reads.
+    fn note_transfers(&self) {
+        let (running, queued) = {
+            let state = lock(&self.transfers);
+            (state.running.is_some(), state.queued)
+        };
+        let mut status = lock(&self.status);
+        status.transferring = running;
+        status.queued_transfers = queued;
+    }
+
+    /// Sums both lanes' handshakes into the status (5.3).
+    fn note_handshakes(&self) {
+        let mut total = *lock(&self.browse_handshakes);
+        total.add(*lock(&self.transfer_handshakes));
+        lock(&self.status).handshakes = total;
+    }
+
+    fn printing(&self) -> bool {
+        lock(&self.status).printing
+    }
+}
+
+/// The id the running job's bundle runs under when it is too big for the
+/// browse lane. It is out of the range the UI hands out, so a `Cancel` from
+/// the UI can never name it.
+const BUNDLE_TRANSFER_ID: u64 = u64::MAX;
+
+/// The id a "Load preview" runs under when its 3mf is too big for the
+/// browse lane. Like the bundle's, it is outside the range the UI hands
+/// out, so a `Cancel` from the view can never name it.
+const DETAILS_TRANSFER_ID: u64 = u64::MAX - 1;
+
+/// The detail pane's answers are cached by key (5.7): a 3mf's facts and a
+/// G-code header as JSON under `meta`, the plate picture under `thumb`. The
+/// key covers path, size and time, so a file that changed on the card is a
+/// different key and a stale answer is never served (5.6).
+fn meta_of<T: serde::de::DeserializeOwned>(cache: &Cache, key_of: &str,
+                                           key: CacheKey) -> Option<T> {
+    let path = cache.get(key_of, Kind::Meta, key, "json")?;
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn put_meta<T: serde::Serialize>(cache: &Cache, key_of: &str, key: CacheKey,
+                                 value: &T) {
+    if cache.prepare(key_of, Kind::Meta).is_err() {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        std::fs::write(cache.path(key_of, Kind::Meta, key, "json"), bytes)
+            .ok();
+    }
+}
+
+/// A cached 3mf inspection, picture included. The stored PNG is decoded
+/// here, on the lane thread, like a fresh one (5.1, rule 5).
+fn cached_details(cache: &Cache, key_of: &str, key: CacheKey)
+                  -> Option<ThreeMf> {
+    let info: ThreeMfInfo = meta_of(cache, key_of, key)?;
+    let plate = cache.get(key_of, Kind::Thumb, key, "png")
+        .and_then(|path| std::fs::read(path).ok())
+        .as_deref()
+        .and_then(decode_plate);
+    Some(ThreeMf { info, plate })
+}
+
+fn store_details(cache: &Cache, key_of: &str, key: CacheKey,
+                 read: &Inspected) {
+    put_meta(cache, key_of, key, &read.three.info);
+    if let Some(png) = &read.png
+        && cache.prepare(key_of, Kind::Thumb).is_ok()
+    {
+        std::fs::write(cache.path(key_of, Kind::Thumb, key, "png"), png).ok();
+    }
+}
+
+/// What a lane read from a 3mf: the answer for the UI, and the plate's PNG
+/// bytes, which are what the cache keeps (a later session decodes those).
+struct Inspected {
+    three: ThreeMf,
+    png: Option<Vec<u8>>,
+}
+
+/// `threemf::inspect` on bytes that came off the card, bounded like the
+/// bundle is: a corrupt archive may not decide how much memory this process
+/// takes (5.1, rule 6).
+fn inspect_bytes(bytes: &[u8], plate_hint: Option<u32>)
+                 -> Result<Inspected, FtpError> {
+    let size = bytes.len() as u64;
+    if size > BUNDLE_RETR_MAX {
+        return Err(FtpError::TooLarge { size, max: BUNDLE_RETR_MAX });
+    }
+    let (mut info, png) = threemf::inspect(bytes)
+        .map_err(|e| FtpError::Local(e.to_string()))?;
+    // the file usually names its own plate; the job's number is the
+    // fallback 5.7 asks for
+    if info.plate.is_none() {
+        info.plate = plate_hint;
+    }
+    let plate = png.as_deref().and_then(decode_plate);
+    Ok(Inspected { three: ThreeMf { info, plate }, png })
+}
+
+/// The plate picture, decoded and downscaled on the lane thread (5.1,
+/// rule 5). These bytes come off the card, so it goes through the same
+/// limits as a thumbnail, and a picture that does not decode is simply not
+/// shown — the facts next to it are still worth having.
+fn decode_plate(png: &[u8]) -> Option<Picture> {
+    decode_thumb(png, PLATE_PX).ok().map(Picture)
+}
+
+/// The extension a downloaded copy keeps, so the player and the OS see a
+/// real file type. It comes off the card, so it is sanitised (5.6). The
+/// files view needs it too, to name the copy a finished download left in
+/// the cache.
+pub fn extension_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, ext)| cache::sanitize_component(&ext.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+/// `<path>.part`, the name a download writes under until its byte count
+/// matches SIZE (5.6).
+fn part_of(path: &Path) -> PathBuf {
+    let mut part = path.to_path_buf().into_os_string();
+    part.push(".part");
+    PathBuf::from(part)
 }
 
 /// One printer's FTPS worker. The lane thread starts on the first command
@@ -218,52 +585,69 @@ struct Start {
     timing: Timing,
     /// the worker this one replaces: its session is fully dropped before
     /// this one opens its own (section 4, rule 3)
-    predecessor: Option<Arc<AtomicBool>>,
+    predecessor: Option<Arc<AtomicUsize>>,
 }
 
 impl FtpWorker {
     /// A worker for `cfg`. Nothing is connected until a command arrives.
-    pub fn start(cfg: &PrinterCfg, ctx: &egui::Context) -> Self {
-        Self::build(FtpEndpoint::new(cfg), Timing::default(), ctx, None)
+    pub fn start(cfg: &PrinterCfg, ctx: &egui::Context, cache: Arc<Cache>)
+                 -> Self {
+        Self::build(FtpEndpoint::new(cfg), Timing::default(), ctx, None,
+                    cache, &cfg.name, None)
     }
 
     /// The worker that replaces `previous` after a connection edit: it
-    /// opens no session until the old lane thread has ended.
+    /// opens no session until the old lane threads have ended.
     pub fn start_replacing(cfg: &PrinterCfg, ctx: &egui::Context,
-                           previous: &FtpWorker) -> Self {
+                           previous: &FtpWorker, cache: Arc<Cache>) -> Self {
         previous.stop();
         Self::build(FtpEndpoint::new(cfg), Timing::default(), ctx,
-                    Some(previous.shared.ended.clone()))
+                    Some(previous.shared.lanes_live.clone()), cache,
+                    &cfg.name, None)
+    }
+
+    /// The tests' "Save to PC" folder, under the test cache, so no test
+    /// writes into the user's real Downloads folder.
+    #[cfg(test)]
+    fn test_save_root(cache: &Cache) -> Option<PathBuf> {
+        Some(cache.root().join("save-to-pc"))
     }
 
     #[cfg(test)]
     pub fn for_test(endpoint: FtpEndpoint, timing: Timing,
-                    ctx: &egui::Context) -> Self {
-        Self::build(endpoint, timing, ctx, None)
+                    ctx: &egui::Context, cache: Arc<Cache>) -> Self {
+        let save = Self::test_save_root(&cache);
+        Self::build(endpoint, timing, ctx, None, cache, "printer", save)
     }
 
     #[cfg(test)]
     pub fn for_test_replacing(endpoint: FtpEndpoint, timing: Timing,
-                              ctx: &egui::Context, previous: &FtpWorker)
-                              -> Self {
+                              ctx: &egui::Context, previous: &FtpWorker,
+                              cache: Arc<Cache>) -> Self {
         previous.stop();
+        let save = Self::test_save_root(&cache);
         Self::build(endpoint, timing, ctx,
-                    Some(previous.shared.ended.clone()))
+                    Some(previous.shared.lanes_live.clone()), cache,
+                    "printer", save)
     }
 
-    /// A worker whose predecessor's lane ends when `ended` says so: the
-    /// tests drive that flag instead of racing a real lane to its end.
+    /// A worker whose predecessor's lanes end when `live` says so: the
+    /// tests drive that counter instead of racing a real lane to its end.
     #[cfg(test)]
     pub fn for_test_after(endpoint: FtpEndpoint, timing: Timing,
-                          ctx: &egui::Context, ended: Arc<AtomicBool>)
-                          -> Self {
-        Self::build(endpoint, timing, ctx, Some(ended))
+                          ctx: &egui::Context, live: Arc<AtomicUsize>,
+                          cache: Arc<Cache>) -> Self {
+        let save = Self::test_save_root(&cache);
+        Self::build(endpoint, timing, ctx, Some(live), cache, "printer",
+                    save)
     }
 
     fn build(endpoint: FtpEndpoint, timing: Timing, ctx: &egui::Context,
-             predecessor: Option<Arc<AtomicBool>>) -> Self {
+             predecessor: Option<Arc<AtomicUsize>>, cache: Arc<Cache>,
+             name: &str, save_root: Option<PathBuf>) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (events_tx, events) = crossbeam_channel::unbounded();
+        let (transfer_tx, transfer_rx) = crossbeam_channel::unbounded();
         let refused_by_name = endpoint.refused_by_name();
         let conn = match refused_by_name {
             true => ConnState::Stopped(FtpError::RefusedByName),
@@ -273,9 +657,28 @@ impl FtpWorker {
             status: Mutex::new(Status { conn, ..Status::default() }),
             stop: AtomicBool::new(false),
             conns: Mutex::new(None),
+            transfer_conns: Mutex::new(None),
             job: Mutex::new(JobState::default()),
+            transfers: Mutex::new(TransferState::default()),
+            rate: Mutex::new(Rate::new()),
             // no thread yet, so a replacement never waits for one
-            ended: Arc::new(AtomicBool::new(true)),
+            lanes_live: Arc::new(AtomicUsize::new(0)),
+            browse_open: AtomicBool::new(false),
+            transfer_open: AtomicBool::new(false),
+            // the serial never reaches the file system (5.6)
+            printer_key: Cache::printer_key(endpoint.serial()),
+            cache,
+            printer_name: name.to_string(),
+            save_root,
+            transfer_tx,
+            transfer_start: Mutex::new(Some(TransferStart {
+                rx: transfer_rx,
+                endpoint: endpoint.clone(),
+                timing,
+                predecessor: predecessor.clone(),
+            })),
+            browse_handshakes: Mutex::new(Handshakes::default()),
+            transfer_handshakes: Mutex::new(Handshakes::default()),
             refused_by_name,
         });
         Self {
@@ -301,6 +704,23 @@ impl FtpWorker {
         if matches!(cmd, Cmd::Stop) {
             return self.stop();
         }
+        // the transfer lane's printing gate reads this, and it must not
+        // depend on the browse lane's thread having been started
+        if let Cmd::SetPrinting(printing) = cmd {
+            lock(&self.shared.status).printing = printing;
+        }
+        // the transfer lane has its own queue and its own session
+        match cmd {
+            Cmd::Download { id, remote, dest } =>
+                return self.queue_download(id, remote, dest),
+            Cmd::Cancel(id) => return self.cancel(id),
+            // a 3mf over the browse lane's cap cannot be cancelled without
+            // killing the browse session, so it is a user-started download
+            // and runs on the transfer lane (5.4)
+            Cmd::Details { remote, plate_hint } if remote.size > LANE_MAX =>
+                return self.queue_details(remote, plate_hint),
+            _ => {}
+        }
         if let Cmd::JobBundle { job, .. } = &cmd {
             // a new job cancels the running fetch, as JobFetcher did; its
             // session is dropped and the next one reconnects
@@ -314,7 +734,8 @@ impl FtpWorker {
             state.request = Some((job.clone(), 0));
         }
         let needs_lane = matches!(cmd, Cmd::List { .. } | Cmd::Thumb { .. }
-            | Cmd::JobBundle { .. } | Cmd::Retry);
+            | Cmd::JobBundle { .. } | Cmd::Retry | Cmd::Details { .. }
+            | Cmd::GcodeHeader { .. });
         let _ = self.tx.send(cmd);
         if needs_lane {
             self.start_lane();
@@ -332,10 +753,92 @@ impl FtpWorker {
                 result: Err(FtpError::RefusedByName) },
             Cmd::JobBundle { job, .. } => Event::JobBundle {
                 job, result: Err(FtpError::RefusedByName) },
+            Cmd::Download { id, .. } => Event::Done {
+                id, result: Err(FtpError::RefusedByName) },
+            Cmd::Details { remote, .. } => Event::Details {
+                path: remote.path, result: Err(FtpError::RefusedByName) },
+            Cmd::GcodeHeader { remote } => Event::GcodeHeader {
+                path: remote.path, result: Err(FtpError::RefusedByName) },
             _ => return,
         };
         let _ = self.events_tx.send(event);
         self.ctx.request_repaint_after(REPAINT);
+    }
+
+    /// Queues a user-started download on the transfer lane (section 4,
+    /// rule 2). It is counted before the lane sees it, so the UI can ask
+    /// how many transfers are active the moment it returns.
+    fn queue_download(&self, id: u64, remote: RemoteEntry, dest: Dest) {
+        let waiting = {
+            let mut state = lock(&self.shared.transfers);
+            state.cancelled.remove(&id);
+            // one transfer at a time, FIFO (section 4, rule 2)
+            let busy = state.running.is_some() || state.queued > 0;
+            state.queued += 1;
+            busy
+        };
+        self.shared.note_transfers();
+        let _ = self.shared.transfer_tx
+            .send(Job::Download { id, remote, dest });
+        if waiting {
+            // said now, not when its turn comes, so the tile can show why
+            // it is waiting straight away (5.10)
+            let reason = match self.shared.printing() {
+                true => QUEUED_PRINTING,
+                false => QUEUED_ONE_AT_A_TIME,
+            };
+            let _ = self.events_tx
+                .send(Event::Queued { id, reason: reason.to_string() });
+        }
+        start_transfer_lane(&self.shared, &self.ctx, &self.events_tx);
+        self.ctx.request_repaint_after(REPAINT);
+    }
+
+    /// A "Load preview" whose 3mf is over the browse lane's cap: it is a
+    /// user-started download, so it runs on the transfer lane and counts as
+    /// that printer's one download while it does (section 4, 5.4).
+    fn queue_details(&self, remote: RemoteEntry, plate_hint: Option<u32>) {
+        lock(&self.shared.transfers).queued += 1;
+        self.shared.note_transfers();
+        let _ = self.shared.transfer_tx
+            .send(Job::Details { remote, plate_hint });
+        start_transfer_lane(&self.shared, &self.ctx, &self.events_tx);
+        self.ctx.request_repaint_after(REPAINT);
+    }
+
+    /// Cancels one transfer, running or queued (5.4). The running one has
+    /// its flag set and its session cancelled, so a waiting read fails
+    /// within 100 ms; the lane then deletes the `.part`, discards the
+    /// session and reports `Done(Err(Cancelled))`. It never joins.
+    pub fn cancel(&self, id: u64) {
+        let running = {
+            let mut state = lock(&self.shared.transfers);
+            state.cancelled.insert(id);
+            match state.running == Some(id) {
+                true => state.cancel.clone(),
+                false => None,
+            }
+        };
+        if let Some(flag) = running {
+            flag.store(true, Ordering::SeqCst);
+            if let Some(conns) = lock(&self.shared.transfer_conns).as_ref() {
+                conns.cancel();
+            }
+        }
+        let _ = self.shared.transfer_tx.send(Job::Cancel(id));
+        self.ctx.request_repaint_after(REPAINT);
+    }
+
+    /// Transfers running or waiting, for the chip badge and the close
+    /// confirmation (section 6).
+    pub fn active_transfers(&self) -> usize {
+        let state = lock(&self.shared.transfers);
+        usize::from(state.running.is_some()) + state.queued
+    }
+
+    /// The rolling rate the ETA is built from, in bytes per second (5.4).
+    pub fn rate_bps(&self) -> f64 {
+        lock(&self.shared.rate).bytes_per_s()
     }
 
     fn start_lane(&self) {
@@ -343,7 +846,7 @@ impl FtpWorker {
         if self.shared.stop.load(Ordering::SeqCst) {
             return;
         }
-        self.shared.ended.store(false, Ordering::SeqCst);
+        self.shared.lanes_live.fetch_add(1, Ordering::SeqCst);
         let lane = Lane {
             endpoint: start.endpoint,
             shared: self.shared.clone(),
@@ -359,7 +862,8 @@ impl FtpWorker {
             background: false,
             stopped: None,
         };
-        let ended = Ended(self.shared.clone(), self.ctx.clone());
+        let ended = Ended { shared: self.shared.clone(),
+                            ctx: self.ctx.clone(), lane: LaneKind::Browse };
         std::thread::spawn(move || {
             let _ended = ended;
             lane.run();
@@ -383,19 +887,60 @@ impl FtpWorker {
     pub fn stop(&self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         self.cancel_session();
+        if let Some(flag) = lock(&self.shared.transfers).cancel.as_ref() {
+            flag.store(true, Ordering::SeqCst);
+        }
         let _ = self.tx.send(Cmd::Stop);
+        let _ = self.shared.transfer_tx.send(Job::Stop);
     }
 
+    /// Cancels both lanes' sessions: every waiting read and write fails
+    /// within 100 ms and the threads end on their own (5.1, rule 7).
     fn cancel_session(&self) {
-        if let Some(conns) = lock(&self.shared.conns).as_ref() {
-            conns.cancel();
+        for slot in [&self.shared.conns, &self.shared.transfer_conns] {
+            if let Some(conns) = lock(slot).as_ref() {
+                conns.cancel();
+            }
         }
     }
 
-    /// The lane thread has ended (or was never started).
+    /// Every lane thread has ended (or none was started). It is read off
+    /// the live-lane counter, so it can never say "ended" while a lane
+    /// still holds a session (section 4, rule 3).
     pub fn has_ended(&self) -> bool {
-        self.shared.ended.load(Ordering::SeqCst)
+        self.shared.lanes_live.load(Ordering::SeqCst) == 0
     }
+}
+
+/// Starts the transfer lane's thread if it is not running. Both the UI
+/// (a download) and the browse lane (a job bundle over its cap) reach it.
+fn start_transfer_lane(shared: &Arc<Shared>, ctx: &egui::Context,
+                       events: &Sender<Event>) {
+    let Some(start) = lock(&shared.transfer_start).take() else { return };
+    if shared.stop.load(Ordering::SeqCst) {
+        return;
+    }
+    shared.lanes_live.fetch_add(1, Ordering::SeqCst);
+    let lane = TransferLane {
+        endpoint: start.endpoint,
+        shared: shared.clone(),
+        events: events.clone(),
+        ctx: ctx.clone(),
+        timing: start.timing,
+        rx: start.rx,
+        predecessor: start.predecessor,
+        session: None,
+        queue: VecDeque::new(),
+        closed_handshakes: Handshakes::default(),
+        profile: None,
+        current_cancel: None,
+    };
+    let ended = Ended { shared: shared.clone(), ctx: ctx.clone(),
+                        lane: LaneKind::Transfer };
+    std::thread::spawn(move || {
+        let _ended = ended;
+        lane.run();
+    });
 }
 
 impl Drop for FtpWorker {
@@ -404,20 +949,42 @@ impl Drop for FtpWorker {
     }
 }
 
-/// Marks the worker ended when the lane thread ends, a panic included.
-struct Ended(Arc<Shared>, egui::Context);
+/// Which lane a thread is, for the counts it owns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaneKind {
+    Browse,
+    Transfer,
+}
+
+/// Marks a lane ended when its thread ends, a panic included. The worker
+/// counts as ended once every lane has, which is what section 4 rule 3's
+/// replacement waits for.
+struct Ended {
+    shared: Arc<Shared>,
+    ctx: egui::Context,
+    lane: LaneKind,
+}
 
 impl Drop for Ended {
     fn drop(&mut self) {
-        {
-            let mut status = lock(&self.0.status);
-            status.open_sessions = 0;
-            if !matches!(status.conn, ConnState::Stopped(_)) {
-                status.conn = ConnState::Closed;
+        match self.lane {
+            LaneKind::Browse => {
+                self.shared.browse_open.store(false, Ordering::SeqCst);
+                // the status lock is released before note_sessions takes it
+                let mut status = lock(&self.shared.status);
+                if !matches!(status.conn, ConnState::Stopped(_)) {
+                    status.conn = ConnState::Closed;
+                }
             }
+            LaneKind::Transfer =>
+                self.shared.transfer_open.store(false, Ordering::SeqCst),
         }
-        self.0.ended.store(true, Ordering::SeqCst);
-        self.1.request_repaint();
+        self.shared.note_sessions();
+        // nothing else to publish: `has_ended()` is this counter, so a lane
+        // that ends cannot open the replacement's gate while another lane
+        // still holds a session
+        self.shared.lanes_live.fetch_sub(1, Ordering::SeqCst);
+        self.ctx.request_repaint();
     }
 }
 
@@ -443,9 +1010,22 @@ struct JobReq {
     print_type: String,
 }
 
+#[derive(Clone, Debug)]
+struct DetailsReq {
+    remote: RemoteEntry,
+    plate_hint: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct HeaderReq {
+    remote: RemoteEntry,
+}
+
 enum Work {
     List(ListReq),
+    Details(DetailsReq),
     Job(JobReq),
+    Header(HeaderReq),
     Thumb(ThumbReq),
 }
 
@@ -455,7 +1035,11 @@ enum Work {
 #[derive(Default)]
 struct Queue {
     lists: VecDeque<ListReq>,
+    /// the detail pane of the user's selection, ahead of the job bundle
+    details: VecDeque<DetailsReq>,
     job: Option<JobReq>,
+    /// "Read header (~2 s)", behind the bundle (5.4)
+    headers: VecDeque<HeaderReq>,
     thumbs: Vec<ThumbReq>,
     generation: u64,
 }
@@ -498,6 +1082,26 @@ impl Queue {
         self.job.replace(req)
     }
 
+    /// Queues a 3mf inspection; the same file asked for twice is one item.
+    fn push_details(&mut self, req: DetailsReq) {
+        if self.details.iter()
+            .any(|queued| queued.remote.path == req.remote.path)
+        {
+            return;
+        }
+        self.details.push_back(req);
+    }
+
+    /// Queues a header read; the same file asked for twice is one item.
+    fn push_header(&mut self, req: HeaderReq) {
+        if self.headers.iter()
+            .any(|queued| queued.remote.path == req.remote.path)
+        {
+            return;
+        }
+        self.headers.push_back(req);
+    }
+
     /// Drops every queued prefetch, for a background printer or a job that
     /// is starting (section 4, rule 5).
     fn take_thumbs(&mut self) -> Vec<ThumbReq> {
@@ -517,12 +1121,20 @@ impl Queue {
         stale
     }
 
+    /// The priority of 5.4: List, then the user's selection, then the job
+    /// bundle, then a header read, and prefetches last.
     fn next(&mut self) -> Option<Work> {
         if let Some(list) = self.lists.pop_front() {
             return Some(Work::List(list));
         }
+        if let Some(details) = self.details.pop_front() {
+            return Some(Work::Details(details));
+        }
         if let Some(job) = self.job.take() {
             return Some(Work::Job(job));
+        }
+        if let Some(header) = self.headers.pop_front() {
+            return Some(Work::Header(header));
         }
         // LIFO: the newest visible tile first
         (!self.thumbs.is_empty())
@@ -554,7 +1166,7 @@ struct Lane {
     ctx: egui::Context,
     timing: Timing,
     rx: Receiver<Cmd>,
-    predecessor: Option<Arc<AtomicBool>>,
+    predecessor: Option<Arc<AtomicUsize>>,
     session: Option<Session>,
     queue: Queue,
     /// handshakes of the sessions that are already closed
@@ -609,9 +1221,9 @@ impl Lane {
     /// politeness — `open_session` is the rule itself, and it refuses while
     /// the old lane lives, however long that takes.
     fn wait_for_predecessor(&mut self) {
-        let Some(ended) = &self.predecessor else { return };
+        let Some(live) = &self.predecessor else { return };
         let started = Instant::now();
-        while !ended.load(Ordering::SeqCst) && !self.stopping()
+        while live.load(Ordering::SeqCst) > 0 && !self.stopping()
             && started.elapsed() < self.timing.predecessor_wait
         {
             std::thread::sleep(Duration::from_millis(20));
@@ -623,7 +1235,7 @@ impl Lane {
     /// again afterwards.
     fn forget_ended_predecessor(&mut self) {
         if self.predecessor.as_ref()
-            .is_some_and(|ended| ended.load(Ordering::SeqCst))
+            .is_some_and(|live| live.load(Ordering::SeqCst) == 0)
         {
             self.predecessor = None;
         }
@@ -652,6 +1264,12 @@ impl Lane {
                         job: old.job, result: Err(FtpError::Cancelled) });
                 }
             }
+            // a 3mf of 1 MB or less; a bigger one went to the transfer lane
+            // before it ever reached this queue (5.4)
+            Cmd::Details { remote, plate_hint } =>
+                self.queue.push_details(DetailsReq { remote, plate_hint }),
+            Cmd::GcodeHeader { remote } =>
+                self.queue.push_header(HeaderReq { remote }),
             Cmd::SetPrinting(printing) =>
                 self.set_status(|status| status.printing = printing),
             Cmd::JobStarting => {
@@ -674,6 +1292,9 @@ impl Lane {
                 self.stopped = None;
                 self.set_conn(ConnState::Closed);
             }
+            // routed to the transfer lane by `FtpWorker::send`, so they
+            // never reach the browse lane's queue (section 4, rule 2)
+            Cmd::Download { .. } | Cmd::Cancel(_) => {}
             Cmd::Stop => self.shared.stop.store(true, Ordering::SeqCst),
         }
     }
@@ -709,26 +1330,112 @@ impl Lane {
                 self.emit(Event::Thumb { path: req.remote.path,
                                          generation: req.generation, result });
             }
+            Work::Details(req) => {
+                let path = req.remote.path.clone();
+                let result = self.details(&req);
+                self.emit(Event::Details { path, result });
+            }
+            Work::Header(req) => {
+                let path = req.remote.path.clone();
+                let result = self.read_header(&req);
+                self.emit(Event::GcodeHeader { path, result });
+            }
             Work::Job(req) => {
                 lock(&self.shared.job).running = true;
                 let result = self.fetch_job(&req);
-                let mut state = lock(&self.shared.job);
-                state.running = false;
-                if state.request.as_ref()
-                    .is_some_and(|(job, _)| *job == req.job)
-                {
-                    state.request = None;
+                // a bundle handed to the transfer lane is still running:
+                // that lane reports it and clears the request
+                let handed = matches!(result, Ok(None));
+                if !handed {
+                    let mut state = lock(&self.shared.job);
+                    state.running = false;
+                    if state.request.as_ref()
+                        .is_some_and(|(job, _)| *job == req.job)
+                    {
+                        state.request = None;
+                    }
                 }
-                drop(state);
-                self.emit(Event::JobBundle { job: req.job, result });
+                match result {
+                    Ok(None) => {}
+                    Ok(Some(bundle)) => self.emit(Event::JobBundle {
+                        job: req.job, result: Ok(bundle) }),
+                    Err(err) => self.emit(Event::JobBundle {
+                        job: req.job, result: Err(err) }),
+                }
             }
         }
     }
 
-    /// The job's 3mf over the browse session, then the same reader
-    /// `JobFetch` used. Interim (5.4): it runs on the browse session
-    /// whatever the size of the 3mf, until the transfer lane lands.
-    fn fetch_job(&mut self, req: &JobReq) -> Result<JobBundle, FtpError> {
+    /// What a 3mf says about itself, for the detail pane (5.7). Only files
+    /// of `LANE_MAX` or less reach this: a bigger one is a download.
+    fn details(&mut self, req: &DetailsReq) -> Result<ThreeMf, FtpError> {
+        let key_of = self.shared.printer_key.clone();
+        let key = Cache::key(&key_of, &req.remote, None);
+        if let Some(hit) = cached_details(&self.shared.cache, &key_of, key) {
+            return Ok(hit);
+        }
+        let (path, size) = (req.remote.path.clone(), req.remote.size);
+        let bytes = self.with_session(|ftp| ftp.retr_small(&path, size))?;
+        let read = inspect_bytes(&bytes, req.plate_hint)?;
+        store_details(&self.shared.cache, &key_of, key, &read);
+        Ok(read.three)
+    }
+
+    /// The "Read header (~2 s)" of 5.7. `retr_head` drops the data stream
+    /// early, which kills the control connection (3.1), so it consumes its
+    /// session: this opens one of its own and the next command reconnects.
+    fn read_header(&mut self, req: &HeaderReq)
+                   -> Result<gcode::Header, FtpError> {
+        let key_of = self.shared.printer_key.clone();
+        let key = Cache::key(&key_of, &req.remote, None);
+        if let Some(hit) = meta_of::<gcode::Header>(&self.shared.cache,
+                                                    &key_of, key)
+        {
+            return Ok(hit);
+        }
+        if let Some(stopped) = &self.stopped {
+            return Err(stopped.clone());
+        }
+        if self.stopping() {
+            return Err(FtpError::Cancelled);
+        }
+        // the session in hand is left cleanly rather than killed by the
+        // early close below
+        self.close_session(Close::Idle);
+        self.open_session()?;
+        let Some(session) = self.session.take() else {
+            return Err(FtpError::Local("no browse session".into()));
+        };
+        // the call consumes the session, so its records are kept here and
+        // counted after it (5.3: every connection records its own outcome)
+        let conns = session.ftp.conns();
+        let head = session.ftp.retr_head(&req.remote.path, HEADER_READ_MAX);
+        self.closed_handshakes.add(Handshakes::of(&conns));
+        self.shared.browse_open.store(false, Ordering::SeqCst);
+        *lock(&self.shared.browse_handshakes) = self.closed_handshakes;
+        self.shared.note_sessions();
+        self.shared.note_handshakes();
+        if self.stopped.is_none() {
+            self.set_conn(ConnState::Closed);
+        }
+        let head = match head {
+            Ok(head) => head,
+            Err(err) => {
+                self.after_failure(&err);
+                return Err(err);
+            }
+        };
+        let header = gcode::parse_header(&head);
+        put_meta(&self.shared.cache, &key_of, key, &header);
+        Ok(header)
+    }
+
+    /// The job's 3mf, then the same reader `JobFetch` used. A file of
+    /// 1 MB or less is read on the browse session; a larger one moves to
+    /// the transfer lane and counts as that printer's one download
+    /// (section 4, 5.4), which is `Ok(None)` here.
+    fn fetch_job(&mut self, req: &JobReq)
+                 -> Result<Option<JobBundle>, FtpError> {
         let (job, file_name, print_type) = (req.job.clone(),
                                             req.file_name.clone(),
                                             req.print_type.clone());
@@ -768,6 +1475,11 @@ impl Lane {
                 Ok(size) if size > BUNDLE_RETR_MAX =>
                     return Err(FtpError::TooLarge { size,
                                                     max: BUNDLE_RETR_MAX }),
+                // over the browse lane's cap: an unbounded read here could
+                // not be cancelled without killing the browse session, so
+                // the transfer lane takes it (5.4)
+                Ok(size) if size > LANE_MAX =>
+                    return Ok(Some(Found::Big { path: target, size })),
                 Ok(size) => Some(size),
                 Err(FtpError::NotFound) => None,
                 Err(failure) => return Err(failure),
@@ -784,18 +1496,28 @@ impl Lane {
                 }
             })?;
             set_job_progress(&shared, &job, 100);
-            Ok(Some(data))
+            Ok(Some(Found::Data(data)))
         })?;
-        let Some(data) = data else {
-            return Ok(JobBundle {
+        let plate = files::job_plate(&req.job, &req.file_name);
+        match data {
+            None => Ok(Some(JobBundle {
                 label_objects: true,
                 error: format!("no 3mf matching '{}' on SD", req.job),
                 ..Default::default()
-            });
-        };
-        Ok(files::read_3mf(data, files::job_plate(&req.job, &req.file_name))
-            .unwrap_or_else(|e| JobBundle { error: e.to_string(),
-                                            ..Default::default() }))
+            })),
+            Some(Found::Big { path, size }) => {
+                lock(&self.shared.transfers).queued += 1;
+                self.shared.note_transfers();
+                let _ = self.shared.transfer_tx.send(Job::Bundle {
+                    job: req.job.clone(), path, size, plate });
+                start_transfer_lane(&self.shared, &self.ctx, &self.events);
+                Ok(None)
+            }
+            Some(Found::Data(data)) =>
+                Ok(Some(threemf::read_3mf(data, plate)
+                    .unwrap_or_else(|e| JobBundle { error: e.to_string(),
+                                                    ..Default::default() }))),
+        }
     }
 
     /// Runs one command on the browse session, opening it if needed. A
@@ -848,12 +1570,10 @@ impl Lane {
             let idle = session.idle_since;
             self.set_conn(ConnState::Open { idle_since: Some(idle) });
         }
-        let closed = self.closed_handshakes;
-        self.set_status(move |status| {
-            let mut counts = closed;
-            counts.add(handshakes);
-            status.handshakes = counts;
-        });
+        let mut counts = self.closed_handshakes;
+        counts.add(handshakes);
+        *lock(&self.shared.browse_handshakes) = counts;
+        self.shared.note_handshakes();
         result
     }
 
@@ -876,13 +1596,12 @@ impl Lane {
                 self.profile = Some(profile);
                 let idle_since = Instant::now();
                 self.session = Some(Session { ftp, idle_since });
+                self.shared.browse_open.store(true, Ordering::SeqCst);
                 self.set_status(move |status| {
                     status.profile = Some(profile);
                     status.sessions_opened += 1;
-                    status.open_sessions = 1;
-                    status.max_open_sessions =
-                        status.max_open_sessions.max(1);
                 });
+                self.shared.note_sessions();
                 self.set_conn(ConnState::Open {
                     idle_since: Some(idle_since) });
                 Ok(())
@@ -926,13 +1645,15 @@ impl Lane {
             session.ftp.quit();
         }
         // a cancelled or failed session is dropped without a byte
+        self.shared.browse_open.store(false, Ordering::SeqCst);
+        *lock(&self.shared.browse_handshakes) = closed;
         self.set_status(move |status| {
-            status.open_sessions = 0;
-            status.handshakes = closed;
             if why == Close::Idle {
                 status.idle_quits += 1;
             }
         });
+        self.shared.note_sessions();
+        self.shared.note_handshakes();
         if self.stopped.is_none() {
             self.set_conn(ConnState::Closed);
         }
@@ -965,6 +1686,692 @@ impl Lane {
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
         self.ctx.request_repaint_after(REPAINT);
+    }
+}
+
+/// What the browse lane found for a job bundle.
+enum Found {
+    Data(Vec<u8>),
+    /// over the browse lane's cap: the transfer lane takes it (5.4)
+    Big { path: String, size: u64 },
+}
+
+// ----------------------------------------------------- the transfer lane
+
+/// A local file step that failed. A full volume is named as such (5.10),
+/// with the figures left for `disk_full_figures` to fill in.
+fn local_io(err: &std::io::Error) -> FtpError {
+    match err.kind() {
+        std::io::ErrorKind::StorageFull =>
+            FtpError::DiskFull { need: 0, free: 0 },
+        kind => FtpError::Local(format!("could not write the file ({kind})")),
+    }
+}
+
+/// The two numbers 5.10 asks for on a disk-full that happened *during* a
+/// transfer. Neither the socket read nor the file write knows which volume
+/// it is on, so both report zeroes; here the transfer's own SIZE and a
+/// fresh probe of the destination replace them, because "not enough disk
+/// space: needs 0 B, 0 B free" is exactly the card a user cannot act on.
+/// The probe runs while the `.part` is still there, so the free figure is
+/// the one that failed, and a probe that itself fails leaves 0 — which is
+/// what a volume that just refused a write has to spare anyway.
+fn disk_full_figures(err: FtpError, part: &Path, size: u64) -> FtpError {
+    match err {
+        FtpError::DiskFull { need: 0, free: 0 } => {
+            let dir = part.parent().unwrap_or(Path::new("."));
+            FtpError::DiskFull { need: cache::space_needed(size),
+                                 free: cache::free_bytes(dir).unwrap_or(0) }
+        }
+        other => other,
+    }
+}
+
+/// The second session of section 4, rule 2: opened only for a user-started
+/// download, or for a job bundle the browse lane cannot take. Transfers run
+/// one at a time, FIFO, and the session is closed as soon as the queue
+/// empties. Prefetches never reach this lane.
+struct TransferLane {
+    endpoint: FtpEndpoint,
+    shared: Arc<Shared>,
+    events: Sender<Event>,
+    ctx: egui::Context,
+    timing: Timing,
+    rx: Receiver<Job>,
+    predecessor: Option<Arc<AtomicUsize>>,
+    session: Option<FtpSession>,
+    queue: VecDeque<Job>,
+    closed_handshakes: Handshakes,
+    profile: Option<ServerProfile>,
+    /// the running transfer's cancel flag, so the session path sees a
+    /// cancel that landed between two steps and not only `retr_to` (5.4)
+    current_cancel: Option<Arc<AtomicBool>>,
+}
+
+impl TransferLane {
+    fn run(mut self) {
+        self.wait_for_predecessor();
+        while !self.stopping() {
+            while let Ok(job) = self.rx.try_recv() {
+                self.take(job);
+            }
+            if self.stopping() {
+                break;
+            }
+            match self.queue.pop_front() {
+                Some(job) => self.run_job(job),
+                None => {
+                    // nothing left to transfer: the session closes at once,
+                    // so the printer is back to one session (section 4)
+                    self.close_session();
+                    match self.rx.recv_timeout(Duration::from_secs(3600)) {
+                        Ok(job) => self.take(job),
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+        }
+        self.close_session();
+        self.abandon_queue();
+    }
+
+    fn stopping(&self) -> bool {
+        self.shared.stop.load(Ordering::SeqCst)
+    }
+
+    /// The transfer running now has been cancelled. It is checked before a
+    /// session is opened and around every command, not only between the
+    /// chunks of `retr_to`: a cancel that lands while the lane is opening
+    /// its session would otherwise pay for a whole handshake (~0.9 s on the
+    /// P1S) and a SIZE round trip for a transfer nobody wants (5.4).
+    fn cancelled(&self) -> bool {
+        self.current_cancel.as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    fn take(&mut self, job: Job) {
+        match job {
+            Job::Stop => self.shared.stop.store(true, Ordering::SeqCst),
+            Job::Cancel(id) => {
+                // the running transfer is cancelled through its flag by
+                // FtpWorker::cancel; one still queued simply never starts
+                if let Some(at) = self.queue.iter()
+                    .position(|queued| job_id(queued) == Some(id))
+                {
+                    self.queue.remove(at);
+                    self.drop_queued(id);
+                }
+            }
+            job => self.queue.push_back(job),
+        }
+    }
+
+    fn run_job(&mut self, job: Job) {
+        match job {
+            Job::Download { id, remote, dest } =>
+                self.run_download(id, remote, dest),
+            Job::Bundle { job, path, size, plate } =>
+                self.run_bundle(job, path, size, plate),
+            Job::Details { remote, plate_hint } =>
+                self.run_details(remote, plate_hint),
+            Job::Cancel(_) | Job::Stop => {}
+        }
+    }
+
+    /// A "Load preview" whose 3mf was too big for the browse lane: it is
+    /// downloaded into the cache and read back from there (5.4, 5.7).
+    fn run_details(&mut self, remote: RemoteEntry, plate_hint: Option<u32>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = lock(&self.shared.transfers);
+            state.queued = state.queued.saturating_sub(1);
+            state.running = Some(DETAILS_TRANSFER_ID);
+            state.cancel = Some(cancel.clone());
+        }
+        self.shared.note_transfers();
+        lock(&self.shared.rate).clear();
+        self.current_cancel = Some(cancel.clone());
+        let result = self.details(&remote, plate_hint, &cancel);
+        {
+            let mut state = lock(&self.shared.transfers);
+            state.running = None;
+            state.cancel = None;
+            prune_cancelled(&mut state);
+        }
+        self.current_cancel = None;
+        self.shared.note_transfers();
+        if result.is_err() {
+            self.close_session();
+        }
+        self.emit(Event::Details { path: remote.path, result });
+    }
+
+    fn details(&mut self, remote: &RemoteEntry, plate_hint: Option<u32>,
+               cancel: &Arc<AtomicBool>) -> Result<ThreeMf, FtpError> {
+        let key_of = self.shared.printer_key.clone();
+        let key = Cache::key(&key_of, remote, None);
+        if let Some(hit) = cached_details(&self.shared.cache, &key_of, key) {
+            return Ok(hit);
+        }
+        let ext = extension_of(&remote.name);
+        let file = match self.shared.cache.get(&key_of, Kind::File, key, &ext)
+        {
+            Some(hit) => hit,
+            None => {
+                let path = remote.path.clone();
+                let size = self.with_session(|ftp| ftp.size(&path))?;
+                if size > BUNDLE_RETR_MAX {
+                    return Err(FtpError::TooLarge { size,
+                                                    max: BUNDLE_RETR_MAX });
+                }
+                let (final_path, part) = self.destination(
+                    remote, Dest::Cache { open_after: false }, key, &ext,
+                    size)?;
+                let mut progress = |_done: u64| {};
+                self.transfer_file(remote, size, &final_path, &part, cancel,
+                                   &mut progress)?;
+                final_path
+            }
+        };
+        let bytes = std::fs::read(&file).map_err(|e| local_io(&e))?;
+        let read = inspect_bytes(&bytes, plate_hint)?;
+        store_details(&self.shared.cache, &key_of, key, &read);
+        Ok(read.three)
+    }
+
+    /// One user-started download, start to finish.
+    fn run_download(&mut self, id: u64, remote: RemoteEntry, dest: Dest) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancelled_before_it_started = {
+            let mut state = lock(&self.shared.transfers);
+            state.queued = state.queued.saturating_sub(1);
+            match state.cancelled.remove(&id) {
+                true => true,
+                false => {
+                    state.running = Some(id);
+                    state.cancel = Some(cancel.clone());
+                    false
+                }
+            }
+        };
+        self.shared.note_transfers();
+        if cancelled_before_it_started {
+            return self.emit(Event::Done {
+                id, result: Err(FtpError::Cancelled) });
+        }
+        lock(&self.shared.rate).clear();
+        self.current_cancel = Some(cancel.clone());
+        let result = self.download(id, &remote, dest, &cancel);
+        {
+            let mut state = lock(&self.shared.transfers);
+            state.running = None;
+            state.cancel = None;
+            state.cancelled.remove(&id);
+            prune_cancelled(&mut state);
+        }
+        self.current_cancel = None;
+        self.shared.note_transfers();
+        if result.is_err() {
+            // a cancelled or failed transfer never reuses its session: the
+            // early close killed the control connection (3.1, 5.4)
+            self.close_session();
+        }
+        self.emit(Event::Done { id, result });
+    }
+
+    fn download(&mut self, id: u64, remote: &RemoteEntry, dest: Dest,
+                cancel: &Arc<AtomicBool>) -> Result<Transferred, FtpError> {
+        let printer_key = self.shared.printer_key.clone();
+        let key = Cache::key(&printer_key, remote, None);
+        let ext = extension_of(&remote.name);
+        // a cancel that landed before this transfer opened anything is
+        // answered before a session is spent on it (5.4)
+        if cancel.load(Ordering::SeqCst) {
+            return Err(FtpError::Cancelled);
+        }
+        // a complete, key-matching copy is never downloaded again (5.6)
+        if let Some(hit) =
+            self.shared.cache.get(&printer_key, Kind::File, key, &ext)
+        {
+            let bytes = std::fs::metadata(&hit)
+                .map(|meta| meta.len()).unwrap_or(remote.size);
+            return match dest {
+                Dest::Cache { .. } =>
+                    Ok(Transferred { path: hit, bytes, dest,
+                                     from_cache: true }),
+                Dest::SaveToPc =>
+                    self.copy_from_cache(remote, &hit, bytes, key, &ext),
+            };
+        }
+        // SIZE first: it is what the byte count is checked against and what
+        // the free-space rule needs (5.2, 5.6)
+        let path = remote.path.clone();
+        let size = self.with_session(|ftp| ftp.size(&path))?;
+        let (final_path, part) =
+            self.destination(remote, dest, key, &ext, size)?;
+
+        let events = self.events.clone();
+        let shared = self.shared.clone();
+        let ctx = self.ctx.clone();
+        let mut last = Instant::now();
+        let mut progress = move |done: u64| {
+            let bytes_per_s = lock(&shared.rate).sample(done);
+            // repaints are throttled, never one per chunk (5.4)
+            if last.elapsed() >= REPAINT {
+                last = Instant::now();
+                let _ = events.send(Event::Progress {
+                    id, done, total: size, bytes_per_s });
+                ctx.request_repaint_after(REPAINT);
+            }
+        };
+        let bytes = self.transfer_file(remote, size, &final_path, &part,
+                                       cancel, &mut progress)?;
+        self.emit(Event::Progress { id, done: bytes, total: size,
+                                    bytes_per_s: self.rate() });
+        Ok(Transferred { path: final_path, bytes, dest, from_cache: false })
+    }
+
+    /// "Save to PC" served from a copy already in the cache (5.6). It is
+    /// still a write into the user's Downloads folder, so it goes through
+    /// the same discipline as a download: the free-space rule first, then
+    /// `<dest>.part`, renamed only once the byte count matched. A plain
+    /// `fs::copy` onto the final name creates and truncates it, so a full
+    /// volume or an I/O error half way would leave a short file sitting
+    /// under the real name, which both the user and `Cache::get` read as a
+    /// whole one.
+    fn copy_from_cache(&self, remote: &RemoteEntry, hit: &Path, bytes: u64,
+                       key: cache::CacheKey, ext: &str)
+                       -> Result<Transferred, FtpError> {
+        let dest = Dest::SaveToPc;
+        let (target, part) = self.destination(remote, dest, key, ext, bytes)?;
+        let copied = std::fs::copy(hit, &part)
+            .map_err(|e| disk_full_figures(local_io(&e), &part, bytes));
+        let done = match copied {
+            // the source is the cached file, so its own length is what the
+            // copy has to match; a short one is as worthless as a short
+            // download and is never given the real name
+            Ok(copied) if copied == bytes =>
+                self.shared.cache.commit(&part, &target)
+                    .map_err(|e| disk_full_figures(local_io(&e), &part,
+                                                   bytes)),
+            Ok(copied) =>
+                Err(FtpError::Truncated { got: copied, want: bytes }),
+            Err(failure) => Err(failure),
+        };
+        match done {
+            Ok(()) => Ok(Transferred { path: target, bytes, dest,
+                                       from_cache: true }),
+            Err(failure) => {
+                std::fs::remove_file(&part).ok();
+                Err(failure)
+            }
+        }
+    }
+
+    /// The running job's 3mf, when it is too big for the browse lane. It
+    /// counts as that printer's one download while it runs (section 4).
+    fn run_bundle(&mut self, job: String, path: String, size: u64,
+                  plate: Option<u32>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = lock(&self.shared.transfers);
+            state.queued = state.queued.saturating_sub(1);
+            state.running = Some(BUNDLE_TRANSFER_ID);
+            state.cancel = Some(cancel.clone());
+        }
+        self.shared.note_transfers();
+        lock(&self.shared.rate).clear();
+        self.current_cancel = Some(cancel.clone());
+        let result = self.bundle(&job, &path, size, plate, &cancel);
+        {
+            let mut state = lock(&self.shared.transfers);
+            state.running = None;
+            state.cancel = None;
+            prune_cancelled(&mut state);
+        }
+        self.current_cancel = None;
+        self.shared.note_transfers();
+        {
+            let mut state = lock(&self.shared.job);
+            state.running = false;
+            if state.request.as_ref()
+                .is_some_and(|(name, _)| *name == job)
+            {
+                state.request = None;
+            }
+        }
+        if result.is_err() {
+            self.close_session();
+        }
+        self.emit(Event::JobBundle { job, result });
+    }
+
+    fn bundle(&mut self, job: &str, path: &str, size: u64,
+              plate: Option<u32>, cancel: &Arc<AtomicBool>)
+              -> Result<JobBundle, FtpError> {
+        let remote = RemoteEntry {
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            size,
+            is_dir: false,
+            mtime: None,
+            unreadable: false,
+        };
+        let printer_key = self.shared.printer_key.clone();
+        let key = Cache::key(&printer_key, &remote, None);
+        let ext = extension_of(&remote.name);
+        let file = match self.shared.cache
+            .get(&printer_key, Kind::File, key, &ext)
+        {
+            Some(hit) => hit,
+            None => {
+                let (final_path, part) = self.destination(
+                    &remote, Dest::Cache { open_after: false }, key, &ext,
+                    size)?;
+                let shared = self.shared.clone();
+                let ctx = self.ctx.clone();
+                let name = job.to_string();
+                let mut last = Instant::now();
+                let mut progress = move |done: u64| {
+                    lock(&shared.rate).sample(done);
+                    if let Some(pct) = (done * 100).checked_div(size) {
+                        set_job_progress(&shared, &name, pct.min(99) as u8);
+                    }
+                    if last.elapsed() >= REPAINT {
+                        last = Instant::now();
+                        ctx.request_repaint_after(REPAINT);
+                    }
+                };
+                self.transfer_file(&remote, size, &final_path, &part, cancel,
+                                   &mut progress)?;
+                final_path
+            }
+        };
+        // the browse lane refused anything over BUNDLE_RETR_MAX by its
+        // SIZE, so this read is already bounded (5.4)
+        let data = std::fs::read(&file).map_err(|e| local_io(&e))?;
+        set_job_progress(&self.shared, job, 100);
+        Ok(threemf::read_3mf(data, plate)
+            .unwrap_or_else(|e| JobBundle { error: e.to_string(),
+                                            ..Default::default() }))
+    }
+
+    /// Streams one file into `part` and renames it onto `final_path` once
+    /// the byte count matched SIZE (5.6). Any failure deletes the `.part`:
+    /// there is no resume, so a partial file is worth nothing.
+    fn transfer_file(&mut self, remote: &RemoteEntry, size: u64,
+                     final_path: &Path, part: &Path,
+                     cancel: &Arc<AtomicBool>,
+                     progress: &mut dyn FnMut(u64))
+                     -> Result<u64, FtpError> {
+        if self.session.is_none() {
+            self.open_session()?;
+        }
+        // eviction and Clear cache must not delete a running download
+        //
+        // Known gap (stage 3 security review, F4, unreproduced): between
+        // the rename below and the player's own mark_open (player.rs), a
+        // second printer's worker calling reserve() -> evict_to() could
+        // delete the file this download just committed, so "Download &
+        // play" would report success and the player then fail to open it.
+        // Marking `final_path` open here does NOT fix it: this function
+        // also serves 3mf previews and JobBundle, which never reach the
+        // player, so nothing would ever mark those closed and they would
+        // survive eviction and Clear cache for the process's life. The fix
+        // belongs in the Dest::Cache{open_after:true} hand-off, which is a
+        // design change the owner has not been asked for yet.
+        self.shared.cache.mark_open(part);
+        let result = self.stream_to_part(remote, size, part, cancel,
+                                         progress);
+        self.shared.cache.mark_closed(part);
+        match result {
+            Ok(bytes) => match self.shared.cache.commit(part, final_path) {
+                Ok(()) => Ok(bytes),
+                Err(e) => {
+                    let failure = disk_full_figures(local_io(&e), part, size);
+                    // nothing is left under a name that promises a whole
+                    // file, and a rename that failed leaves the `.part`
+                    // behind otherwise (5.6)
+                    std::fs::remove_file(part).ok();
+                    Err(failure)
+                }
+            },
+            Err(err) => {
+                // probed before the `.part` goes, or the free space would
+                // already count the bytes this transfer is about to give
+                // back (5.10)
+                let failure = disk_full_figures(err, part, size);
+                std::fs::remove_file(part).ok();
+                Err(failure)
+            }
+        }
+    }
+
+    fn stream_to_part(&mut self, remote: &RemoteEntry, size: u64,
+                      part: &Path, cancel: &Arc<AtomicBool>,
+                      progress: &mut dyn FnMut(u64))
+                      -> Result<u64, FtpError> {
+        let file = std::fs::File::create(part).map_err(|e| local_io(&e))?;
+        let mut writer = BufWriter::new(file);
+        let session = self.session.as_mut()
+            .ok_or_else(|| FtpError::Local("no transfer session".into()))?;
+        let transferred = session.retr_to(&remote.path, size, &mut writer,
+                                          cancel, progress);
+        // the handle is closed before the rename: Windows refuses to move
+        // a file that is still open
+        let flushed = std::io::Write::flush(&mut writer);
+        drop(writer);
+        let bytes = transferred?;
+        flushed.map_err(|e| local_io(&e))?;
+        Ok(bytes)
+    }
+
+    /// Where a transfer writes, with the free-space rule of 5.6 applied
+    /// before a byte is read.
+    fn destination(&self, remote: &RemoteEntry, dest: Dest,
+                   key: cache::CacheKey, ext: &str, size: u64)
+                   -> Result<(PathBuf, PathBuf), FtpError> {
+        let key_of = &self.shared.printer_key;
+        match dest {
+            Dest::Cache { .. } => {
+                self.shared.cache.prepare(key_of, Kind::File)
+                    .map_err(|e| local_io(&e))?;
+                // a cache download evicts first, then the disk is the limit
+                self.shared.cache.reserve(size)?;
+                Ok((self.shared.cache.path(key_of, Kind::File, key, ext),
+                    self.shared.cache.part_path(key_of, Kind::File, key,
+                                                ext)))
+            }
+            Dest::SaveToPc => {
+                let target = self.save_target(remote)?;
+                let dir = target.parent().unwrap_or(Path::new("."));
+                cache::require_space(dir, size)?;
+                let part = part_of(&target);
+                Ok((target, part))
+            }
+        }
+    }
+
+    fn save_target(&self, remote: &RemoteEntry) -> Result<PathBuf, FtpError> {
+        match &self.shared.save_root {
+            Some(root) => cache::save_to_pc_path_in(
+                root, &self.shared.printer_name, &remote.name),
+            None => cache::save_to_pc_path(&self.shared.printer_name,
+                                           &remote.name),
+        }.map_err(|e| local_io(&e))
+    }
+
+    fn rate(&self) -> f64 {
+        lock(&self.shared.rate).bytes_per_s()
+    }
+
+    /// Runs one command on the transfer session, opening it if needed. A
+    /// handshake stall is retried once (section 4, rule 4).
+    fn with_session<R>(&mut self,
+                       mut op: impl FnMut(&mut FtpSession)
+                           -> Result<R, FtpError>)
+                       -> Result<R, FtpError> {
+        let mut stall_retry = true;
+        loop {
+            if self.stopping() || self.cancelled() {
+                return Err(FtpError::Cancelled);
+            }
+            if self.session.is_none() {
+                self.open_session()?;
+            }
+            let session = self.session.as_mut().expect("a session is open");
+            let result = op(session);
+            let handshakes = session.handshakes();
+            let mut counts = self.closed_handshakes;
+            counts.add(handshakes);
+            *lock(&self.shared.transfer_handshakes) = counts;
+            self.shared.note_handshakes();
+            let Err(err) = result else { return result };
+            if self.session.as_ref()
+                .is_some_and(|session| session.is_poisoned())
+            {
+                self.close_session();
+            }
+            // a cancel that raced this command is the answer, whatever the
+            // command itself came back with: nobody is waiting for the
+            // retry of a transfer they stopped
+            if self.cancelled() {
+                return Err(FtpError::Cancelled);
+            }
+            if err == FtpError::HandshakeStall && stall_retry
+                && !self.stopping()
+            {
+                stall_retry = false;
+                self.sleep_interruptible(self.timing.stall_retry);
+                continue;
+            }
+            return Err(err);
+        }
+    }
+
+    fn open_session(&mut self) -> Result<(), FtpError> {
+        self.forget_ended_predecessor();
+        if self.predecessor.is_some() {
+            // the worker this one replaces still holds a session; opening
+            // one now could be this printer's third (section 4, rule 3)
+            return Err(FtpError::Local(
+                "still closing the previous connection".into()));
+        }
+        let conns = SessionConns::new();
+        *lock(&self.shared.transfer_conns) = Some(conns.clone());
+        // `FtpWorker::cancel` sets the flag and then cancels whatever it
+        // finds recorded here, so a cancel that read that slot a moment ago
+        // cancelled records this session does not have. The flag is checked
+        // again now that the new ones are installed, and the records are
+        // cancelled here rather than left for the handshake to finish (5.4).
+        if self.cancelled() || self.stopping() {
+            conns.cancel();
+            return Err(FtpError::Cancelled);
+        }
+        let session = self.endpoint.connect(conns, self.profile)?;
+        let profile = session.profile();
+        self.profile = Some(profile);
+        self.session = Some(session);
+        self.shared.transfer_open.store(true, Ordering::SeqCst);
+        self.set_status(move |status| {
+            status.profile = status.profile.or(Some(profile));
+            status.sessions_opened += 1;
+        });
+        self.shared.note_sessions();
+        Ok(())
+    }
+
+    fn close_session(&mut self) {
+        let Some(session) = self.session.take() else { return };
+        self.closed_handshakes.add(session.handshakes());
+        *lock(&self.shared.transfer_handshakes) = self.closed_handshakes;
+        if !session.is_poisoned() {
+            session.quit();
+        }
+        *lock(&self.shared.transfer_conns) = None;
+        self.shared.transfer_open.store(false, Ordering::SeqCst);
+        self.shared.note_sessions();
+        self.shared.note_handshakes();
+    }
+
+    /// A transfer the user cancelled before its turn came.
+    fn drop_queued(&self, id: u64) {
+        {
+            let mut state = lock(&self.shared.transfers);
+            state.queued = state.queued.saturating_sub(1);
+            state.cancelled.remove(&id);
+            prune_cancelled(&mut state);
+        }
+        self.shared.note_transfers();
+        self.emit(Event::Done { id, result: Err(FtpError::Cancelled) });
+    }
+
+    /// The lane is ending: nothing left in the queue will run, and the UI
+    /// hears about each one rather than waiting for ever.
+    fn abandon_queue(&mut self) {
+        let queue = std::mem::take(&mut self.queue);
+        for job in queue {
+            match job {
+                Job::Download { id, .. } => self.emit(Event::Done {
+                    id, result: Err(FtpError::Cancelled) }),
+                Job::Details { remote, .. } => self.emit(Event::Details {
+                    path: remote.path, result: Err(FtpError::Cancelled) }),
+                _ => {}
+            }
+        }
+        {
+            let mut state = lock(&self.shared.transfers);
+            state.queued = 0;
+            state.running = None;
+            state.cancel = None;
+            state.cancelled.clear();
+        }
+        self.shared.note_transfers();
+    }
+
+    fn wait_for_predecessor(&mut self) {
+        let Some(live) = &self.predecessor else { return };
+        let started = Instant::now();
+        while live.load(Ordering::SeqCst) > 0 && !self.stopping()
+            && started.elapsed() < self.timing.predecessor_wait
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.forget_ended_predecessor();
+    }
+
+    fn forget_ended_predecessor(&mut self) {
+        if self.predecessor.as_ref()
+            .is_some_and(|live| live.load(Ordering::SeqCst) == 0)
+        {
+            self.predecessor = None;
+        }
+    }
+
+    fn sleep_interruptible(&self, total: Duration) {
+        let started = Instant::now();
+        while started.elapsed() < total && !self.stopping() {
+            let left = total.saturating_sub(started.elapsed());
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+        }
+    }
+
+    fn set_status(&self, change: impl FnOnce(&mut Status)) {
+        change(&mut lock(&self.shared.status));
+    }
+
+    fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
+        self.ctx.request_repaint_after(REPAINT);
+    }
+}
+
+/// The transfer id a job reports under, when it has one.
+fn job_id(job: &Job) -> Option<u64> {
+    match job {
+        Job::Download { id, .. } => Some(*id),
+        _ => None,
     }
 }
 
@@ -1085,6 +2492,110 @@ pub enum ThumbState {
     Failed(FtpError),
 }
 
+/// Where one transfer is, as the view shows it (5.4, section 6).
+#[derive(Clone, Debug)]
+pub enum TransferPhase {
+    /// started, nothing reported back yet: the session is opening (~0.9 s)
+    Starting,
+    /// waiting its turn, with the reason of 5.10
+    Queued(String),
+    /// real bytes off the socket, never an estimate (5.4)
+    Running { done: u64, total: u64, bytes_per_s: f64 },
+    Done(Result<Transferred, FtpError>),
+}
+
+/// One transfer the view started: its tile's state, its row in the transfer
+/// bar, and the file it produced once it lands (section 6).
+#[derive(Clone, Debug)]
+pub struct TransferUi {
+    pub id: u64,
+    /// the file being fetched, kept whole so a failed row can be retried
+    /// from the bar without looking it up in a listing that may have been
+    /// taken again since (5.10)
+    pub remote: RemoteEntry,
+    pub dest: Dest,
+    pub phase: TransferPhase,
+    /// when the row was created, for the "connecting 3 s" of section 6
+    pub started: Instant,
+}
+
+impl TransferUi {
+    /// The remote path this row is about.
+    pub fn path(&self) -> &str {
+        &self.remote.path
+    }
+
+    pub fn name(&self) -> &str {
+        &self.remote.name
+    }
+
+    /// Running or waiting: what the chip badge and the close confirmation
+    /// count (section 6).
+    pub fn active(&self) -> bool {
+        !matches!(self.phase, TransferPhase::Done(_))
+    }
+
+    /// How far along, for the bar. None until a real byte count arrives.
+    pub fn fraction(&self) -> Option<f32> {
+        match &self.phase {
+            TransferPhase::Running { done, total, .. } if *total > 0 =>
+                Some((*done as f32 / *total as f32).clamp(0.0, 1.0)),
+            _ => None,
+        }
+    }
+
+    pub fn percent(&self) -> Option<u8> {
+        self.fraction().map(|done| (done * 100.0).round() as u8)
+    }
+
+    /// Seconds left at the rolling rate (5.4), falling back to the
+    /// documented default until there is something to measure.
+    pub fn eta_s(&self) -> Option<f32> {
+        let TransferPhase::Running { done, total, bytes_per_s } = &self.phase
+        else {
+            return None;
+        };
+        let rate = match *bytes_per_s > 1.0 {
+            true => *bytes_per_s,
+            false => DEFAULT_RATE_BPS,
+        };
+        Some((total.saturating_sub(*done) as f64 / rate) as f32)
+    }
+
+    /// The file it produced, once it landed.
+    pub fn landed(&self) -> Option<&Transferred> {
+        match &self.phase {
+            TransferPhase::Done(Ok(done)) => Some(done),
+            _ => None,
+        }
+    }
+
+    /// What stopped it, for the tile's short text and the bar.
+    pub fn failure(&self) -> Option<&FtpError> {
+        match &self.phase {
+            TransferPhase::Done(Err(err)) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// What a 3mf says about itself, as the detail pane asked (5.7).
+#[derive(Clone, Debug)]
+pub enum DetailState {
+    Loading,
+    /// boxed: a 3mf's facts and its plate picture dwarf the other variants
+    Ready(Box<ThreeMf>),
+    Failed(FtpError),
+}
+
+/// A plain `.gcode` header the user asked for (5.7).
+#[derive(Clone, Debug)]
+pub enum HeaderState {
+    Loading,
+    Ready(gcode::Header),
+    Failed(FtpError),
+}
+
 /// Everything the files view shows for one printer (5.4). Listings live in
 /// memory only in this stage; the disk cache comes with the transfer lane.
 #[derive(Default)]
@@ -1103,6 +2614,22 @@ pub struct BrowserState {
     pub cert_alert: Option<Refusal>,
     /// what stopped the lane, shown as an error card with Retry
     pub error: Option<FtpError>,
+    /// transfers the view started, in the order it started them (section 6)
+    pub transfers: Vec<TransferUi>,
+    /// what each 3mf says about itself (5.7)
+    pub details: HashMap<String, DetailState>,
+    /// plain `.gcode` headers the user asked for (5.7)
+    pub headers: HashMap<String, HeaderState>,
+    /// the rolling rate the ETA is built from; 0 until one is measured
+    pub rate_bps: f64,
+    /// a "Download & play" that landed: the local file, and the remote path
+    /// it came from, which is what decides the player's starting speed —
+    /// a cached copy is named by a hash, so `/ipcam` is not in it (7)
+    play_now: Option<(PathBuf, String)>,
+    /// ids handed to the worker. They start at 1, far below the reserved
+    /// ids the job bundle and a big preview run under, so a Cancel from the
+    /// view can never name one of those.
+    next_transfer_id: u64,
     /// listing generation: results of older ones are ignored
     generation: u64,
     recordings_opened: bool,
@@ -1121,6 +2648,12 @@ impl BrowserState {
         // so its tile would stay "loading" for ever and hold the one
         // request the view keeps in flight (section 4)
         self.thumbs.retain(|_, thumb| !matches!(thumb, ThumbState::Loading));
+        // a new listing can show a different file under the same name, and
+        // these are keyed by path: what the old one said is dropped. The
+        // disk cache keeps them keyed by size and time, so an unchanged
+        // file answers from there without touching the printer (5.6).
+        self.details.clear();
+        self.headers.clear();
         vec![self.list("/")]
     }
 
@@ -1198,6 +2731,121 @@ impl BrowserState {
             .any(|thumb| matches!(thumb, ThumbState::Loading))
     }
 
+    // -------------------------------------------- transfers (5.4, 6)
+
+    /// Starts a user download. The same file is never fetched twice at
+    /// once: a second click while it runs does nothing (section 6).
+    pub fn download(&mut self, remote: &RemoteEntry, dest: Dest)
+                    -> Option<Cmd> {
+        if self.transfers.iter().any(|transfer|
+            transfer.path() == remote.path && transfer.active())
+        {
+            return None;
+        }
+        // a finished row for the same file is replaced by this one
+        self.transfers.retain(|transfer| transfer.path() != remote.path);
+        self.next_transfer_id += 1;
+        let id = self.next_transfer_id;
+        self.transfers.push(TransferUi {
+            id,
+            remote: remote.clone(),
+            dest,
+            phase: TransferPhase::Starting,
+            started: Instant::now(),
+        });
+        Some(Cmd::Download { id, remote: remote.clone(), dest })
+    }
+
+    /// Cancels one transfer (5.4). The `.part` is deleted and the session
+    /// discarded on the lane thread, not this one, and its
+    /// `Done(Err(Cancelled))` is what finally clears a *running* row.
+    ///
+    /// A transfer that has not started is answered here as well, because
+    /// the lane takes queued `Cancel`s only between jobs: while a
+    /// seven-minute RETR runs, a row the user cancelled would go on saying
+    /// "waiting: one download at a time" for the rest of it. The worker
+    /// writes the same phase later, so this is only ever an earlier copy of
+    /// the same answer.
+    pub fn cancel_transfer(&mut self, id: u64) -> Cmd {
+        if let Some(transfer) = self.transfer_mut(id)
+            && matches!(transfer.phase,
+                        TransferPhase::Starting | TransferPhase::Queued(_))
+        {
+            transfer.phase = TransferPhase::Done(Err(FtpError::Cancelled));
+        }
+        Cmd::Cancel(id)
+    }
+
+    fn transfer_mut(&mut self, id: u64) -> Option<&mut TransferUi> {
+        self.transfers.iter_mut().find(|transfer| transfer.id == id)
+    }
+
+    /// The transfer of one remote file, for its tile (section 6).
+    pub fn transfer_of(&self, path: &str) -> Option<&TransferUi> {
+        self.transfers.iter().find(|transfer| transfer.path() == path)
+    }
+
+    /// Where a finished download put the file: "Open in player" and "Show
+    /// in folder" need a real path (section 6).
+    pub fn local_copy(&self, path: &str) -> Option<&Path> {
+        self.transfer_of(path)?.landed().map(|done| done.path.as_path())
+    }
+
+    /// Transfers running or waiting: the chip badge and the confirmations
+    /// before closing, removing or editing a printer (section 6).
+    pub fn active_transfers(&self) -> usize {
+        self.transfers.iter().filter(|transfer| transfer.active()).count()
+    }
+
+    /// The running transfer's percentage, for the chip badge's `v 42%`.
+    pub fn running_percent(&self) -> Option<u8> {
+        self.transfers.iter().find_map(TransferUi::percent)
+    }
+
+    /// Drops a finished row from the transfer bar.
+    pub fn dismiss(&mut self, id: u64) {
+        self.transfers.retain(|transfer|
+            transfer.id != id || transfer.active());
+    }
+
+    /// The file a "Download & play" landed on, handed over exactly once so
+    /// the player is opened for it and not again on the next frame.
+    pub fn take_play_request(&mut self) -> Option<(PathBuf, String)> {
+        self.play_now.take()
+    }
+
+    // ----------------------------------------- details and headers (5.7)
+
+    /// Asks what a 3mf says about itself. `None` when it is already
+    /// loading, loaded or failed, so the pane never asks once per frame.
+    pub fn request_details(&mut self, remote: &RemoteEntry,
+                           plate_hint: Option<u32>) -> Option<Cmd> {
+        if self.details.contains_key(&remote.path) {
+            return None;
+        }
+        self.details.insert(remote.path.clone(), DetailState::Loading);
+        Some(Cmd::Details { remote: remote.clone(), plate_hint })
+    }
+
+    /// The user retried a failed preview: it is asked for once more.
+    pub fn forget_details(&mut self, path: &str) {
+        self.details.remove(path);
+    }
+
+    /// "Read header (~2 s)" (5.7). Never automatic: only this call starts
+    /// one, and only when the user clicked it.
+    pub fn request_header(&mut self, remote: &RemoteEntry) -> Option<Cmd> {
+        if self.headers.contains_key(&remote.path) {
+            return None;
+        }
+        self.headers.insert(remote.path.clone(), HeaderState::Loading);
+        Some(Cmd::GcodeHeader { remote: remote.clone() })
+    }
+
+    pub fn forget_header(&mut self, path: &str) {
+        self.headers.remove(path);
+    }
+
     /// Folds one worker event in and returns the listings it starts.
     pub fn apply(&mut self, event: Event) -> Vec<Cmd> {
         match event {
@@ -1239,6 +2887,50 @@ impl BrowserState {
                 Vec::new()
             }
             Event::JobBundle { .. } => Vec::new(),
+            Event::Queued { id, reason } => {
+                if let Some(transfer) = self.transfer_mut(id) {
+                    transfer.phase = TransferPhase::Queued(reason);
+                }
+                Vec::new()
+            }
+            Event::Progress { id, done, total, bytes_per_s } => {
+                self.rate_bps = bytes_per_s;
+                if let Some(transfer) = self.transfer_mut(id) {
+                    transfer.phase =
+                        TransferPhase::Running { done, total, bytes_per_s };
+                }
+                Vec::new()
+            }
+            Event::Done { id, result } => {
+                // "Download & play" opens the file when it lands, and the
+                // request is taken exactly once (section 6)
+                let plays = self.transfers.iter()
+                    .find(|transfer| transfer.id == id)
+                    .filter(|transfer| matches!(
+                        transfer.dest, Dest::Cache { open_after: true }))
+                    .map(|transfer| transfer.path().to_string());
+                if let (Some(remote), Ok(done)) = (plays, &result) {
+                    self.play_now = Some((done.path.clone(), remote));
+                }
+                if let Some(transfer) = self.transfer_mut(id) {
+                    transfer.phase = TransferPhase::Done(result);
+                }
+                Vec::new()
+            }
+            Event::Details { path, result } => {
+                self.details.insert(path, match result {
+                    Ok(three) => DetailState::Ready(Box::new(three)),
+                    Err(err) => DetailState::Failed(err),
+                });
+                Vec::new()
+            }
+            Event::GcodeHeader { path, result } => {
+                self.headers.insert(path, match result {
+                    Ok(header) => HeaderState::Ready(header),
+                    Err(err) => HeaderState::Failed(err),
+                });
+                Vec::new()
+            }
         }
     }
 
@@ -1741,15 +3433,31 @@ mod tests {
                  predecessor_wait: Duration::from_secs(2) }
     }
 
+    /// A cache of this test process, under the temp directory, so no test
+    /// ever touches the user's real cache.
+    fn test_cache() -> Arc<Cache> {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "bambu-worker-test-{}-{}", std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)));
+        Cache::at(root, 64 * 1024 * 1024)
+    }
+
     fn worker_on(port: u16, serial: &str, timing: Timing,
                  io_timeout: Duration) -> FtpWorker {
+        worker_with(port, serial, timing, io_timeout, test_cache())
+    }
+
+    fn worker_with(port: u16, serial: &str, timing: Timing,
+                   io_timeout: Duration, cache: Arc<Cache>) -> FtpWorker {
         let tls = match config::files_refused_by_name(serial).is_some() {
             true => PrinterTls::new(serial),
             false => Ok(test_tls(TEST_CA, TEST_SERIAL)),
         };
         let endpoint = crate::ftp::FtpEndpoint::for_test(
             tls, port, serial, ACCESS_CODE, io_timeout);
-        FtpWorker::for_test(endpoint, timing, &egui::Context::default())
+        FtpWorker::for_test(endpoint, timing, &egui::Context::default(),
+                            cache)
     }
 
     /// The test leaf with its key; control and data share one ticketer,
@@ -1860,13 +3568,27 @@ mod tests {
         bytes.into_inner()
     }
 
+    /// A real PNG, so the plate picture goes through the decode the lane
+    /// does (5.1, rule 5) rather than through a string that is not one.
+    fn plate_png() -> Vec<u8> {
+        let image = image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 8) as u8, (y * 8) as u8, 200])
+        });
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encode");
+        bytes.into_inner()
+    }
+
     fn job_3mf() -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
+        let png = plate_png();
         let entries: [(&str, &[u8]); 3] = [
             ("Metadata/plate_1.gcode", b"; gcode"),
-            ("Metadata/plate_1.png", b"plate-1"),
+            ("Metadata/plate_1.png", png.as_slice()),
             ("Metadata/slice_info.config",
              b"<config><plate><metadata key=\"index\" value=\"1\"/>\
                <object identify_id=\"7\" name=\"cube\" skipped=\"false\" />\
@@ -2709,7 +4431,7 @@ mod tests {
         assert_eq!(job, "part");
         assert_eq!(bundle.error, "");
         assert_eq!(bundle.objects, vec![(7, "cube".to_string())]);
-        assert_eq!(bundle.plate_png.as_deref(), Some(&b"plate-1"[..]));
+        assert_eq!(bundle.plate_png, Some(plate_png()));
         assert_eq!(worker.job_progress("part"), None, "delivered once");
         let commands = server.commands();
         assert_eq!(commands.first().map(String::as_str), Some("USER"));
@@ -2820,7 +4542,8 @@ mod tests {
             Ok(test_tls(TEST_CA, TEST_SERIAL)), server.port, TEST_SERIAL,
             ACCESS_CODE, IO_TIMEOUT);
         let second = FtpWorker::for_test_replacing(
-            endpoint, fast(), &egui::Context::default(), &first);
+            endpoint, fast(), &egui::Context::default(), &first,
+            test_cache());
         second.send(Cmd::List { dir: "/".into(), generation: 1 });
         listed(next_event(&second, BOUND, is_listed)).1.expect("listed");
         assert!(first.has_ended(), "the old lane ended before the new one \
@@ -2836,7 +4559,8 @@ mod tests {
     #[test]
     fn a_replacement_opens_no_session_while_the_old_lane_lives() {
         let server = ftp_server(HOST, listing_spec(Vec::new()));
-        let ended = Arc::new(AtomicBool::new(false));
+        // one lane still live in the worker this one replaces
+        let live = Arc::new(AtomicUsize::new(1));
         let timing = Timing { predecessor_wait: Duration::from_millis(100),
                               ..fast() };
         let endpoint = crate::ftp::FtpEndpoint::for_test(
@@ -2844,7 +4568,7 @@ mod tests {
             ACCESS_CODE, IO_TIMEOUT);
         let worker = FtpWorker::for_test_after(endpoint, timing,
                                                &egui::Context::default(),
-                                               ended.clone());
+                                               live.clone(), test_cache());
         worker.send(Cmd::List { dir: "/".into(), generation: 1 });
         let started = Instant::now();
         let (_, result) = listed(next_event(&worker, BOUND, is_listed));
@@ -2860,12 +4584,1089 @@ mod tests {
 
         // once the old lane has ended, the next command opens the one
         // session this printer is allowed
-        ended.store(true, Ordering::SeqCst);
+        live.store(0, Ordering::SeqCst);
         worker.send(Cmd::List { dir: "/".into(), generation: 1 });
         listed(next_event(&worker, BOUND, is_listed)).1.expect("listed");
         assert_eq!(server.sessions(), 1);
         assert_eq!(server.max_open_sessions(), 1);
         assert_eq!(worker.status().max_open_sessions, 1);
+    }
+
+    // ------------------------------------------------- the transfer lane
+
+    fn is_done(event: &Event) -> bool {
+        matches!(event, Event::Done { .. })
+    }
+
+    fn is_progress(event: &Event) -> bool {
+        matches!(event, Event::Progress { .. })
+    }
+
+    fn is_queued(event: &Event) -> bool {
+        matches!(event, Event::Queued { .. })
+    }
+
+    fn done_result(event: Event) -> (u64, Result<Transferred, FtpError>) {
+        match event {
+            Event::Done { id, result } => (id, result),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn is_details(event: &Event) -> bool {
+        matches!(event, Event::Details { .. })
+    }
+
+    fn is_header(event: &Event) -> bool {
+        matches!(event, Event::GcodeHeader { .. })
+    }
+
+    fn details_result(event: Event) -> (String, Result<ThreeMf, FtpError>) {
+        match event {
+            Event::Details { path, result } => (path, result),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn header_result(event: Event)
+                     -> (String, Result<gcode::Header, FtpError>) {
+        match event {
+            Event::GcodeHeader { path, result } => (path, result),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The same job 3mf, padded past the browse lane's cap.
+    fn big_job_3mf() -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let filler = vec![b'x'; LANE_MAX as usize + 8192];
+        let png = plate_png();
+        let entries: [(&str, &[u8]); 3] = [
+            ("Metadata/plate_1.gcode", filler.as_slice()),
+            ("Metadata/plate_1.png", png.as_slice()),
+            ("Metadata/slice_info.config",
+             b"<config><plate><metadata key=\"index\" value=\"1\"/>\
+               <object identify_id=\"7\" name=\"cube\" skipped=\"false\" />\
+               </plate></config>"),
+        ];
+        for (name, body) in entries {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn cache_key(remote: &RemoteEntry) -> (String, cache::CacheKey) {
+        let printer_key = Cache::printer_key(TEST_SERIAL);
+        let key = Cache::key(&printer_key, remote, None);
+        (printer_key, key)
+    }
+
+    /// The lane keeps its session between two jobs that are already queued
+    /// (it only closes when the queue empties), so a transfer that was
+    /// cancelled must discard its poisoned session before the next queued
+    /// job runs. Without this, the job behind a cancelled one is handed the
+    /// poisoned session and ends as `Done(Err(Poisoned))` for a download
+    /// nobody cancelled: the zombie session of hard part 2. The test below
+    /// waits for `Done` before sending the next download, so the queue's
+    /// own idle close hides the missing one.
+    #[test]
+    fn a_download_queued_behind_a_cancelled_one_runs_on_a_fresh_session() {
+        let body = vec![7u8; 512 * 1024];
+        let mut spec = genuine(vec![("a.avi".into(), body.clone()),
+                                    ("b.avi".into(), body.clone())]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let size = body.len() as u64;
+
+        // both are queued before either finishes
+        worker.send(Cmd::Download { id: 1, remote: entry("/a.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+        worker.send(Cmd::Download { id: 2, remote: entry("/b.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+        assert_eq!(worker.active_transfers(), 2);
+
+        // the running one is cancelled once it is really streaming
+        let Event::Progress { id, .. } =
+            next_event(&worker, BOUND, is_progress)
+        else { panic!("no progress") };
+        assert_eq!(id, 1, "the first download is not the one running");
+        let started = Instant::now();
+        worker.cancel(1);
+        let (first, cancelled) =
+            done_result(next_event(&worker, BOUND, is_done));
+        assert_eq!(first, 1);
+        assert_eq!(cancelled.err(), Some(FtpError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(2),
+                "cancel took {:?}", started.elapsed());
+
+        // the queued one must still run: a poisoned session may never be
+        // handed to it
+        let (second, landed) = done_result(next_event(
+            &worker, Duration::from_secs(30), is_done));
+        assert_eq!(second, 2);
+        let landed = landed.expect("the queued download ran");
+        assert_eq!(landed.bytes, size);
+        assert!(worker.status().max_open_sessions <= 2);
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// Hard parts 1 and 2 of stage 3. Progress is the real byte count off
+    /// the socket; Cancel stops the transfer while it runs; and the app is
+    /// left coherent — the `.part` is deleted, nothing is committed, the
+    /// session is discarded rather than reused, no thread is left behind,
+    /// and the next download opens a fresh session.
+    #[test]
+    fn cancel_mid_download_deletes_the_part_and_the_next_one_reconnects() {
+        let body = vec![7u8; 512 * 1024];
+        let mut spec = genuine(
+            vec![("timelapse/video.avi".into(), body.clone())]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let remote = entry("/timelapse/video.avi", body.len() as u64);
+        let (printer_key, key) = cache_key(&remote);
+        let part = cache.part_path(&printer_key, Kind::File, key, "avi");
+
+        worker.send(Cmd::Download { id: 1, remote: remote.clone(),
+                                    dest: Dest::Cache { open_after: true } });
+        assert_eq!(worker.active_transfers(), 1);
+
+        // real bytes from the socket, not an estimate
+        let Event::Progress { id, done, total, bytes_per_s } =
+            next_event(&worker, BOUND, is_progress)
+        else { panic!("no progress") };
+        assert_eq!((id, total), (1, body.len() as u64));
+        assert!(done > 0 && done < total, "{done} of {total}");
+        assert!(bytes_per_s > 0.0, "no rate for the ETA");
+        assert!(worker.rate_bps() > 0.0, "the ETA has no rate to use");
+        assert!(part.exists(), "the download does not write to a .part");
+        assert!(worker.status().transferring);
+
+        let started = Instant::now();
+        worker.send(Cmd::Cancel(1));
+        let (id, result) = done_result(next_event(&worker, BOUND, is_done));
+        let elapsed = started.elapsed();
+        assert_eq!(id, 1);
+        assert_eq!(result.err(), Some(FtpError::Cancelled));
+        // the cancel is not waiting for an IO timeout
+        assert!(elapsed < Duration::from_secs(2), "cancel took {elapsed:?}");
+        assert!(!part.exists(), "the .part survived the cancel");
+        assert_eq!(cache.get(&printer_key, Kind::File, key, "avi"), None,
+                   "a cancelled download was committed");
+        assert_eq!(worker.active_transfers(), 0);
+        assert!(!worker.status().transferring);
+
+        // the session was discarded, never reused: the next download opens
+        // a fresh one and completes
+        let sessions = server.sessions();
+        worker.send(Cmd::Download { id: 2, remote,
+                                    dest: Dest::Cache { open_after: false } });
+        let (id, result) =
+            done_result(next_event(&worker, Duration::from_secs(30),
+                                   is_done));
+        let landed = result.expect("the next download ran");
+        assert_eq!((id, landed.bytes), (2, body.len() as u64));
+        assert!(!landed.from_cache);
+        assert_eq!(std::fs::read(&landed.path).expect("the file"), body);
+        assert!(server.sessions() > sessions,
+                "the cancelled session was reused");
+        assert!(worker.status().max_open_sessions <= 2);
+
+        // and no lane thread is left behind
+        worker.stop();
+        assert!(eventually(Duration::from_secs(5), || worker.has_ended()),
+                "a lane thread was left running");
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.10: fewer bytes than SIZE is `Truncated`, the `.part` is deleted
+    /// and nothing is ever renamed into place.
+    #[test]
+    fn a_short_transfer_is_truncated_and_the_part_is_never_renamed() {
+        let mut spec = genuine(vec![("a.avi".into(), vec![9u8; 1000])]);
+        // SIZE promises more than the file holds
+        spec.size_reply = Some("213 5000");
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let remote = entry("/a.avi", 5000);
+        let (printer_key, key) = cache_key(&remote);
+
+        worker.send(Cmd::Download { id: 7, remote,
+                                    dest: Dest::Cache { open_after: false } });
+        let (id, result) = done_result(next_event(&worker, BOUND, is_done));
+        assert_eq!(id, 7);
+        assert_eq!(result.err(),
+                   Some(FtpError::Truncated { got: 1000, want: 5000 }));
+        assert!(!cache.part_path(&printer_key, Kind::File, key, "avi")
+                    .exists(), "the .part was kept");
+        assert_eq!(cache.get(&printer_key, Kind::File, key, "avi"), None,
+                   "a short transfer was renamed into place");
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// Section 4 and 5.10: while the printer prints, downloads run one at a
+    /// time and the rest say why they are waiting.
+    #[test]
+    fn while_printing_downloads_run_one_at_a_time_with_their_wording() {
+        let body = vec![1u8; 256 * 1024];
+        let mut spec = genuine(vec![("a.avi".into(), body.clone()),
+                                    ("b.avi".into(), body.clone())]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        worker.send(Cmd::SetPrinting(true));
+        assert!(worker.status().printing, "the gate did not see the print");
+
+        let size = body.len() as u64;
+        worker.send(Cmd::Download { id: 1, remote: entry("/a.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+        worker.send(Cmd::Download { id: 2, remote: entry("/b.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+
+        let Event::Queued { id, reason } =
+            next_event(&worker, BOUND, is_queued)
+        else { panic!("nothing was queued") };
+        assert_eq!(id, 2, "the first download is not the one that waits");
+        assert_eq!(reason,
+                   "waiting: printer is printing, one download at a time");
+        assert_eq!(worker.active_transfers(), 2);
+
+        // FIFO, and only ever one at a time
+        let (first, a) = done_result(next_event(&worker,
+                                                Duration::from_secs(30),
+                                                is_done));
+        assert!(!worker.status().transferring || worker.active_transfers() == 1);
+        let (second, b) = done_result(next_event(&worker,
+                                                 Duration::from_secs(30),
+                                                 is_done));
+        assert_eq!((first, second), (1, 2));
+        a.expect("the first download");
+        b.expect("the second download");
+        assert!(worker.status().max_open_sessions <= 2,
+                "a third session was opened");
+        assert_eq!(worker.active_transfers(), 0);
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.4: a job bundle whose 3mf is over the browse lane's cap moves to
+    /// the transfer lane, and still comes back as a bundle.
+    #[test]
+    fn a_job_bundle_over_the_cap_moves_to_the_transfer_lane() {
+        let big = big_job_3mf();
+        assert!(big.len() as u64 > LANE_MAX, "the fixture is not big enough");
+        let server = ftp_server(HOST, genuine(
+            vec![("part.gcode.3mf".into(), big)]));
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        worker.send(Cmd::JobBundle { job: "part".into(),
+                                     file_name: String::new(),
+                                     print_type: "local".into() });
+        let (job, result) = bundle_result(next_event(
+            &worker, Duration::from_secs(30), is_bundle));
+        assert_eq!(job, "part");
+        let bundle = result.expect("a bundle");
+        assert_eq!(bundle.objects, vec![(7, "cube".to_string())]);
+        assert_eq!(bundle.plate_png, Some(plate_png()));
+        // it ran on a second session, and the browse lane stayed free
+        assert!(server.sessions() >= 2,
+                "the bundle stayed on the browse session");
+        assert!(worker.status().max_open_sessions <= 2);
+        assert_eq!(worker.job_progress("part"), None, "delivered once");
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// Section 4, rule 3: browsing and downloading at once is two sessions
+    /// for that printer, and never a third.
+    #[test]
+    fn a_printer_never_has_more_than_two_sessions() {
+        let body = vec![2u8; 1024 * 1024];
+        let mut spec = listing_spec(vec![("a.avi".into(), body.clone())]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        worker.send(Cmd::Download { id: 1,
+                                    remote: entry("/a.avi",
+                                                  body.len() as u64),
+                                    dest: Dest::Cache { open_after: false } });
+        assert!(eventually(BOUND, || worker.status().transferring),
+                "the transfer did not start");
+
+        // the browse lane keeps working while the transfer runs
+        worker.send(Cmd::List { dir: "/".into(), generation: 1 });
+        listed(next_event(&worker, BOUND, is_listed)).1.expect("listed");
+        assert_eq!(worker.status().open_sessions, 2, "one session per lane");
+
+        done_result(next_event(&worker, Duration::from_secs(30), is_done)).1
+            .expect("the download finished");
+        assert_eq!(worker.status().max_open_sessions, 2);
+        assert_eq!(server.max_open_sessions(), 2,
+                   "the printer saw more than two sessions");
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.4: a transfer cancelled before its turn came never starts, and is
+    /// still reported, so no tile waits for ever.
+    #[test]
+    fn a_queued_transfer_cancelled_before_its_turn_never_starts() {
+        let body = vec![4u8; 512 * 1024];
+        let mut spec = genuine(vec![("a.avi".into(), body.clone()),
+                                    ("b.avi".into(), body.clone())]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let size = body.len() as u64;
+        worker.send(Cmd::Download { id: 1, remote: entry("/a.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+        worker.send(Cmd::Download { id: 2, remote: entry("/b.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+        assert_eq!(worker.active_transfers(), 2);
+
+        // the second one is cancelled while the first still runs
+        worker.cancel(2);
+        let (id, result) = done_result(next_event(&worker,
+                                                  Duration::from_secs(30),
+                                                  is_done));
+        // the running transfer is untouched, so the first Done is either
+        // the cancelled one or the one that finished
+        let (cancelled, finished) = match id {
+            2 => (result, done_result(next_event(&worker,
+                                                 Duration::from_secs(30),
+                                                 is_done)).1),
+            _ => (done_result(next_event(&worker, Duration::from_secs(30),
+                                         is_done)).1, result),
+        };
+        assert_eq!(cancelled.err(), Some(FtpError::Cancelled));
+        assert_eq!(finished.expect("the running transfer").bytes, size);
+        assert_eq!(worker.active_transfers(), 0);
+        // only the one that ran was ever fetched
+        assert_eq!(server.commands().iter()
+                       .filter(|command| *command == "RETR").count(), 1);
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.6: a complete, key-matching copy is copied, never fetched again.
+    #[test]
+    fn save_to_pc_copies_a_cached_copy_instead_of_downloading_again() {
+        let body = vec![3u8; 4096];
+        let server = ftp_server(HOST, genuine(
+            vec![("a.avi".into(), body.clone())]));
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let remote = entry("/a.avi", body.len() as u64);
+
+        worker.send(Cmd::Download { id: 1, remote: remote.clone(),
+                                    dest: Dest::Cache { open_after: true } });
+        let (_, result) = done_result(next_event(&worker, BOUND, is_done));
+        assert!(!result.expect("downloaded").from_cache);
+        let retrs = || server.commands().iter()
+            .filter(|command| *command == "RETR").count();
+        let before = retrs();
+
+        worker.send(Cmd::Download { id: 2, remote, dest: Dest::SaveToPc });
+        let (_, result) = done_result(next_event(&worker, BOUND, is_done));
+        let saved = result.expect("saved to the PC");
+        assert!(saved.from_cache, "it downloaded the file a second time");
+        assert_eq!(std::fs::read(&saved.path).expect("the saved file"), body);
+        assert_eq!(retrs(), before, "a second RETR went out");
+        // 5.6: the copy went through `<dest>.part` like a download, so
+        // nothing is left under the real name unless the whole file
+        // arrived, and no `.part` survives a copy that worked
+        assert!(!part_of(&saved.path).exists(),
+                "a .part was left in the Downloads folder");
+        assert_eq!(std::fs::metadata(&saved.path).expect("the saved file")
+                       .len(), body.len() as u64);
+
+        // and one left by a crash is swept at the next start, outside the
+        // cache tree as well (5.6)
+        let stale = part_of(&saved.path);
+        std::fs::write(&stale, b"half").expect("write");
+        let save_root = saved.path.parent().expect("printer folder")
+            .parent().expect("save root");
+        cache.sweep_save_parts(save_root);
+        assert!(!stale.exists(), "a stale .part survived in Downloads");
+        assert!(saved.path.exists(), "the saved file was swept away");
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// Section 4, rule 3: `has_ended()` is the live-lane count, so it can
+    /// never read "ended" while a lane still holds a session. It used to be
+    /// a flag stored beside that counter, which a browse lane ending at the
+    /// instant the user clicked Download could latch to true with the
+    /// transfer lane live — and that flag is the gate a replacement worker
+    /// waits on before opening a session of its own.
+    #[test]
+    fn the_ended_gate_follows_the_live_lanes() {
+        let body = vec![5u8; 256 * 1024];
+        let mut spec = genuine(vec![("a.avi".into(), body.clone())]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        // no thread yet: a replacement may open its session straight away
+        assert!(worker.has_ended());
+
+        // only the transfer lane runs here — the browse lane was never
+        // started, which is the case the old flag got wrong
+        worker.send(Cmd::Download { id: 1,
+                                    remote: entry("/a.avi",
+                                                  body.len() as u64),
+                                    dest: Dest::Cache { open_after: false } });
+        assert!(!worker.has_ended(), "the gate opened with a lane live");
+        let started = Instant::now();
+        assert!(eventually(BOUND, || worker.status().transferring),
+                "the transfer did not start");
+        assert!(started.elapsed() < BOUND);
+        assert!(!worker.has_ended(), "the gate opened with a session held");
+
+        worker.stop();
+        let started = Instant::now();
+        assert!(eventually(Duration::from_secs(5), || worker.has_ended()),
+                "a lane thread was left running");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(worker.status().open_sessions, 0);
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.4: the transfer lane opens no session for a transfer that is
+    /// already cancelled, and cancels the records it installed rather than
+    /// leaving them for the handshake to finish. `FtpWorker::cancel` sets
+    /// the flag and then cancels whatever it finds recorded, so a cancel
+    /// that raced the install would otherwise be seen only by `retr_to` —
+    /// after a full handshake (~0.9 s on the P1S) and a SIZE had been spent
+    /// on a transfer nobody is waiting for.
+    #[test]
+    fn the_transfer_lane_opens_no_session_for_a_cancelled_transfer() {
+        // a port that answers nothing: a connection here would cost the IO
+        // timeout, so anything prompt below never touched the network
+        let port = silent_server(Duration::from_secs(30));
+        let cache = test_cache();
+        let worker = worker_with(port, TEST_SERIAL, fast(), IO_TIMEOUT,
+                                 cache.clone());
+        let (_tx, rx) = crossbeam_channel::unbounded::<Job>();
+        let endpoint = crate::ftp::FtpEndpoint::for_test(
+            Ok(test_tls(TEST_CA, TEST_SERIAL)), port, TEST_SERIAL,
+            ACCESS_CODE, IO_TIMEOUT);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut lane = TransferLane {
+            endpoint,
+            shared: worker.shared.clone(),
+            events: worker.events_tx.clone(),
+            ctx: egui::Context::default(),
+            timing: fast(),
+            rx,
+            predecessor: None,
+            session: None,
+            queue: VecDeque::new(),
+            closed_handshakes: Handshakes::default(),
+            profile: None,
+            current_cancel: Some(cancel.clone()),
+        };
+
+        let started = Instant::now();
+        assert_eq!(lane.open_session().err(), Some(FtpError::Cancelled));
+        assert!(lane.session.is_none(), "a session was opened anyway");
+        // the records it installed were cancelled on the way out
+        let conns = lock(&worker.shared.transfer_conns).clone();
+        assert!(conns.expect("session records").is_cancelled());
+        // and a command is the same answer, still without a connection
+        assert_eq!(lane.with_session(|ftp| ftp.size("/a.avi")).err(),
+                   Some(FtpError::Cancelled));
+        let elapsed = started.elapsed();
+        assert!(elapsed < AT_ONCE, "it connected anyway: {elapsed:?}");
+        assert_eq!(worker.status().sessions_opened, 0);
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.10: a disk-full that happens while the bytes are being written
+    /// names both figures. Neither the socket read nor the file write knows
+    /// which volume it is on, so they report zeroes and the lane fills them
+    /// in; the card used to read "not enough disk space: needs 0 B, 0 B
+    /// free", which is exactly when a user needs the numbers.
+    #[test]
+    fn a_disk_full_while_writing_names_both_figures() {
+        let cache = test_cache();
+        let part = cache.part_path(&Cache::printer_key(TEST_SERIAL),
+                                   Kind::File, CacheKey(1), "avi");
+        std::fs::create_dir_all(part.parent().expect("parent")).expect("dir");
+        // gate G3's timelapse
+        let size = 86_527_810;
+        let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        let failure = disk_full_figures(local_io(&full), &part, size);
+        let FtpError::DiskFull { need, .. } = failure else {
+            panic!("a full volume was not named as such: {failure:?}");
+        };
+        assert_eq!(need, cache::space_needed(size));
+        let text = failure.text(TEST_SERIAL);
+        assert!(text.contains("not enough disk space"), "{text}");
+        assert!(!text.contains("needs 0 B"), "{text}");
+        assert!(!has_serial_run(&text, TEST_SERIAL), "{text}");
+        // nothing else is turned into a disk-full on the way out
+        let other = disk_full_figures(FtpError::Truncated { got: 1, want: 2 },
+                                      &part, size);
+        assert_eq!(other, FtpError::Truncated { got: 1, want: 2 });
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.4: the confirmations before closing the app, removing a printer or
+    /// editing its connection have to count the worker's queue and not only
+    /// the rows the view started. A job bundle over 1 MB and a big "Load
+    /// preview" run on the transfer lane under reserved ids and have no row
+    /// at all, so an automatic 86 MB download was being discarded without a
+    /// question asked.
+    #[test]
+    fn an_automatic_transfer_counts_for_the_confirmations() {
+        let mut spec = genuine(vec![("part.gcode.3mf".into(),
+                                     big_job_3mf())]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        worker.send(Cmd::JobBundle { job: "part".into(),
+                                     file_name: String::new(),
+                                     print_type: "local".into() });
+        let started = Instant::now();
+        assert!(eventually(Duration::from_secs(30),
+                           || worker.active_transfers() > 0),
+                "the bundle never reached the transfer lane");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        // the view has no row for it, and that is all the confirmations
+        // used to count
+        assert_eq!(BrowserState::default().active_transfers(), 0);
+        assert!(crate::ui::files_view::active_transfer_note(
+                    worker.active_transfers()).is_some(),
+                "the close confirmation would not have asked");
+
+        worker.stop();
+        let started = Instant::now();
+        assert!(eventually(Duration::from_secs(5), || worker.has_ended()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// The cancelled set is not a leak: an id cancelled after its transfer
+    /// had already answered is forgotten once nothing is queued or running.
+    /// Ids are monotonic, so a stale one could never gate a later transfer;
+    /// it was unbounded growth, not a wrong answer.
+    #[test]
+    fn cancelled_ids_are_forgotten_once_the_queue_empties() {
+        let body = vec![6u8; 4096];
+        let server = ftp_server(HOST, genuine(
+            vec![("a.avi".into(), body.clone()),
+                 ("b.avi".into(), body.clone())]));
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let size = body.len() as u64;
+        worker.send(Cmd::Download { id: 1, remote: entry("/a.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+        done_result(next_event(&worker, BOUND, is_done)).1
+            .expect("the first download");
+
+        // a cancel for a transfer that has already answered, and one for an
+        // id this worker never had
+        worker.cancel(1);
+        worker.cancel(4242);
+        assert!(!lock(&worker.shared.transfers).cancelled.is_empty());
+
+        worker.send(Cmd::Download { id: 2, remote: entry("/b.avi", size),
+                                    dest: Dest::Cache { open_after: false } });
+        done_result(next_event(&worker, BOUND, is_done)).1
+            .expect("the second download");
+        let started = Instant::now();
+        assert!(eventually(BOUND, || lock(&worker.shared.transfers)
+                    .cancelled.is_empty()),
+                "cancelled ids are kept for the life of the worker");
+        assert!(started.elapsed() < BOUND);
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// Section 6: cancelling a transfer that has not started is answered at
+    /// once. The lane takes a queued `Cancel` only between jobs, so while a
+    /// seven-minute download runs the row would otherwise go on saying
+    /// "waiting: one download at a time" for the rest of it, and the ✕ that
+    /// the user pressed would read as a dead button.
+    #[test]
+    fn cancelling_a_queued_transfer_answers_at_once() {
+        let mut state = BrowserState::default();
+        let remote = entry("/timelapse/video.avi", 4_411_548);
+        let Some(Cmd::Download { id, .. }) =
+            state.download(&remote, Dest::Cache { open_after: true })
+        else {
+            panic!("no download was started");
+        };
+        state.apply(Event::Queued { id,
+                                    reason: QUEUED_PRINTING.to_string() });
+        assert_eq!(state.active_transfers(), 1);
+
+        let cmd = state.cancel_transfer(id);
+        assert!(matches!(cmd, Cmd::Cancel(cancelled) if cancelled == id));
+        assert_eq!(state.transfer_of(&remote.path)
+                       .and_then(TransferUi::failure),
+                   Some(&FtpError::Cancelled),
+                   "the row still said it was waiting");
+        assert_eq!(state.active_transfers(), 0);
+        // the worker's own answer, later, writes the same phase
+        state.apply(Event::Done { id, result: Err(FtpError::Cancelled) });
+        assert_eq!(state.active_transfers(), 0);
+
+        // a transfer that is already running is not answered here: its
+        // `.part` and its session are the lane's to deal with, and only its
+        // `Done` says they were
+        let Some(Cmd::Download { id, .. }) =
+            state.download(&remote, Dest::SaveToPc)
+        else {
+            panic!("no download was started");
+        };
+        state.apply(Event::Progress { id, done: 10, total: 100,
+                                      bytes_per_s: 1000.0 });
+        state.cancel_transfer(id);
+        assert!(state.transfer_of(&remote.path)
+                    .is_some_and(TransferUi::active),
+                "a running transfer was answered without its lane");
+    }
+
+    /// 5.7: a 3mf of 1 MB or less is inspected on the browse session, and
+    /// the answer is cached by key, so asking again touches no printer.
+    #[test]
+    fn a_small_3mf_is_inspected_on_the_browse_session() {
+        let body = job_3mf();
+        let server = ftp_server(HOST, genuine(
+            vec![("part.gcode.3mf".into(), body.clone())]));
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let remote = entry("/part.gcode.3mf", body.len() as u64);
+        assert!(body.len() as u64 <= LANE_MAX, "the fixture is too big");
+
+        worker.send(Cmd::Details { remote: remote.clone(),
+                                   plate_hint: None });
+        let (path, result) =
+            details_result(next_event(&worker, BOUND, is_details));
+        assert_eq!(path, "/part.gcode.3mf");
+        let three = result.expect("a 3mf");
+        assert_eq!(three.info.plate, Some(1));
+        assert_eq!(three.info.objects, vec![(7, "cube".to_string())]);
+        // the picture arrives decoded: the lane thread does that, and the
+        // UI thread only uploads it (5.1, rule 5)
+        assert_eq!(three.plate.as_ref().expect("the plate picture").0.size,
+                   [8, 8]);
+        // it stayed on the browse session: no second session was opened
+        assert_eq!(worker.status().max_open_sessions, 1);
+
+        // and it is cached by key: the file is not read a second time
+        let retrs = || server.commands().iter()
+            .filter(|command| *command == "RETR").count();
+        let before = retrs();
+        worker.send(Cmd::Details { remote, plate_hint: None });
+        let (_, result) =
+            details_result(next_event(&worker, BOUND, is_details));
+        result.expect("the cached 3mf");
+        assert_eq!(retrs(), before, "the 3mf was read again");
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.4: a 3mf over the browse lane's cap is a user-started download, so
+    /// it moves to the transfer lane and still comes back as a preview.
+    #[test]
+    fn a_big_3mf_preview_moves_to_the_transfer_lane() {
+        let big = big_job_3mf();
+        assert!(big.len() as u64 > LANE_MAX, "the fixture is not big enough");
+        let server = ftp_server(HOST, genuine(
+            vec![("big.gcode.3mf".into(), big.clone())]));
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+        let remote = entry("/big.gcode.3mf", big.len() as u64);
+
+        worker.send(Cmd::Details { remote, plate_hint: Some(1) });
+        let (_, result) = details_result(next_event(
+            &worker, Duration::from_secs(30), is_details));
+        let three = result.expect("a 3mf");
+        assert_eq!(three.info.objects, vec![(7, "cube".to_string())]);
+        // the transfer lane checks SIZE before it downloads; the browse
+        // lane's own path never does, so this is where it ran
+        assert!(server.commands().iter().any(|command| command == "SIZE"),
+                "it did not run on the transfer lane: {:?}",
+                server.commands());
+        assert!(worker.status().max_open_sessions <= 2);
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// 5.7: "Read header" drops the stream early, which kills the control
+    /// connection, so it runs on a session of its own and the next command
+    /// reconnects. It never leaves a second session open.
+    #[test]
+    fn a_header_read_consumes_its_session_and_the_next_reconnects() {
+        let mut body = b"; HEADER_BLOCK_START\n\
+                         ; model printing time: 9m 38s\n\
+                         ; total layer number: 46\n\
+                         ; total filament weight [g] : 0.26\n\
+                         ; max_z_height: 5.60\n\
+                         ; HEADER_BLOCK_END\n".to_vec();
+        // far more than the 8 KB the head read takes
+        body.extend(std::iter::repeat_n(b'x', 64 * 1024));
+        let server = ftp_server(HOST, listing_spec(
+            vec![("a.gcode".into(), body)]));
+        let cache = test_cache();
+        let worker = worker_with(server.port, TEST_SERIAL, fast(),
+                                 IO_TIMEOUT, cache.clone());
+
+        worker.send(Cmd::GcodeHeader { remote: entry("/a.gcode", 0) });
+        let (path, result) =
+            header_result(next_event(&worker, BOUND, is_header));
+        assert_eq!(path, "/a.gcode");
+        let header = result.expect("a header");
+        assert_eq!(header.layers, Some(46));
+        assert_eq!(header.weight_g, Some(0.26));
+        assert_eq!(header.max_z_mm, Some(5.60));
+        assert_eq!(header.prediction_s, Some(9 * 60 + 38));
+        assert!(header.complete, "the block ended inside the bytes read");
+        let sessions = server.sessions();
+
+        // the session died with that early close: the next command opens a
+        // fresh one, and there is never a second one open at the same time
+        worker.send(Cmd::List { dir: "/".into(), generation: 1 });
+        listed(next_event(&worker, BOUND, is_listed)).1.expect("listed");
+        assert!(server.sessions() > sessions,
+                "the consumed session was reused");
+        assert_eq!(worker.status().max_open_sessions, 1,
+                   "the header read left a second session open");
+        std::fs::remove_dir_all(cache.root()).ok();
+    }
+
+    /// T17, for everything this stage added: no message, path or reason
+    /// carries any run of the serial.
+    #[test]
+    fn no_transfer_message_or_path_carries_serial_characters() {
+        let printer_key = Cache::printer_key(TEST_SERIAL);
+        assert!(!has_serial_run(&printer_key, TEST_SERIAL), "{printer_key}");
+        for reason in [QUEUED_PRINTING, QUEUED_ONE_AT_A_TIME] {
+            assert!(!has_serial_run(reason, TEST_SERIAL), "{reason}");
+        }
+        for failure in [FtpError::Cancelled,
+                        FtpError::Truncated { got: 1, want: 2 },
+                        FtpError::DiskFull { need: 96 << 20, free: 1 << 20 },
+                        FtpError::Local("could not write the file".into())]
+        {
+            let text = failure.text(TEST_SERIAL);
+            assert!(!has_serial_run(&text, TEST_SERIAL), "{text}");
+            assert!(!text.is_empty());
+        }
+        // and the paths a download writes to
+        let cache = test_cache();
+        let remote = entry("/timelapse/video_2026-06-01_06-11-57.avi", 10);
+        let (key_of, key) = cache_key(&remote);
+        for path in [cache.path(&key_of, Kind::File, key, "avi"),
+                     cache.part_path(&key_of, Kind::File, key, "avi")]
+        {
+            let shown = path.display().to_string();
+            assert!(!has_serial_run(&shown, TEST_SERIAL), "{shown}");
+        }
+    }
+
+    /// A cache under the session scratchpad, so a live download never lands
+    /// in the user's real cache.
+    #[cfg(test)]
+    fn live_cache() -> Arc<Cache> {
+        let root = std::env::var_os("BAMBU_LIVE_CACHE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir()
+                .join("bambu-live-transfer-cache"));
+        // far above the file, so nothing is evicted while the check runs
+        Cache::at(root, 8 * 1024 * 1024 * 1024)
+    }
+
+    /// Whether the printer is idle, on the evidence a read-only probe can
+    /// actually get. Bambu pushes deltas, so `gcode_state` arrives only
+    /// when it changes and an idle printer never sends it; a full snapshot
+    /// needs `pushall`, and this stage's live rules forbid every MQTT
+    /// publish. So idleness is established from what the deltas do carry:
+    /// a reported `gcode_state` decides it outright, and otherwise no
+    /// print-progress field may appear at all and both temperatures must
+    /// be far below printing values. Anything unknown is a refusal.
+    #[cfg(test)]
+    fn idle_from(probe: &crate::mqtt::StateProbe) -> Result<String, String> {
+        if !probe.connected {
+            return Err("the probe never reached the printer".into());
+        }
+        if probe.reports == 0 {
+            return Err("the printer sent no report at all".into());
+        }
+        let last = |field: &str| probe.watched.iter()
+            .find(|(name, _, _)| name == field)
+            .map(|(_, _, last)| last.clone());
+        if let Some(state) = &probe.gcode_state {
+            return match state.as_str() {
+                "RUNNING" | "PAUSE" => Err(format!("gcode_state {state}")),
+                other => Ok(format!("gcode_state {other}")),
+            };
+        }
+        for field in ["layer_num", "mc_percent", "mc_remaining_time",
+                      "total_layer_num", "mc_print_stage"]
+        {
+            if let Some(seen) = last(field) {
+                return Err(format!(
+                    "{field} reported ({seen}): it may be printing"));
+            }
+        }
+        // Temperatures are deltas too: one that does not change is not
+        // re-sent, so a field missing from this window says nothing. What
+        // is required is that the printer really is reporting telemetry
+        // (at least one temperature seen) and that every temperature it
+        // did report is far below printing values. A hot nozzle is never
+        // silent: its control loop moves it constantly.
+        let mut temps: Vec<(&str, f64)> = Vec::new();
+        for field in ["nozzle_temper", "bed_temper"] {
+            if let Some(value) = last(field)
+                .and_then(|value| value.parse::<f64>().ok())
+            {
+                temps.push((field, value));
+            }
+        }
+        if temps.is_empty() {
+            return Err("no temperature reported at all".into());
+        }
+        for (field, value) in &temps {
+            let printing_at = match *field {
+                "nozzle_temper" => 60.0,
+                _ => 50.0,
+            };
+            if *value >= printing_at {
+                return Err(format!("{field} {value} °C: it may be printing"));
+            }
+        }
+        let seen: Vec<String> = temps.iter()
+            .map(|(field, value)| format!("{field} {value} °C"))
+            .collect();
+        Ok(format!("no print progress in {} reports, {}", probe.reports,
+                   seen.join(", ")))
+    }
+
+    /// Read-only MQTT diagnosis of the P1S, for the live checks: what the
+    /// printer pushes on its own, without a single publish. It opens no FTP
+    /// session and downloads nothing.
+    ///
+    /// Bambu reports are deltas, so `gcode_state` arrives only when it
+    /// changes; a running print still advances `layer_num`, `mc_percent` or
+    /// `mc_remaining_time` within this window, and an idle one advances
+    /// none of them. It prints telemetry only: never a serial, an address,
+    /// an access code or a file name.
+    #[test]
+    #[ignore = "live: needs BAMBU_LIVE_CONFIG and the P1S on the LAN"]
+    fn live_p1s_state_probe() {
+        let path = std::env::var("BAMBU_LIVE_CONFIG")
+            .expect("BAMBU_LIVE_CONFIG");
+        let text = std::fs::read_to_string(&path).expect("config");
+        let config: crate::config::Config =
+            toml::from_str(&text).expect("config.toml");
+        let printer = config.printers.iter()
+            .find(|p| model_from_serial(&p.serial) == "Bambu Lab P1S")
+            .expect("a P1S in the live config");
+        let probe = crate::mqtt::subscribe_gcode_state(
+            &printer.ip, &printer.serial, &printer.access_code,
+            Duration::from_secs(90));
+        println!("connected {}, {} print reports, gcode_state {:?}",
+                 probe.connected, probe.reports, probe.gcode_state);
+        for (field, first, last) in &probe.watched {
+            let moved = if first == last { "" } else { "  <-- changed" };
+            println!("  {field}: {first} -> {last}{moved}");
+        }
+        assert!(probe.connected, "the probe never reached the printer");
+    }
+
+    /// Live check of the transfer lane on the P1S (design doc 4 and 5.4,
+    /// and this stage's live rules): read-only FTPS, one printer at a time,
+    /// never more than two sessions, and only while the printer is not
+    /// printing. It downloads one real timelapse through the transfer lane,
+    /// then starts it again and cancels it after a few seconds, and proves
+    /// the app is left coherent: the `.part` is deleted, nothing is
+    /// committed, the session is discarded, no lane thread is left behind
+    /// and the next download runs on a fresh session.
+    ///
+    /// It needs BAMBU_LIVE_CONFIG. It prints byte counts, seconds, rates
+    /// and session counts only: never a serial, an address, an access code
+    /// or a file name.
+    #[test]
+    #[ignore = "live: needs BAMBU_LIVE_CONFIG and the P1S on the LAN"]
+    fn live_transfer_lane_downloads_then_cancels_on_the_p1s() {
+        let path = std::env::var("BAMBU_LIVE_CONFIG")
+            .expect("BAMBU_LIVE_CONFIG");
+        let text = std::fs::read_to_string(&path).expect("config");
+        let config: crate::config::Config =
+            toml::from_str(&text).expect("config.toml");
+        let printer = config.printers.iter()
+            .find(|p| model_from_serial(&p.serial) == "Bambu Lab P1S")
+            .expect("a P1S in the live config");
+
+        // the live rules allow a large download only while it is not
+        // printing, and this probe subscribes without ever publishing
+        let probe = crate::mqtt::subscribe_gcode_state(
+            &printer.ip, &printer.serial, &printer.access_code,
+            Duration::from_secs(120));
+        println!("MQTT probe: connected {}, {} print reports, state {:?}",
+                 probe.connected, probe.reports, probe.gcode_state);
+        for (field, first, last) in &probe.watched {
+            println!("  {field}: {first} -> {last}");
+        }
+        match idle_from(&probe) {
+            Ok(why) => println!("P1S is idle: {why}"),
+            Err(why) => panic!("the P1S cannot be confirmed idle ({why}): \
+                                the live rules forbid a download"),
+        }
+
+        let ctx = egui::Context::default();
+        let cache = live_cache();
+        let printer_key = Cache::printer_key(&printer.serial);
+        let worker = FtpWorker::start(printer, &ctx, cache.clone());
+
+        // The smallest timelapse of at least 1 MB, not the biggest: the
+        // owner's live budget allows one 86 MB pull per stage and the
+        // implementer already spent it, so this check must be repeatable
+        // without downloading it again. 1 MB is the floor because progress
+        // and the rate need several chunks to mean anything.
+        worker.send(Cmd::List { dir: "/timelapse".into(), generation: 1 });
+        let entries = listed(next_event(&worker, Duration::from_secs(60),
+                                        is_listed)).1
+            .expect("/timelapse listed");
+        let video = entries.iter()
+            .filter(|e| !e.is_dir && !e.unreadable
+                && e.name.to_lowercase().ends_with(".avi")
+                && e.size >= 1024 * 1024)
+            .min_by_key(|e| e.size)
+            .expect("a timelapse of at least 1 MB on the P1S")
+            .clone();
+        let key = Cache::key(&printer_key, &video, None);
+        let part = cache.part_path(&printer_key, Kind::File, key, "avi");
+        println!("timelapse: {} bytes", video.size);
+
+        // ---- one full download through the transfer lane ----
+        let started = Instant::now();
+        worker.send(Cmd::Download { id: 1, remote: video.clone(),
+                                    dest: Dest::Cache { open_after: false } });
+        let mut ticks = 0;
+        let landed = loop {
+            let event = next_event(&worker, Duration::from_secs(180),
+                                   |e| is_progress(e) || is_done(e));
+            match event {
+                Event::Progress { done, total, bytes_per_s, .. } => {
+                    ticks += 1;
+                    if ticks % 25 == 0 {
+                        println!("  {done} / {total} bytes, \
+                                  {bytes_per_s:.0} B/s");
+                    }
+                }
+                Event::Done { id, result } => {
+                    assert_eq!(id, 1);
+                    break result.expect("the download finished");
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        let elapsed = started.elapsed();
+        let rate = landed.bytes as f64 / elapsed.as_secs_f64();
+        println!("downloaded {} bytes in {:.1} s ({:.0} B/s, {:.0} KiB/s)",
+                 landed.bytes, elapsed.as_secs_f64(), rate, rate / 1024.0);
+        assert_eq!(landed.bytes, video.size, "the byte count matched SIZE");
+        assert!(!landed.from_cache);
+        assert_eq!(std::fs::metadata(&landed.path).expect("the file").len(),
+                   video.size);
+        assert!(!part.exists(), "a .part was left behind");
+        let after_download = worker.status();
+        println!("after the download: sessions opened {}, at most {} open \
+                  at once, handshakes {:?}",
+                 after_download.sessions_opened,
+                 after_download.max_open_sessions,
+                 after_download.handshakes);
+        assert!(after_download.max_open_sessions <= 2,
+                "more than two sessions on one printer");
+
+        // ---- the same download again, cancelled after a few seconds ----
+        // the cached copy is removed first, or it would be served from disk
+        std::fs::remove_file(&landed.path).expect("clear the cached copy");
+        let sessions_before = worker.status().sessions_opened;
+        worker.send(Cmd::Download { id: 2, remote: video.clone(),
+                                    dest: Dest::Cache { open_after: false } });
+        let Event::Progress { done, .. } =
+            next_event(&worker, Duration::from_secs(120), is_progress)
+        else { panic!("no progress") };
+        assert!(done > 0);
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(part.exists(), "the second download is not writing a .part");
+
+        let cancelled_at = Instant::now();
+        worker.send(Cmd::Cancel(2));
+        let (id, result) = done_result(next_event(&worker,
+                                                  Duration::from_secs(30),
+                                                  is_done));
+        let cancel_took = cancelled_at.elapsed();
+        assert_eq!(id, 2);
+        assert_eq!(result.err(), Some(FtpError::Cancelled));
+        println!("cancel answered in {:.2} s", cancel_took.as_secs_f64());
+        assert!(!part.exists(), "the .part survived the cancel");
+        assert_eq!(cache.get(&printer_key, Kind::File, key, "avi"), None,
+                   "a cancelled download was committed");
+        assert_eq!(worker.active_transfers(), 0);
+
+        // ---- the next download runs on a fresh session ----
+        // a thumbnail, not another large file: the live rules allow one
+        // full large download plus short cancelled ones
+        worker.send(Cmd::List { dir: "/timelapse/thumbnail".into(),
+                                generation: 1 });
+        let thumbs = listed(next_event(&worker, Duration::from_secs(60),
+                                       is_listed)).1
+            .expect("/timelapse/thumbnail listed");
+        let thumb = thumbs.iter()
+            .filter(|e| !e.is_dir && !e.unreadable)
+            .min_by_key(|e| e.size)
+            .expect("a thumbnail")
+            .clone();
+        worker.send(Cmd::Download { id: 3, remote: thumb.clone(),
+                                    dest: Dest::Cache { open_after: false } });
+        let (id, result) = done_result(next_event(&worker,
+                                                  Duration::from_secs(60),
+                                                  is_done));
+        assert_eq!(id, 3);
+        let small = result.expect("the next download ran after the cancel");
+        assert_eq!(small.bytes, thumb.size);
+        let status = worker.status();
+        println!("after the cancel: sessions opened {} (was {}), at most {} \
+                  open at once, handshakes {:?}",
+                 status.sessions_opened, sessions_before,
+                 status.max_open_sessions, status.handshakes);
+        assert!(status.sessions_opened > sessions_before,
+                "the cancelled session was reused");
+        assert!(status.max_open_sessions <= 2);
+        assert_eq!(status.handshakes.control_full, status.sessions_opened,
+                   "every session did one full control handshake");
+        assert_eq!(status.handshakes.data_full, 0,
+                   "a data connection did not resume");
+
+        // ---- no lane thread is left behind ----
+        worker.stop();
+        assert!(eventually(Duration::from_secs(10), || worker.has_ended()),
+                "a lane thread was left running");
+        println!("both lanes ended; cache left at {} bytes",
+                 cache.usage_bytes());
     }
 
     /// Live, read-only check on the owner's printers (design doc 4 and 5.5,
@@ -2885,7 +5686,7 @@ mod tests {
         let ctx = egui::Context::default();
         for (index, printer) in config.printers.iter().enumerate() {
             let model = model_from_serial(&printer.serial);
-            let worker = FtpWorker::start(printer, &ctx);
+            let worker = FtpWorker::start(printer, &ctx, test_cache());
             let mut state = BrowserState::default();
             let mut pending = state.refresh();
             // the Recordings tab is open too, so /ipcam is listed (5.5)

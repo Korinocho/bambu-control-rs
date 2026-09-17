@@ -38,13 +38,22 @@ regex-lite = "0.1.9"
 # src/ftp.rs (design doc 5.2). chrono is already built through suppaftp,
 # with the same feature set.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# "Save to PC" writes to the user's Downloads folder (design doc 5.6); the
+# cache falls back to dirs for %LOCALAPPDATA% when the env var is missing.
+dirs = "7"
+# "Open in player" and "Show in folder" (design doc 7, option B): the always
+# available fallback for a format the in-app MJPEG player cannot decode, and
+# the way a saved file is shown in Explorer. "reveal" is that second one.
+opener = { version = "0.8.5", features = ["reveal"] }
 
 # Single instance (design doc 4, rule 6): CreateMutexW for the named mutex
 # and MessageBoxW for the message a second launch shows.
+# Win32_Storage_FileSystem is GetDiskFreeSpaceExW, the free-space check every
+# download runs before it starts (design doc 5.6).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem",
+    "Win32_System_Threading", "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]
