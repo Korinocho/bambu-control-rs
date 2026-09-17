@@ -354,7 +354,7 @@ Implementation spec for the MVP. Gate G2 approved rustls with conditions; the ow
 - The leaf is public: the printer sends it in clear in every handshake, and anyone on the LAN can fetch it. Signature (a) alone therefore proves nothing about the peer; (b) proves that the peer holds the leaf's key. Both are required, each with its own tests.
 - CN == configured serial is a hard condition. It is the only per-device identity binding: `BBL CA` issues the leaves of every printer on this generation, and it also signed certificates that are not printer leaves (section 11).
 - Nothing is learned or stored from a connection. The first connection to a printer is verified exactly like every later one, and there is no trust action.
-- **LAN credential theft is not closed by the MVP.** MQTT (`mqtt.rs:45-53`, port 8883) and the camera (`camera.rs:49-51` and `:82-83`, port 6000) keep `danger_accept_invalid_certs` and `danger_accept_invalid_hostnames`. The access code is still handed to anyone who answers on 8883 or 6000, and whoever can intercept 990 can intercept those ports. Both are tracked as GitHub issues [#1](https://github.com/Korinocho/bambu-control-rs/issues/1) (MQTT) and [#2](https://github.com/Korinocho/bambu-control-rs/issues/2) (camera). It is small work: the same verifier and the same certificate, verified live on 8883 and 6000 (section 10.5).
+- **LAN credential theft was not closed by the MVP, and is closed now (2026-09-17).** The MVP left MQTT (8883) and the camera (6000) accepting any certificate, so the access code went to anyone who answered. Both now open through the same `AnchoredConnector` as FTPS: issue [#2](https://github.com/Korinocho/bambu-control-rs/issues/2) (camera) closed by `29102cc`, issue [#1](https://github.com/Korinocho/bambu-control-rs/issues/1) (MQTT) by `2ae6e39`. `danger_accept_invalid_certs` and `danger_accept_invalid_hostnames` appear nowhere in `src` or the vendored suppaftp, and CI greps all of `src` for them. Every path to a printer — 990, 6000, 8883 — is verified against the embedded `BBL CA` and the configured serial.
 - Residual risk: a peer holding the printer's own private key, or a compromise of the `BBL CA` private key. No revocation mechanism exists for this CA.
 
 **Trust anchor.**
@@ -379,10 +379,14 @@ Implementation spec for the MVP. Gate G2 approved rustls with conditions; the ow
 
 ```toml
 # native-tls is used ONLY by MQTT (rumqttc), until GitHub issue #1 moves it to the
-# printer certificate verifier. The camera stopped using it when issue #2 landed (see
-# "As built" below). FTPS does not use it; this is not a transition step for FTPS.
-native-tls = "0.2.18"
-rumqttc = { version = "0.25.1", default-features = false, features = ["use-native-tls"] }
+# printer certificate verifier. UPDATED 2026-09-17: issues #2 (`29102cc`) and #1
+# (`2ae6e39`) both landed, native-tls is gone from the tree with 11 other crates,
+# and rumqttc carries no TLS feature at all. tokio stays regardless, since
+# rumqttc declares tokio, tokio-stream and tokio-util as non-optional.
+rumqttc = { version = "0.25.1", default-features = false }
+# bytes is direct because rumqttc does not re-export BytesMut, and
+# Packet::read/write take one. Resolves to the version already in the lock.
+bytes = "1"
 suppaftp = { version = "10.0.2", features = ["rustls-ring", "deprecated"] }
 # "tls12" is load-bearing: the printers negotiate only TLS 1.2. Without it no printer
 # handshake can succeed (design doc 5.3).
@@ -394,8 +398,8 @@ ring = "0.17"
 - **No direct `rustls-webpki` dependency.** webpki stays only as rustls' own transitive dependency.
 - **The FTPS native-tls path is deleted when the verifier lands.** That path is `NativeTlsFtpStream` with a `TlsConnector` using `danger_*`, at `files.rs:174-179` today.
   - There is no runtime fallback, and no second path is kept "just in case". suppaftp loses its `native-tls` feature.
-  - CI fails on any `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` in the FTPS code: `git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src/tls.rs src/tls src/ftp.rs src/browser.rs src/files.rs vendor/suppaftp/src` must print nothing.
-  - When issues #1 and #2 land, the same grep runs over all of `src`, and the `native-tls` dependency is removed.
+  - CI fails on any `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` anywhere: `git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src vendor/suppaftp/src` must print nothing. `tests/source_rules.rs` mirrors that list and must change with it; a mirror that has drifted passes for a file CI would fail on.
+  - Widened from the FTPS-only path to all of `src` when issues #2 and #1 landed (`29102cc`, `2ae6e39`), as planned. The `native-tls` dependency went with them, taking 11 other crates and 128 lines of `Cargo.lock`.
 - **suppaftp is vendored** (stage 1b). suppaftp 10.0.2 declares its `TlsConnector` trait in a private module, so no application can supply a connector. `vendor/suppaftp` is the published crate plus one export (`pub use sync_ftp::TlsConnector`), wired through `[patch.crates-io]`; `vendor/suppaftp/PATCHES.md` documents it and when to drop it.
   - Upstream exported the trait once (`veeso/suppaftp` PR #22, merged 2022-10-10) and lost it in a later refactor, so asking upstream to restore it is the way out of the copy.
   - **No route without the patch exists**, checked on 10.0.2 and on 12.0.0 (the latest release, 2026-09-08). The crate root does export the `TlsStream` trait, but implementing it is not enough. `ImplFtpStream`'s fields are private, and its constructors are `connect`, `connect_timeout` and `connect_with_stream`, which all start in clear text (`DataStream::Tcp`), plus `into_secure` and `connect_secure_implicit`, the only two that build a `DataStream::Ssl` (`sync_ftp.rs:175`, `:242`) and both of which take an `impl TlsConnector`. `DataStream` is public, but no public constructor accepts one. A control connection handed over already encrypted would not help either: every data connection is built inside `data_command` from `self.tls_ctx` (`sync_ftp.rs:1009-1018`), so without a connector the data connections stay in clear text and implicit FTPS is impossible. suppaftp's own `RustlsConnector::from(Arc<ClientConfig>)` would carry this verifier, but not the time limits set before the first TLS byte, the handshake limit, cancel, or the per-connection record: refusals would arrive as `SecureError(String)` or `BadResponse`, which this section forbids matching on. Writing the FTP client instead was rejected as about 2000 lines of avoidable risk.
@@ -662,7 +666,7 @@ Two findings from that verification are worth keeping, because both were invisib
 
 **Refusal card** (FTPS, section 6). There is no trust action at all.
 - Text: "This is not a certificate Bambu Lab issued for this printer's serial. Possible causes: a wrong IP or serial in the printer settings, a printer board with a different identity, or someone intercepting the connection. The connection was refused and the access code was not sent over this connection."
-- "Over this connection" is deliberate: until issue #1 lands, the MQTT connection to the same address sends the access code without verifying the certificate (Security position, above).
+- "Over this connection" was deliberate: when this text was written, the MQTT connection to the same address still sent the access code without verifying the certificate. Since #1 and #2 closed (`2ae6e39`, `29102cc`) every port is verified, so the qualifier is now merely precise rather than a hedge. The wording is kept: it remains true, and `ftp.rs` asserts it verbatim while `browser.rs` and `files_view.rs` consume it, so rewording buys no accuracy.
 - Buttons: **Edit printer** and **Close** (Close is the default). No "trust", "accept" or "continue" action exists, and no text suggests the refusal is expected.
 - A replaced board that keeps its serial and has a `BBL CA` leaf passes, and never shows this card.
 
@@ -732,7 +736,7 @@ Errors, connections, config:
 
 Provider, dependencies, UI:
 - **T23** `no_provider_default_calls_in_src` (a scan of `src` and `vendor/suppaftp/src` with the CI grep pattern; the test file lives in `tests/`, so the pattern string itself is never scanned), plus the clippy `disallowed-methods` run in CI.
-- **T24** CI steps, not cargo tests: no `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` in the FTPS code; `cargo tree -d` lists none of rustls, rustls-webpki, ring, aws-lc-rs and aws-lc-sys; `cargo tree -i aws-lc-rs` fails.
+- **T24** CI steps, mirrored locally by `tests/source_rules.rs`: no `danger_accept_invalid_certs` or `danger_accept_invalid_hostnames` anywhere in `src` or the vendored suppaftp (widened from the FTPS path when #2 and #1 landed); `cargo tree -d` lists none of rustls, rustls-webpki, ring, aws-lc-rs and aws-lc-sys; `cargo tree -i aws-lc-rs` fails. A further rule asserts both production MQTT call sites pass `MQTT_PORT` and the anchor built from the configured serial, since both are test-injected and no test can check them.
 - **T25** UI and model texts:
   - `refusal_card_has_no_trust_action` (only Edit printer and Close);
   - `v2_models_are_refused_by_name_without_connecting` (H2C, P2S, X2D);
@@ -1433,9 +1437,10 @@ The owner reviewed these numbers and approved with conditions (G2), then approve
      - suppaftp loses its `native-tls` feature.
      - `native-tls` stays only for MQTT and the camera, with a `Cargo.toml` comment saying so.
      - 5.3; T24.
+     - *Historical, like the bullet below: these describe the MVP's scope. Since 2026-09-17 the grep covers all of `src`, and `native-tls` is gone entirely (`2ae6e39`).*
    - **No direct `rustls-webpki` dependency.** There is one ring verification path, and a code comment says why rustls' helper is not used. 5.3; T13.
    - **The rustls `tls12` feature is load-bearing.** CI asserts `protocol_version() == TLSv1_2` next to `handshake_kind() == Resumed`, and `Cargo.toml` carries a comment. 5.3; T22.
-   - **MQTT and the camera keep `danger_*` in the MVP,** so LAN credential theft is not closed by the MVP. Tracked as issues #1 and #2 (10.5).
+   - **MQTT and the camera keep `danger_*` in the MVP,** so LAN credential theft is not closed by the MVP. Tracked as issues #1 and #2 (10.5). *Historical: this describes the MVP's scope. Both closed on 2026-09-17 (`29102cc`, `2ae6e39`); no `danger_*` remains anywhere in `src`.*
 
 **Conditions, as they apply now.** Code and tests enforce each one during the MVP.
 
@@ -1502,8 +1507,9 @@ Phase 0 (~1 d) and the spike (≤1 d) come before and are not included.
 - `rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }`, with the `tls12` comment (5.3); `ring = "0.17"` for signatures (a) and (b).
 - `x509-cert = { version = "0.3.0", default-features = false }` (5.3).
 - No direct `rustls-webpki` dependency (5.3).
-- `rumqttc = { version = "0.25.1", default-features = false, features = ["use-native-tls"] }`: removes aws-lc-rs, aws-lc-sys and rustls-webpki 0.102.8 (5.3).
-- `native-tls = "0.2.18"` stays only for MQTT and the camera, with a comment saying so, until issues #1 and #2 (10.5).
+- `rumqttc = { version = "0.25.1", default-features = false }`: no TLS feature at all, so neither aws-lc-rs, aws-lc-sys nor rustls-webpki 0.102.8 enters the tree, and rumqttc serves only as a packet codec (5.3). *The MVP shipped this line with `features = ["use-native-tls"]`; issue #1 (`2ae6e39`) dropped the feature.*
+- `bytes = "1"` is a direct dependency, because rumqttc does not re-export `BytesMut` and `Packet::read`/`write` take one. It resolves to the version already in the lock.
+- `native-tls` is **gone** as of issue #1 (`2ae6e39`), taking 11 crates and 128 lines of `Cargo.lock` with it: openssl and its four companions, security-framework and its sys crate, foreign-types and its shared crate, schannel, tokio-native-tls and vcpkg. It had stayed for MQTT and the camera until issues #1 and #2 (10.5). tokio remains, since rumqttc declares tokio, tokio-stream and tokio-util as non-optional.
 - `opener = { version = "0.8.5", features = ["reveal"] }`.
 - `chrono = "0.4.45"`, direct; already compiled through suppaftp.
 - `dirs = "7"`.
@@ -1514,7 +1520,7 @@ Phase 0 (~1 d) and the spike (≤1 d) come before and are not included.
 - Security notes, per path:
   - FTPS (990): the certificate must be issued by Bambu's `BBL CA` for the configured serial, and the handshake must be signed with its key. Expiry is deliberately not checked.
   - Camera (6000): verified as of issue #2, with the same anchor, the same serial and the same handshake signature check as FTPS. The auth packet carrying the access code is written only after that handshake is accepted.
-  - MQTT (8883): certificates are not verified until issue #1; the access code is sent to whatever answers at the printer's address.
+  - MQTT (8883): verified as of issue #1 (`2ae6e39`), with the same anchor, serial and handshake signature check. CONNECT carries the access code and is written only after that handshake is accepted, and a subscription counts only once the printer acknowledges it for the identifier the app sent and grants it.
   - The access code is stored in plain text in `config.toml`.
 
 **Build checks:**
@@ -1524,9 +1530,9 @@ Phase 0 (~1 d) and the spike (≤1 d) come before and are not included.
 - The dependency tree and `cargo check` were verified on a scratch copy of the manifest and lock (section 11). That copy had the final rustls, x509-cert, ring, suppaftp `rustls-ring` and `rumqttc` lines. It still had a direct `rustls-webpki` line and suppaftp's `native-tls` feature; the final lines remove both.
 - CI re-runs the tree checks on the real manifest.
 
-### 10.5 Credential channels: MQTT and camera (issues #1 and #2; straight after the MVP, before v2; about 2.75-3.25 dev-days). **Camera (#2) is done; MQTT (#1) is open.**
+### 10.5 Credential channels: MQTT and camera (issues #1 and #2). **Both closed, 2026-09-17.**
 
-The MVP did not close LAN credential theft. Port 8883 still accepts any certificate and hands the access code to whoever answers (5.3, Security position), in **two** byte-identical places: `mqtt.rs:66-72`, inside `subscribe_gcode_state` (`#[cfg(test)]`, the subscribe-only idle probe), and `mqtt.rs:172-178`, inside `PrinterClient::start` (production). The camera no longer does: issue #2 landed, and `src/camera.rs` opens its socket through the same `AnchoredConnector` as FTPS.
+The MVP did not close LAN credential theft: 8883 and 6000 accepted any certificate and handed the access code to whoever answered (5.3, Security position). Both are closed now. Issue #2 landed in `29102cc` and `src/camera.rs` opens through the same `AnchoredConnector` as FTPS; issue #1 landed in `2ae6e39`, replacing both of the byte-identical native-tls blocks in `src/mqtt.rs` — the `#[cfg(test)]` idle probe and `PrinterClient::start` — with a single connection loop shared by both callers, exactly as the collapse-into-one-helper decision below required.
 - **Decision (owner, 2026-09-17).** Issue #1 collapses the two blocks into a single helper, so that fixing one and forgetting the other becomes impossible, and the CI grep's "all of `src`" end state follows for free. **The probe's site is fixed first:** it is the only one of the two that runs against real printers today, because the live-test rules require an idle confirmation before any live run — which means the safety measure is itself the vector: confirming that a printer is idle is precisely what sends the access code over an unverified connection, and it will keep doing so until #1 closes. Until #1 lands, live tests continue with that exposure accepted explicitly rather than left tacit: home LAN, no known hostile devices, risk theoretical.
 - Tracked as GitHub issues [#1](https://github.com/Korinocho/bambu-control-rs/issues/1) (MQTT) and [#2](https://github.com/Korinocho/bambu-control-rs/issues/2) (camera).
 - It is small work: the same verifier and the same certificate, verified live on 8883 and 6000 of all three printers (section 11). MQTT also needs its own connection loop, because rumqttc 0.25.1 cannot use the app's verifier without breaking the T24 tree rule (#1 row below).
@@ -1537,7 +1543,7 @@ The MVP did not close LAN credential theft. Port 8883 still accepts any certific
 | **#1 MQTT:** a rustls stream to 8883 with a config from the printer's `PrinterTls` (`Resumption::disabled()`, 5.3). The handshake and both signature checks complete before `CONNECT` carries the access code, and a refusal appears on the printer panel with the same text as the Files card. #1 keeps the T24 tree rule as approved. It removes `native-tls` and 11 crates with it (measured; see 5.3). It does **not** remove `tokio`, which an earlier version of this row wrongly claimed: rumqttc's `tokio`, `tokio-stream` and `tokio-util` dependencies are non-optional. The app runs the MQTT connection itself over its verified stream, with rumqttc's public packet codec (`Packet::read` / `Packet::write`, which compiles with no features at all) and its own keep-alive pings and reconnects, replacing `Client::new` and `Connection::iter` (`mqtt.rs:55`, `:68`). **Correction (2026-09-17).** An earlier version of this row rejected injecting our verifier on the grounds that rumqttc "cannot be handed a stream the app has already verified". The stream half is true and still holds — `EventLoop::new` takes only `MqttOptions` and a channel capacity, and `framed::Network` is a private module — but it was never the reason, and leaving it stated as one is how this decision gets made wrongly again. `TlsConfiguration::Rustls(Arc<ClientConfig>)` (`lib.rs:356`) accepts our config directly, verifier included, with no change to rumqttc's source. The **only** real blocker on the unvendored path is that the feature which enables it drags in a second rustls-webpki (0.102.8 beside 0.103.13), failing the CI dependency-tree step. Vendoring rumqttc fixes exactly that one dependency line — which is what option 2b was, costed and rejected below on other grounds | `src/mqtt.rs`, `src/main.rs`, `Cargo.toml` | 5.5 d |
 | **#2 Camera: done.** `AnchoredConnector::connect_stream` — the same call FTPS makes, extracted as an inherent method so a non-FTP caller need not reach through a vendored FTP client's trait to open a socket — replaces the native-tls connector, and the handshake is checked before `auth_packet` is written. Built on `config_for_new_session` rather than the planned `Resumption::disabled()` constructor: a per-session store reaches the same end (5.3) | `src/camera.rs`, `src/tls/connector.rs` | done |
 | **Tests:** camera done — three in `src/camera.rs`. A leaf from another authority, and a genuine printer leaf for a different serial, each leave zero TLS records of content type 23 on the wire and record `Refused` with the reason, which separates "did not write because it refused" from "did not write because the socket died". A positive control asserts the accepted case writes exactly one such record carrying the 80-byte auth packet, through the same server and the same counting code, and pins `TLSv1_2` so the count cannot quietly stop meaning anything. MQTT equivalents remain | `src/camera.rs`, `src/tls/testkit.rs` | camera done |
-| **As each lands:** the `danger_*` CI grep took `src/camera.rs` with #2, and covers all of `src` once #1 lands; `native-tls` and its comment come out of `Cargo.toml` with #1, leaving `rumqttc` no TLS feature. README Security notes now describe 990 and 6000 as verified and 8883 as not. `tests/source_rules.rs` mirrors the CI grep and must be changed with it | `Cargo.toml`, CI, `README.md`, `tests/source_rules.rs` | #1 remaining |
+| **Both landed.** The `danger_*` CI grep took `src/camera.rs` with #2 and all of `src` with #1; `native-tls` and its comment left `Cargo.toml` with #1, leaving `rumqttc` no TLS feature and taking 11 other crates out of the lock. README Security notes describe 990, 6000 and 8883 as verified. `tests/source_rules.rs` mirrors the CI grep and was widened in the same commit | `Cargo.toml`, CI, `README.md`, `tests/source_rules.rs` | done |
 
 **Decision (owner, 2026-09-17): option 2a.** Three transports were costed in parallel, and each report was then checked by an adversarial reviewer against real dependency trees built on scratch copies of the manifest. All three cleared the hard constraints — no aws-lc-rs, exactly one rustls-webpki — so the constraints did not decide it.
 
@@ -1690,7 +1696,7 @@ Before the `rumqttc` change, the lock compiled both ring and aws-lc-rs, and `Cli
 
 **Decision (G2, owner, 2026-09-15):** approved with conditions, then CA anchoring adopted and approved (10.3). The MVP uses rustls (ring provider, TLS 1.2 only) with a resumption store per FTP session and a verifier anchored on `BBL CA` and bound to the serial, as specified in 5.3.
 - **Justification: performance.** The gain is for many small files inside one open session; bulk downloads and connect + login do not improve.
-- **Security:** FTPS gets real verification, and the camera got the same verifier when issue #2 landed. LAN credential theft stays open on MQTT until issue #1.
+- **Security:** FTPS gets real verification, and the camera (#2, `29102cc`) and MQTT (#1, `2ae6e39`) got the same verifier. LAN credential theft is closed on all three ports.
 - **Plan B** (native-tls with pinning) is not an equivalent fallback, because its signature-check assumption was never tested. If rustls were blocked, the app would keep today's behaviour and say so.
 
 
@@ -1705,10 +1711,10 @@ Before the `rumqttc` change, the lock compiled both ring and aws-lc-rs, and `Cli
 | rustls resumption stops working (firmware change, config regression) | resumed on every rustls data connection on all three printers (P1S: 7 full, 64 resumed; 148-byte ticket on the wire) | Each session's resumption store with N = 64; `handshake_kind()` and `protocol_version()` checks and T22 (5.3); keep one session open while a grid loads |
 | The verifier accepts an impostor | the leaf is public (sent in every handshake); `BBL CA` issues every legacy printer's leaf and also signed certificates that are not leaves | Two signatures, both required (the anchor's key over the TBS, the leaf's key over the handshake); CN == configured serial as a hard check after the anchor signature; nothing learned from connections; T4-T15 (5.3). Residual: the printer's own private key or the `BBL CA` key; no revocation exists for this CA |
 | A legitimate printer is refused | `BBL CA` expires 2032-04-01 and the leaves in 2035; firmware could move a model to `BBL CA2`; whether a board replacement keeps the serial was not verified | Expiry not checked, as a requirement (T8); the refusal card lists the causes and offers Edit printer; a board that keeps its serial passes; a new anchor ships in an app release if a model moves to another authority |
-| Access code stolen through the camera or MQTT | `mqtt.rs:45-53` accepts any certificate and sends the access code | Camera closed by issue #2: it opens through the FTPS verifier, and three tests assert a refused certificate receives no application-data record at all. MQTT open until issue #1 (10.5): same verifier, same certificate |
+| Access code stolen through the camera or MQTT | both accepted any certificate in the MVP and sent the access code to whoever answered | Closed on both. Camera (#2, `29102cc`): three tests assert a refused certificate receives no application-data record at all. MQTT (#1, `2ae6e39`): the same verifier, plus a SUBSCRIBE that must be acknowledged for the identifier sent and granted, so a broker that acknowledges while granting nothing is an error rather than silence read as idleness |
 | Someone "simplifies" the verifier to rustls' helper, or to webpki with `BBL CA` as root | webpki rejects X.509 v1 with `UnsupportedCertVersion`, and every owner printer's leaf is v1 | Code comment in `verify_tls12_signature`; the v1 tests in T3 and T13 fail; the T13 source scan; no direct rustls-webpki dependency (5.3) |
 | The `tls12` feature or the TLS 1.2 version list is dropped | the printers negotiate only TLS 1.2; suppaftp and ureq also enable the feature today, which hides a removal | `Cargo.toml` comment; CI asserts `protocol_version() == TLSv1_2` next to `handshake_kind() == Resumed` (T22) |
-| The FTPS native-tls path comes back | `files.rs:174-179` uses `danger_*` today | Deleted when the verifier lands; suppaftp without `native-tls`; CI grep for `danger_*` in the FTPS code (T24) |
+| The FTPS native-tls path comes back | `files.rs:174-179` used `danger_*` before the verifier landed; that path is deleted | suppaftp without `native-tls`; CI greps all of `src` and the vendored suppaftp for `danger_*`, mirrored by `tests/source_rules.rs` (T24) |
 | A dependency or later code sets a process-default crypto provider, or a second provider or TLS crate enters the tree | ring and aws-lc-rs were both compiled before the `rumqttc` change; ureq adopts a process default | clippy `disallowed-methods`, CI grep, `rumqttc` without default features, `cargo tree` checks (5.3; T23, T24) |
 | Certificate errors lost or attributed to the wrong connection | suppaftp 10.0.2 turns connector and LIST data errors into strings / `BadResponse`; two lanes share one verifier | Per-connection records filled below suppaftp; no shared slots; a verifier without state; no retry on TLS errors; T17-T20 (5.3) |
 | The configured serial is wrong or comes from an untrusted source | the CN binding is only as good as the serial it is compared with | The serial is typed by the user from the printer screen or label and never filled in from discovery; the refusal card points to the settings (5.3) |
