@@ -15,7 +15,8 @@
 //!   and carry nothing;
 //! - the scenes leave the view nothing to ask for: a thumbnail is always in
 //!   flight, previews are already read, recordings already listed. The
-//!   matrix asserts afterwards that no worker ever opened a session.
+//!   matrix asserts afterwards that no worker opened a session and that the
+//!   view left no preview waiting on one.
 //!
 //! Matrix: `BAMBU_SNAPSHOT_DIR=<dir> cargo test snapshots::screenshot_matrix
 //! -- --ignored` (`BAMBU_SNAPSHOT_ONLY=panel,dlg-skip` narrows it). Diff:
@@ -301,6 +302,10 @@ fn shoot(ctx: &egui::Context, pixels: [usize; 2], zoom: f32,
         let out = ctx.run_ui(raw_input(points, step as f64, input),
                              &mut draw);
         raster.apply(&out.textures_delta);
+        // egui paints an id clash as a "🔥" note in debug builds: a shot
+        // that has one fails, so the matrix is the E6 check too
+        let clash = clash_note(&out.shapes);
+        assert!(clash.is_none(), "id clash in the shot: {clash:?}");
         if last {
             let primitives = ctx.tessellate(out.shapes,
                                             out.pixels_per_point);
@@ -309,6 +314,19 @@ fn shoot(ctx: &egui::Context, pixels: [usize; 2], zoom: f32,
         raster.free(&out.textures_delta);
     }
     canvas.image()
+}
+
+/// The first "🔥" note egui painted, if any.
+fn clash_note(shapes: &[egui::epaint::ClippedShape]) -> Option<String> {
+    fn walk(shape: &egui::Shape) -> Option<String> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text().starts_with('🔥') =>
+                Some(text.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    shapes.iter().find_map(|clipped| walk(&clipped.shape))
 }
 
 // --------------------------------------------------------------- fixtures
@@ -571,6 +589,7 @@ fn printer_ui(ctx: &egui::Context, cache: &Arc<cache::Cache>,
         player: None,
         player_tex: None,
         player_error: None,
+        open_error: None,
         shell_openable: RefCell::new(HashMap::new()),
         job_bundle: None,
         plate_texture: None,
@@ -668,13 +687,13 @@ const MATRIX: [&str; 13] = [
 ];
 
 /// States the stages look at beyond the matrix, at the two smaller sizes.
-const EXTRAS: [&str; 21] = [
+const EXTRAS: [&str; 23] = [
     "chips-six", "panel-firmware", "files-loading", "files-empty",
     "files-error", "files-refusal", "files-folders", "files-gcode",
     "dlg-add", "dlg-temp", "dlg-speed", "dlg-fans", "dlg-confirm-stop",
     "dlg-confirm-remove", "dlg-hms", "no-printers", "dlg-skip-many",
     "dlg-skip-confirm", "files-failed-four", "files-long-name",
-    "files-printing",
+    "files-printing", "files-open-error", "files-companion",
 ];
 
 fn files_scene(app: &mut App, tab: Tab) -> &mut PrinterUi {
@@ -885,6 +904,21 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
             let printer = &mut app.printers[1];
             printer.browser = browsed();
         }
+        "files-open-error" => {
+            files_scene(&mut app, Tab::Recordings).open_error = Some(
+                "couldn't open the file (no program is associated with it)"
+                    .to_string());
+            app.config_error = Some(
+                "settings couldn't be saved: access denied".to_string());
+        }
+        "files-companion" => {
+            let printer = files_scene(&mut app, Tab::Files);
+            let path = "/cache/job.3mf";
+            printer.files.selected = Some(path.to_string());
+            // already read, so the view has nothing to ask the worker for
+            printer.browser.details.insert(path.to_string(),
+                DetailState::Ready(Box::new(three_mf())));
+        }
         other => panic!("no scene {other:?}"),
     }
     Scene { app, _dir: dir }
@@ -1032,6 +1066,12 @@ fn screenshot_matrix() {
         for printer in &scene.app.printers {
             assert_eq!(printer.ftp.status().sessions_opened, 0,
                        "{name}: a worker opened an FTP session");
+            // a preview in Loading is one the view asked the worker for;
+            // the session count alone passes when the connect is still
+            // under way, so this is the check that holds
+            assert!(!printer.browser.details.values()
+                        .any(|detail| matches!(detail, DetailState::Loading)),
+                    "{name}: the view asked the worker for a preview");
         }
         image.save(dir.join(file_name(name, size, zoom)))
             .expect("write the PNG");
@@ -1141,4 +1181,61 @@ fn a_context_shot_twice_is_refused() {
     let first = shoot(&ctx, [8, 8], 1.0, Vec::new(), draw);
     assert_eq!(first.get_pixel(4, 4).0, [255, 255, 255, 255]);
     shoot(&ctx, [8, 8], 1.0, Vec::new(), draw);
+}
+
+/// The control for the clash check in `shoot`: two widgets under one id
+/// fail the shot.
+#[test]
+#[should_panic(expected = "id clash in the shot")]
+fn an_id_clash_fails_the_shot() {
+    let ctx = context(1.0);
+    shoot(&ctx, [64, 64], 1.0, Vec::new(), |ui| {
+        let id = egui::Id::new("twice");
+        let _ = ui.interact(Rect::from_min_size(Pos2::ZERO, vec2(8.0, 8.0)),
+                            id, egui::Sense::click());
+        let _ = ui.interact(Rect::from_min_size(pos2(20.0, 20.0),
+                                                vec2(8.0, 8.0)),
+                            id, egui::Sense::click());
+    });
+}
+
+/// D12: Skip objects stays open when a new job clears its bundle, and says
+/// why, instead of vanishing.
+#[test]
+fn skip_objects_explains_a_bundle_that_went() {
+    let ctx = context(1.0);
+    let mut scene = scene("dlg-skip", &ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut run = |scene: &mut Scene| {
+        let mut painted = Vec::new();
+        for step in 0..FRAMES {
+            let out = ctx.run_ui(raw_input(vec2(1080.0, 780.0), step as f64,
+                                           Vec::new()),
+                                 |ui| scene.app.ui(ui, &mut frame));
+            painted.clear();
+            fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(text) =>
+                        found.push(text.galley.text().to_string()),
+                    egui::Shape::Vec(shapes) =>
+                        shapes.iter().for_each(|shape| walk(shape, found)),
+                    _ => {}
+                }
+            }
+            out.shapes.iter().for_each(|clipped| walk(&clipped.shape,
+                                                      &mut painted));
+        }
+        painted
+    };
+    // the control: with its bundle, the dialog lists the objects
+    let painted = run(&mut scene);
+    assert!(painted.iter().any(|text| text.starts_with("Objects on plate")),
+            "{painted:?}");
+    scene.app.printers[1].job_bundle = None;
+    let painted = run(&mut scene);
+    assert!(painted.iter().any(|text|
+                text == "The print changed; there are no objects to skip."),
+            "{painted:?}");
+    assert!(matches!(scene.app.dialog, Dialog::Skip(_)),
+            "the dialog closed");
 }

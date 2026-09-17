@@ -75,6 +75,9 @@ struct PrinterUi {
     /// when the OS player is the way out of it (section 7, option B). An
     /// empty recording has nothing to open, so it carries no path.
     player_error: Option<(String, Option<PathBuf>)>,
+    /// why "Open in player" or "Show in folder" last failed, shown in the
+    /// files view until Back or the next one that works (C3)
+    open_error: Option<String>,
     /// which local files may be handed to the Windows shell, answered by
     /// `player::openable_by_shell` and remembered here: the verdict reads
     /// the file's first bytes, and the view asks for it while painting
@@ -129,6 +132,7 @@ impl PrinterUi {
             player: None,
             player_tex: None,
             player_error: None,
+            open_error: None,
             shell_openable: RefCell::new(HashMap::new()),
             job_bundle: None,
             plate_texture: None,
@@ -571,7 +575,7 @@ impl App {
             // the fields are split apart here so the view can change the
             // browser state while it reads the player next to it
             let PrinterUi { cfg, browser, files, player, player_tex,
-                            player_error, .. } = printer;
+                            player_error, open_error, .. } = printer;
             let player_view = player.as_ref().map(|player| {
                 files_view::PlayerView {
                     title: player.path().file_name()
@@ -603,6 +607,7 @@ impl App {
                     .map(|(text, _)| text.as_str()),
                 player_error_path: player_error.as_ref()
                     .and_then(|(_, path)| path.as_deref()),
+                open_error: open_error.as_deref(),
             };
             let out = files_view::show(ui, browser, files, &view);
             (out.actions, out.cmds)
@@ -613,6 +618,7 @@ impl App {
         for action in actions {
             match action {
                 files_view::Action::Back => {
+                    self.printers[selected].open_error = None;
                     self.printers[selected].files.close();
                     self.printers[selected].close_player();
                     self.view = AppView::Panel;
@@ -627,17 +633,17 @@ impl App {
                     }
                 }
                 // the OS player and Explorer (design doc 7, option B)
+                // a failure is said in the files view, where it happened,
+                // and not in the settings-error slot above every page (C3)
                 files_view::Action::OpenExternally(path) => {
-                    if let Err(e) = opener::open(&path) {
-                        self.config_error =
-                            Some(format!("couldn't open the file ({e})"));
-                    }
+                    self.printers[selected].open_error = opener::open(&path)
+                        .err()
+                        .map(|e| format!("couldn't open the file ({e})"));
                 }
                 files_view::Action::Reveal(path) => {
-                    if let Err(e) = opener::reveal(&path) {
-                        self.config_error =
-                            Some(format!("couldn't show the file ({e})"));
-                    }
+                    self.printers[selected].open_error = opener::reveal(&path)
+                        .err()
+                        .map(|e| format!("couldn't show the file ({e})"));
                 }
                 files_view::Action::ClearCache => {
                     // it skips the file the player has open (5.6)
@@ -1019,7 +1025,12 @@ impl App {
             }
             Dialog::Skip(mut dlg) => {
                 let printer = &self.printers[self.selected];
+                // a new job cleared the bundle while the dialog was open:
+                // it says so and waits for Close instead of vanishing (D12)
                 let Some(bundle) = printer.job_bundle.clone() else {
+                    if !dialogs::show_skip_gone(ctx) {
+                        self.dialog = Dialog::Skip(dlg);
+                    }
                     return;
                 };
                 let live: HashSet<i64> = {
@@ -1373,7 +1384,10 @@ impl eframe::App for App {
                 .inner_margin(pad::PAGE))
             .show(root, |ui| {
                 if let Some(error) = &self.config_error {
-                    ui.label(RichText::new(error).color(theme::DANGER));
+                    ui.push_id("settings-error", |ui| {
+                        ui::widgets::banner(ui, ui::widgets::Tone::Danger,
+                                            None, error);
+                    });
                 }
                 // the files view is a full page, outside the panel's
                 // ScrollArea: a nested show_rows inside it would break the
@@ -1382,7 +1396,11 @@ impl eframe::App for App {
                     self.show_files(ui, ctx);
                     return;
                 }
-                egui::ScrollArea::vertical().auto_shrink(false)
+                // one scroll offset per printer (E1, D06)
+                let panel_salt = ("panel", self.printers.get(self.selected)
+                    .map(|printer| printer.cfg.serial.clone()));
+                egui::ScrollArea::vertical().id_salt(panel_salt)
+                    .auto_shrink(false)
                     .show(ui, |ui| {
                 if self.printers.is_empty() {
                     ui.centered_and_justified(|ui| {

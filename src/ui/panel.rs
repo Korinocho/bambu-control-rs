@@ -216,13 +216,14 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
             ui.horizontal(|ui| {
                 let color_hex = tray.get("tray_color")
                     .and_then(|v| v.as_str()).unwrap_or("");
-                let color = if color_hex.len() >= 6 {
-                    let parse =
-                        |i| u8::from_str_radix(&color_hex[i..i + 2], 16)
-                            .unwrap_or(theme::SWATCH_UNKNOWN.r());
-                    theme::reported([parse(0), parse(2), parse(4)])
-                } else {
-                    theme::SWATCH_UNKNOWN
+                // the colour comes off the network: `get` never cuts a
+                // character in half, and a colour is read whole or not at
+                // all (E39, D16)
+                let channel = |at: usize| color_hex.get(at..at + 2)
+                    .and_then(|pair| u8::from_str_radix(pair, 16).ok());
+                let color = match (channel(0), channel(2), channel(4)) {
+                    (Some(r), Some(g), Some(b)) => theme::reported([r, g, b]),
+                    _ => theme::SWATCH_UNKNOWN,
                 };
                 let (rect, _) = ui.allocate_exact_size(
                     Vec2::splat(size::SWATCH), Sense::hover());
@@ -261,7 +262,11 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
                 .or_else(|| unit.get("id").and_then(|v| v.as_str())
                     .and_then(|s| s.parse().ok()))
                 .unwrap_or(0);
-            let letter = (b'A' + uid as u8) as char;
+            // a unit id past Z reads "?" instead of overflowing (E39)
+            let letter = u8::try_from(uid).ok()
+                .and_then(|id| b'A'.checked_add(id))
+                .filter(u8::is_ascii_uppercase)
+                .map_or('?', char::from);
             for tray in unit.get("tray").and_then(|v| v.as_array())
                 .cloned().unwrap_or_default()
             {
@@ -269,8 +274,9 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
                     .or_else(|| tray.get("id").and_then(|v| v.as_str())
                         .and_then(|s| s.parse().ok()))
                     .unwrap_or(0);
-                let global = uid * 4 + tid;
-                slot_row(ui, format!("{letter}{}", tid + 1), &tray,
+                let global = uid.saturating_mul(4).saturating_add(tid);
+                slot_row(ui, format!("{letter}{}", tid.saturating_add(1)),
+                         &tray,
                          tray_now == global.to_string());
                 shown = true;
             }
@@ -724,5 +730,27 @@ mod tests {
                            "{width}: {left} {a:?} and {right} {b:?}");
             }
         }
+    }
+
+    /// E39, D16: a filament colour that is not ASCII hex and a unit id past
+    /// the alphabet render, and nothing panics (release aborts on a panic).
+    #[test]
+    fn hostile_ams_fields_render_without_panicking() {
+        let mut state = idle();
+        state.insert("ams".to_string(), json!({
+            "ams": [{ "id": "255", "tray": [
+                { "id": "0", "tray_type": "PLA", "tray_color": "aÁÉÍxx" },
+                { "id": 9223372036854775807i64, "tray_type": "PETG",
+                  "tray_color": "zz" },
+            ]}],
+            "tray_now": "1",
+        }));
+        let painted = render(900.0, &state);
+        // unit 255 has no letter; the slots still render, and name their
+        // filament
+        assert!(painted.texts.iter().any(|(text, _)| text == "?1   PLA"),
+                "{:?}", painted.texts.iter().map(|(t, _)| t)
+                    .collect::<Vec<_>>());
+        assert!(painted.texts.iter().any(|(text, _)| text.ends_with("PETG")));
     }
 }

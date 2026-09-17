@@ -268,6 +268,62 @@ fn the_token_scan_finds_each_kind_of_literal() {
     assert_eq!(lines, (1..=16).collect::<Vec<_>>(), "{found:#?}");
 }
 
+/// Every `ScrollArea` statement names its state with `id_salt` before it is
+/// shown (E1), and no `push_id` is keyed by a row index (E2). Returns what
+/// breaks either rule.
+fn identity_hits(file: &Path, text: &str) -> Vec<String> {
+    let scroll = regex_lite::Regex::new(
+        r"ScrollArea::(vertical|horizontal|both)\(\)").expect("pattern");
+    let show = regex_lite::Regex::new(r"\.show(_viewport|_rows)?\(")
+        .expect("pattern");
+    let by_index = regex_lite::Regex::new(r"push_id\(\s*(row|index|i)\s*,")
+        .expect("pattern");
+    let line_of = |at: usize| text[..at].lines().count();
+    let mut found = Vec::new();
+    for start in scroll.find_iter(text) {
+        let statement = match show.find(&text[start.end()..]) {
+            Some(end) => &text[start.end()..start.end() + end.start()],
+            None => &text[start.end()..],
+        };
+        if !statement.contains(".id_salt(") {
+            found.push(format!("{}:{}: ScrollArea without id_salt",
+                               file.display(), line_of(start.start())));
+        }
+    }
+    for hit in by_index.find_iter(text) {
+        found.push(format!("{}:{}: push_id keyed by an index",
+                           file.display(), line_of(hit.start())));
+    }
+    found
+}
+
+/// E1, E2: scroll state and row ids have names of their own.
+#[test]
+fn ui_state_is_keyed_by_identity() {
+    let sources = ui_production_sources();
+    let scrolls = sources.iter()
+        .map(|(_, text)| text.matches("ScrollArea::vertical()").count())
+        .sum::<usize>();
+    assert!(scrolls >= 8, "only {scrolls} scroll areas scanned");
+    let found: Vec<String> = sources.iter()
+        .flat_map(|(file, text)| identity_hits(file, text))
+        .collect();
+    assert!(found.is_empty(), "unnamed state:\n{}", found.join("\n"));
+}
+
+/// The control for the scan above.
+#[test]
+fn the_identity_scan_finds_unnamed_state() {
+    let sample = "\
+        egui::ScrollArea::vertical().max_height(9.0).show(ui, |ui| {});\n\
+        egui::ScrollArea::vertical().id_salt(\"x\").show(ui, |ui| {});\n\
+        ui.push_id(row, |ui| {});\n\
+        ui.push_id(transfer.id, |ui| {});\n";
+    let found = identity_hits(Path::new("sample.rs"), sample);
+    assert_eq!(found, ["sample.rs:1: ScrollArea without id_salt",
+                       "sample.rs:3: push_id keyed by an index"]);
+}
+
 /// T24 (the CI grep, locally): no certificate checks disabled anywhere.
 ///
 /// Every path to a printer verifies now -- FTPS on 990, the camera on 6000

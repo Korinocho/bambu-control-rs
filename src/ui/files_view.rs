@@ -236,6 +236,9 @@ pub struct View<'a> {
     /// the local file that error is about, so the fallback can still offer
     /// "Open in player" and "Show in folder" for it (section 7)
     pub player_error_path: Option<&'a Path>,
+    /// why the last "Open in player" or "Show in folder" failed; `main.rs`
+    /// clears it on Back and on the next one that works (C3)
+    pub open_error: Option<&'a str>,
 }
 
 /// Where a remote file's complete copy is in the disk cache, if it is there
@@ -342,12 +345,26 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     }
     files.close_focused = false;
 
+    // Each block that comes and goes has an id scope of its own, so its
+    // appearing never renumbers the widgets after it: the filter kept
+    // losing its focus and cursor when one did (E3, D05).
     if let Some(notice) = not_tested_notice(view.serial, view.profile) {
-        banner(ui, theme::WARN, theme::WARN_BG, &notice);
+        ui.push_id("not-tested", |ui| {
+            widgets::banner(ui, widgets::Tone::Warn, None, &notice);
+        });
     }
     status_line(ui, state, view, &mut out);
     if let Some(error) = state.error.clone() {
-        error_card(ui, &error, view.serial, &mut out);
+        ui.push_id("error-card", |ui| {
+            error_card(ui, &error, view.serial, &mut out);
+        });
+    }
+    // "couldn't open the file": said here, where it happened, until Back
+    // or the next open that works (C3, D22)
+    if let Some(error) = view.open_error {
+        ui.push_id("open-error", |ui| {
+            widgets::banner(ui, widgets::Tone::Danger, None, error);
+        });
     }
     // the player takes over the grid area; Back returns to the grid
     // (section 6)
@@ -365,12 +382,14 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     // the file could not be played here: the OS player is the way out
     // (5.10, section 7 option B)
     if let Some(note) = view.player_error {
-        ui.add_space(space::XS);
-        player_error_card(ui, view, note, view.player_error_path,
-                          &mut out);
+        ui.push_id("player-error", |ui| {
+            ui.add_space(space::XS);
+            player_error_card(ui, view, note, view.player_error_path,
+                              &mut out);
+        });
     }
     ui.add_space(space::XS);
-    controls(ui, files);
+    ui.push_id("controls", |ui| controls(ui, files, view.serial));
     ui.add_space(space::S);
 
     if files.tab == Tab::Recordings {
@@ -379,9 +398,11 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     // the tabs list the unreadable entries they cannot show (5.10)
     let damaged = damaged_dirs(state, files.tab);
     for (dir, count) in &damaged {
-        banner(ui, theme::WARN, theme::WARN_BG, &format!(
-            "{count} entries in {dir} can't be read; the SD card's file \
-             system looks damaged"));
+        ui.push_id(("damaged", dir), |ui| {
+            widgets::banner(ui, widgets::Tone::Warn, None, &format!(
+                "{count} entries in {dir} can't be read; the SD card's file \
+                 system looks damaged"));
+        });
     }
     // that banner already gives the reason, so nothing repeats it below
     let damaged = !damaged.is_empty();
@@ -399,8 +420,10 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         && !damaged
         && let Some(notice) = state.timelapse_notice()
     {
-        banner(ui, theme::TEXT_DIM, theme::CARD, notice);
-        ui.add_space(space::XS);
+        ui.push_id("orphan-notice", |ui| {
+            widgets::banner(ui, widgets::Tone::Neutral, None, notice);
+            ui.add_space(space::XS);
+        });
     }
     let rows = build_rows(state, files, columns, view.serial, damaged);
     // the transfer bar and the cache line sit below the grid, so the list
@@ -738,7 +761,7 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
             + size::SPEED_COMBO_W + os_w + 4.0 * gap;
         let last = frames.saturating_sub(1) as u32;
         let mut at = player.pos.min(last);
-        let slider = ui.scope(|ui| {
+        let slider = ui.push_id(("player-seek", view.serial), |ui| {
             ui.spacing_mut().slider_width =
                 (ui.available_width() - taken).max(0.0);
             ui.add(egui::Slider::new(&mut at, 0..=last).show_value(false))
@@ -752,7 +775,7 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
             clock_text(player.index.duration_s())))
             .color(theme::TEXT_DIM), &caption, Align::Min);
         // Display on an f32 drops the trailing ".0", so these read 1x, 10x
-        egui::ComboBox::from_id_salt("player-speed")
+        egui::ComboBox::from_id_salt(("player-speed", view.serial))
             .width(size::SPEED_COMBO_W)
             .selected_text(format!("{}x", player.speed))
             .show_ui(ui, |ui| {
@@ -1009,15 +1032,19 @@ fn status_line(ui: &mut Ui, state: &BrowserState, view: &View<'_>,
         });
 }
 
-fn controls(ui: &mut Ui, files: &mut FilesUi) {
+/// The filter, the sort and the kind filters. Their state is salted with
+/// the printer, so a popup or a cursor never follows the view to another
+/// printer (E4).
+fn controls(ui: &mut Ui, files: &mut FilesUi, serial: &str) {
     // the kind filters move to a second line when the window is too narrow
     // for them: a row wider than the page widens everything below it, and
     // the transfer bar's ✕ went past the right edge (A14)
     ui.horizontal_wrapped(|ui| {
         ui.add(egui::TextEdit::singleline(&mut files.filter)
+            .id_salt(("files-filter", serial))
             .hint_text("filter…")
             .desired_width(size::FILTER_W));
-        egui::ComboBox::from_id_salt("files-sort")
+        egui::ComboBox::from_id_salt(("files-sort", serial))
             .selected_text(format!("Sort: {}", files.sort.label()))
             .show_ui(ui, |ui| {
                 for sort in [Sort::Newest, Sort::Name, Sort::Size] {
@@ -1032,18 +1059,6 @@ fn controls(ui: &mut Ui, files: &mut FilesUi) {
             }
         }
     });
-}
-
-fn banner(ui: &mut Ui, color: Color32, background: Color32, text: &str) {
-    egui::Frame::new()
-        .fill(background)
-        .corner_radius(radius::CONTROL)
-        .inner_margin(pad::BANNER)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(text).color(color)
-                .font(font::caption())).wrap());
-        });
 }
 
 /// The error card of 5.10: the condition's text and a Retry. Never a spinner
@@ -1455,7 +1470,10 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     let heights: Vec<f32> = rows.rows.iter()
         .map(|row| by_kind[row_kind(row)])
         .collect();
-    let measured = virtual_rows(ui, &heights, |ui, index| {
+    let ids = row_ids(state, files.tab, rows);
+    // one scroll offset per printer and per tab (E1, D06)
+    let list_salt = ("files-list", view.serial, files.tab as u8);
+    let measured = virtual_rows(ui, list_salt, &heights, &ids, |ui, index| {
         match &rows.rows[index] {
             Row::Heading(text) => {
                 ui.label(RichText::new(text).color(theme::TEXT_DIM)
@@ -1535,6 +1553,40 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     }
 }
 
+/// A stable identity for each row (E2): what it shows, never its index,
+/// counted when two rows say the same thing ("(empty)" in two folders).
+fn row_ids(state: &BrowserState, tab: Tab, rows: &Rows) -> Vec<egui::Id> {
+    let mut seen: HashMap<egui::Id, u32> = HashMap::new();
+    rows.rows.iter()
+        .map(|row| {
+            let base = match row {
+                Row::Heading(text) => egui::Id::new(("heading", text)),
+                Row::Tiles(tiles) => egui::Id::new(("tiles",
+                    tiles.first().and_then(|at| state.timelapses.get(*at))
+                        .map(|item| item.stem()))),
+                Row::Item(at) | Row::Companion(at) => {
+                    let index = rows.order.get(*at).copied();
+                    let path = match tab {
+                        Tab::Recordings => index
+                            .and_then(|i| state.recordings.get(i))
+                            .map(|entry| entry.path.as_str()),
+                        _ => index.and_then(|i| state.files.get(i))
+                            .map(|item| item.remote.path.as_str()),
+                    };
+                    egui::Id::new(("entry", path))
+                }
+                Row::Folder { entry, .. } =>
+                    egui::Id::new(("folder", &entry.path)),
+                Row::Note(text) => egui::Id::new(("note", text)),
+                Row::Skeleton => egui::Id::new("skeleton"),
+            };
+            let count = seen.entry(base).or_default();
+            *count += 1;
+            base.with(*count)
+        })
+        .collect()
+}
+
 /// The variant of `ScrollArea::show_rows` this view needs: its rows have
 /// different heights (month headings, tile rows, companions), and it must
 /// not nest inside the outer `ScrollArea` (section 6), which is why the
@@ -1545,8 +1597,9 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
 /// caller never feeds it back: a row that
 /// painted taller than declared would shorten the scroll range, so the
 /// declared heights are built to be exact instead (1.8).
-fn virtual_rows(ui: &mut Ui, heights: &[f32],
-                mut render: impl FnMut(&mut Ui, usize))
+fn virtual_rows(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::Debug,
+                heights: &[f32],
+                ids: &[egui::Id], mut render: impl FnMut(&mut Ui, usize))
                 -> Vec<(usize, f32)> {
     let spacing = ui.spacing().item_spacing.y;
     let mut offsets: Vec<f32> = Vec::with_capacity(heights.len() + 1);
@@ -1559,6 +1612,7 @@ fn virtual_rows(ui: &mut Ui, heights: &[f32],
     let total = (y - spacing).max(0.0);
     let mut measured: Vec<(usize, f32)> = Vec::new();
     egui::ScrollArea::vertical()
+        .id_salt(salt)
         .auto_shrink(false)
         .show_viewport(ui, |ui, viewport| {
             ui.set_height(total);
@@ -1580,7 +1634,9 @@ fn virtual_rows(ui: &mut Ui, heights: &[f32],
                 for (row, &height) in heights.iter().enumerate()
                     .take(last).skip(first)
                 {
-                    let placed = ui.push_id(row, |ui| {
+                    // keyed by what the row shows, not where it is, so its
+                    // widgets keep their state when rows above it change
+                    let placed = ui.push_id(ids[row], |ui| {
                         ui.allocate_ui_with_layout(
                             vec2(ui.available_width(), height),
                             egui::Layout::top_down(egui::Align::Min),
@@ -1920,8 +1976,13 @@ fn file_row(ui: &mut Ui, files: &mut FilesUi, item: &FileItem,
         let plate = item.plate_hint
             .map(|plate| format!(" (plate {plate})"))
             .unwrap_or_default();
+        let selected = files.selected.as_deref()
+            == Some(item.remote.path.as_str());
         ui.horizontal(|ui| {
             ui.add_space(space::XL);
+            // the selection is painted behind the line, in the row's own
+            // colours, so selecting it shows and moves nothing (C11, D21)
+            let backdrop = ui.painter().add(egui::Shape::Noop);
             let text = format!("↳ printer's extracted copy: {}  {}{plate}",
                                item.remote.name,
                                human_bytes(item.remote.size));
@@ -1929,7 +1990,19 @@ fn file_row(ui: &mut Ui, files: &mut FilesUi, item: &FileItem,
             let response = ui.add(egui::Label::new(RichText::new(text)
                 .color(theme::TEXT_DIM).font(font::caption()))
                 .sense(Sense::click())
-                .truncate());
+                .truncate())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if selected {
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(response.rect.min.x - pad::ROW.leftf(),
+                               ui.min_rect().min.y),
+                    egui::pos2(ui.max_rect().max.x, ui.min_rect().max.y));
+                ui.painter().set(backdrop, egui::Shape::Rect(
+                    egui::epaint::RectShape::new(
+                        rect, radius::CONTROL, theme::CARD_HOVER,
+                        Stroke::new(stroke::SELECTED, theme::ACCENT),
+                        egui::StrokeKind::Inside)));
+            }
             if response.clicked() {
                 files.selected = Some(item.remote.path.clone());
             }
@@ -1987,6 +2060,8 @@ enum Selected {
     File(Box<FileItem>),
     /// an "Other folder" entry
     Entry(RemoteEntry),
+    /// selected, but not in the latest listing: a refresh dropped it
+    Gone(String),
     None,
 }
 
@@ -2024,7 +2099,8 @@ fn selection(state: &BrowserState, files: &FilesUi) -> Selected {
         })
         .flatten()
         .find(|entry| entry.path == selected)
-        .map_or(Selected::None, |entry| Selected::Entry(entry.clone()))
+        .map_or_else(|| Selected::Gone(selected.to_string()),
+                     |entry| Selected::Entry(entry.clone()))
 }
 
 /// Timelapses and `/ipcam` recordings are AVI. The player sniffs the real
@@ -2072,6 +2148,16 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         match picked {
             Selected::None => {
                 ui.label(RichText::new("Select a file to see its details.")
+                    .color(theme::TEXT_DIM).font(font::caption()));
+            }
+            // the pane says the file went, instead of falling back to
+            // "Select a file" while it stays selected (C12, D21)
+            Selected::Gone(path) => {
+                let name = path.rsplit('/').next().unwrap_or(&path);
+                ui.add(egui::Label::new(RichText::new(name)
+                    .font(font::body_strong())).wrap());
+                ui.add_space(space::XS);
+                ui.label(RichText::new("Not in the latest listing.")
                     .color(theme::TEXT_DIM).font(font::caption()));
             }
             Selected::Timelapse { stem, video, thumb, started, ended } => {
@@ -2682,7 +2768,8 @@ mod tests {
                open_sessions: 0, printing: false, dialog_open: false, now,
                cache_usage: 0, cache_cap: 5 * 1024 * 1024 * 1024,
                cached: None, shell_openable: None,
-               player: None, player_error: None, player_error_path: None }
+               player: None, player_error: None, player_error_path: None,
+               open_error: None }
     }
 
     fn thumb_image() -> egui::ColorImage {
@@ -4193,5 +4280,101 @@ mod tests {
         assert!(title.rect.max.x <= first_tab.rect.min.x,
                 "the title {:?} runs into the tabs {:?}", title.rect,
                 first_tab.rect);
+    }
+
+    // ------------------------------------------- stage 3: identity and state
+
+    /// E3, E4, D05: typing in the filter keeps its focus while blocks above
+    /// it come and go — an error card, the open-error banner, a print.
+    #[test]
+    fn the_filter_keeps_its_focus_while_blocks_above_it_change() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let now = Instant::now();
+        click(&ctx, &mut state, &mut files, &view(P1S, now), "filter…");
+        let typed = |text: &str| egui::Event::Text(text.to_string());
+        frame(&ctx, raw(vec![typed("a")]), &mut state, &mut files,
+              &view(P1S, now));
+        // the control: the click really focused the filter
+        assert_eq!(files.filter, "a");
+
+        state.error = Some(FtpError::PortClosed);
+        let changed = View { printing: true,
+                             open_error: Some("couldn't open the file (x)"),
+                             ..view(P1S, now) };
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &changed);
+        assert!(painted.exact("Retry"), "the error card is not there");
+        frame(&ctx, raw(vec![typed("b")]), &mut state, &mut files, &changed);
+        assert_eq!(files.filter, "ab", "the filter lost its focus");
+    }
+
+    /// E1, D06: a tab and a printer each keep their own scroll offset.
+    #[test]
+    fn each_tab_and_printer_keeps_its_own_scroll_offset() {
+        let ctx = ctx();
+        let mut state = browsed_tiles(40);
+        let mut files = FilesUi::default();
+        let now = Instant::now();
+        // a tile further down: its start time says where the grid is
+        let date = "Jun 01 06:20";
+        let tile_y = |texts: &[Text]| texts.iter()
+            .filter(|text| text.text == date
+                    && text.rect.intersects(text.clip))
+            .map(|text| text.rect.min.y)
+            .fold(f32::INFINITY, f32::min);
+        let render = |state: &mut BrowserState, files: &mut FilesUi,
+                      serial: &str, events: Vec<egui::Event>| {
+            texts(&ctx, raw(events), state, files, &view(serial, now))
+        };
+        let top = tile_y(&render(&mut state, &mut files, P1S, Vec::new()));
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: Vec2::new(0.0, -4.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::default(),
+        };
+        let over = egui::Event::PointerMoved(Pos2::new(200.0, 500.0));
+        render(&mut state, &mut files, P1S, vec![over.clone(), wheel]);
+        let mut scrolled = top;
+        for _ in 0..30 {
+            scrolled = tile_y(&render(&mut state, &mut files, P1S,
+                                      vec![over.clone()]));
+        }
+        assert!(scrolled < top - 100.0, "no scroll: {top} -> {scrolled}");
+
+        // another tab, then back: the grid is where it was left
+        files.tab = Tab::Recordings;
+        render(&mut state, &mut files, P1S, Vec::new());
+        files.tab = Tab::Timelapses;
+        let back = tile_y(&render(&mut state, &mut files, P1S, Vec::new()));
+        assert_eq!(back, scrolled, "the tab switch lost the offset");
+
+        // another printer's grid starts at the top
+        let other = tile_y(&render(&mut state, &mut files, A1, Vec::new()));
+        assert_eq!(other, top, "the offset followed the view to A1");
+    }
+
+    /// C12, D21: a selection a refresh dropped says so, rather than the pane
+    /// falling back to "Select a file" while it stays selected.
+    #[test]
+    fn a_selection_the_listing_dropped_says_so() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Files);
+        files.selected = Some("/cache/gone_plate_2.gcode".to_string());
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, Instant::now()));
+        assert!(painted.exact("Not in the latest listing."),
+                "{:?}", painted.spots);
+        assert!(painted.exact("gone_plate_2.gcode"));
+        assert!(!painted.has("Select a file"));
+        // and with nothing selected, the pane still asks for a selection
+        files.selected = None;
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, Instant::now()));
+        assert!(painted.has("Select a file"));
+        assert!(!painted.has("Not in the latest listing."));
     }
 }
