@@ -2299,16 +2299,46 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         Some((found, picked)) if found == key => picked,
         _ => selection(state, files),
     };
-    // what does not fit the body scrolls inside the pane, actions included,
-    // instead of pushing them and the footer off the window (C12, D01)
+    // the actions of the selected file are pinned to the foot of the pane
+    // and the facts scroll above them, so the primary action is on screen
+    // whatever the file carries (C12, D01, decision O3)
+    let target = action_target(&picked);
+    let plan = match &target {
+        Some((remote, playable)) =>
+            actions_plan(state, view, remote, *playable),
+        None => Vec::new(),
+    };
     let inner = (height - pad::CARD.sum().y - 2.0 * stroke::HAIRLINE)
         .max(0.0);
     card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
+        // the card is the pane's height, so the block has a bottom edge to
+        // sit on and the body has a rect of its own
+        ui.set_min_height(inner);
+        let card = ui.max_rect();
+        // the block is laid out from the bottom of the card upward and
+        // painted before the facts, so what it takes is known this frame
+        // rather than measured and fed back (O3, E15)
+        let mut block = ui.new_child(egui::UiBuilder::new()
+            .max_rect(card)
+            .layout(egui::Layout::bottom_up(Align::Min)));
+        if let Some((remote, _)) = &target {
+            block.set_width(card.width());
+            paint_actions(&mut block, state, remote, &plan, out);
+        }
+        let foot = block.min_rect().height();
+        // what does not fit above the block scrolls (C12)
+        let body = egui::Rect::from_min_max(
+            card.min,
+            egui::pos2(card.max.x, (card.max.y - foot).max(card.min.y)));
+        let mut body_ui = ui.new_child(egui::UiBuilder::new()
+            .max_rect(body)
+            .layout(egui::Layout::top_down(Align::Min)));
+        let ui = &mut body_ui;
         // salted: the list and this pane share one stable id (D33)
         egui::ScrollArea::vertical()
             .id_salt(("files-detail", view.serial))
-            .max_height(inner)
+            .max_height(body.height())
             .auto_shrink([false, true])
             .show(ui, |ui| {
         ui.label(RichText::new("DETAILS").color(theme::TEXT_DIM)
@@ -2351,11 +2381,6 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     }
                 });
                 clock_note(ui, view);
-                // an orphan thumbnail has nothing to download (5.4)
-                if let Some(video) = video {
-                    let playable = is_playable(&video.name);
-                    file_actions(ui, state, view, video, playable, out);
-                }
             }
             Selected::Recording(entry) => {
                 ui.add(egui::Label::new(RichText::new(&entry.name)
@@ -2366,8 +2391,6 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     fact(ui, "TIME", &when_text(entry.mtime));
                 });
                 clock_note(ui, view);
-                let playable = is_playable(&entry.name);
-                file_actions(ui, state, view, entry, playable, out);
             }
             Selected::File(item) => {
                 ui.add(egui::Label::new(RichText::new(&item.remote.name)
@@ -2393,7 +2416,6 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     ui.add_space(space::S);
                     gcode_pane(ui, state, view, &item.remote, out);
                 }
-                file_actions(ui, state, view, &item.remote, false, out);
             }
             Selected::Entry(entry) => {
                 ui.add(egui::Label::new(RichText::new(&entry.name)
@@ -2407,10 +2429,6 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     fact(ui, "TIME", &when_text(entry.mtime));
                 });
                 clock_note(ui, view);
-                if !entry.is_dir && !entry.unreadable {
-                    let playable = is_playable(&entry.name);
-                    file_actions(ui, state, view, entry, playable, out);
-                }
             }
         }
             });
@@ -2419,20 +2437,47 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     files.chosen = Some((key, picked));
 }
 
-/// The actions of section 6 for one remote file. A file already on disk
-/// offers the players and the folder; one that is not offers the downloads,
-/// each with the time it will cost.
-fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
-                remote: &RemoteEntry, playable: bool, out: &mut Outcome) {
-    ui.add_space(space::M);
-    // The borrow ends here, so the buttons below can start a download. A
-    // copy this session downloaded is the first answer; after it, a
-    // complete key-matching copy already in the disk cache, so a file that
-    // is on disk from an earlier session is not advertised as a download
-    // with six minutes on it (5.6).
+/// What the selected file offers to act on: the entry the actions work on
+/// and whether this app can play it. A folder, an unreadable entry, an
+/// orphan thumbnail and "nothing selected" offer none (5.4).
+fn action_target(picked: &Selected) -> Option<(&RemoteEntry, bool)> {
+    match picked {
+        Selected::Timelapse { video: Some(video), .. } =>
+            Some((video, is_playable(&video.name))),
+        Selected::Recording(entry) =>
+            Some((entry, is_playable(&entry.name))),
+        Selected::File(item) => Some((&item.remote, false)),
+        Selected::Entry(entry) if !entry.is_dir && !entry.unreadable =>
+            Some((entry, is_playable(&entry.name))),
+        Selected::Timelapse { .. } | Selected::Entry(_)
+        | Selected::Gone(_) | Selected::None => None,
+    }
+}
+
+/// One line of the action block, in the order it is painted. The block is
+/// pinned to the foot of the pane, so its height has to be known before it
+/// is painted: every line's height comes from the style (1.8, O3).
+enum Act {
+    /// a caption line: the cost of a download, "Opening…", or a note
+    Caption(String, Color32),
+    /// the accent action on a local copy
+    Play { path: PathBuf, reason: Option<&'static str> },
+    /// the accent action on a file that is not on disk yet
+    DownloadAndPlay { reason: Option<&'static str> },
+    /// "Show in folder", and "Open in player" when the file may reach the
+    /// shell (F2), on one row
+    Os { path: PathBuf, openable: bool },
+    Save { reason: Option<&'static str> },
+}
+
+/// What the block holds for `remote`, in order. A copy this session
+/// downloaded is the first answer; after it, a complete key-matching copy
+/// already in the disk cache, so a file that is on disk from an earlier
+/// session is not advertised as a download with six minutes on it (5.6).
+fn actions_plan(state: &BrowserState, view: &View<'_>,
+                remote: &RemoteEntry, playable: bool) -> Vec<Act> {
     let local = state.local_copy(&remote.path).map(Path::to_path_buf)
         .or_else(|| view.cached.and_then(|cached| cached(remote)));
-    let width = ui.available_width();
     // a file already on its way is not downloaded twice: the buttons say
     // so instead of dropping the click (D11, browser.rs `download`)
     let busy = state.transfer_of(&remote.path)
@@ -2440,55 +2485,93 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
         .then_some("Already downloading");
     // and a player still opening takes no second file (E31, D07)
     let opening = view.opening.then_some("Opening the last file…");
+    let mut plan = Vec::new();
     if view.opening {
-        ui.label(RichText::new("Opening…").color(theme::TEXT_DIM)
-            .font(font::caption()));
+        plan.push(Act::Caption("Opening…".to_string(), theme::TEXT_DIM));
     }
-    match &local {
+    match local {
         Some(path) => {
-            if playable
-                && accent_button_reason(ui, "Play",
-                                        vec2(width, size::BUTTON_H), opening)
-            {
-                // the remote path decides the speed, not the cached name
-                out.actions.push(Action::Play {
-                    path: path.clone(),
-                    speed: player::default_speed(&remote.path) });
+            if playable {
+                plan.push(Act::Play { path: path.clone(),
+                                      reason: opening });
             }
             // a saved copy of anything: the shell only gets a file whose
             // header and extension agree that it is media (F2)
-            let openable = may_reach_shell(view, path);
-            ui.horizontal(|ui| os_player_buttons(ui, path, openable, out));
-            // a key-matching copy is copied, never downloaded again (5.6)
-            if widgets::button(ui, egui::Button::new("Save to PC"), busy)
-                && let Some(cmd) = state.download(remote, Dest::SaveToPc)
-            {
-                out.cmds.push(cmd);
-            }
+            let openable = may_reach_shell(view, &path);
+            plan.push(Act::Os { path, openable });
+            plan.push(Act::Save { reason: busy });
         }
         None => {
-            ui.label(RichText::new(format!(
-                "Download {}", download_eta(remote.size, state.rate_bps)))
-                .color(theme::TEXT_DIM).font(font::caption()));
-            if playable
-                && accent_button_reason(ui, "Download & play",
-                                        vec2(width, size::BUTTON_H),
-                                        busy.or(opening))
-                && let Some(cmd) = state.download(
-                    remote, Dest::Cache { open_after: true })
-            {
-                out.cmds.push(cmd);
+            // every action says its time cost up front (section 6)
+            plan.push(Act::Caption(
+                format!("Download {}",
+                        download_eta(remote.size, state.rate_bps)),
+                theme::TEXT_DIM));
+            if playable {
+                plan.push(Act::DownloadAndPlay {
+                    reason: busy.or(opening) });
             }
-            if widgets::button(ui, egui::Button::new("Save to PC"), busy)
-                && let Some(cmd) = state.download(remote, Dest::SaveToPc)
-            {
-                out.cmds.push(cmd);
-            }
+            plan.push(Act::Save { reason: busy });
         }
     }
     if let Some((text, color)) = note_for(state, &remote.path, view.now) {
-        ui.label(RichText::new(text).color(color).font(font::caption()));
+        plan.push(Act::Caption(text, color));
     }
+    plan
+}
+
+/// The block itself. The `ui` it is given is laid out bottom-up from the
+/// foot of the pane, so the plan is walked backwards: the last line is
+/// painted first, at the bottom, and the gap above the block last.
+fn paint_actions(ui: &mut Ui, state: &mut BrowserState,
+                 remote: &RemoteEntry, plan: &[Act], out: &mut Outcome) {
+    let width = ui.available_width();
+    for act in plan.iter().rev() {
+        match act {
+            Act::Caption(text, color) => {
+                ui.label(RichText::new(text).color(*color)
+                    .font(font::caption()));
+            }
+            Act::Play { path, reason } => {
+                if accent_button_reason(ui, "Play",
+                                        vec2(width, size::BUTTON_H),
+                                        *reason)
+                {
+                    // the remote path decides the speed, not the cached
+                    // name (section 7)
+                    out.actions.push(Action::Play {
+                        path: path.clone(),
+                        speed: player::default_speed(&remote.path) });
+                }
+            }
+            Act::DownloadAndPlay { reason } => {
+                if accent_button_reason(ui, "Download & play",
+                                        vec2(width, size::BUTTON_H),
+                                        *reason)
+                    && let Some(cmd) = state.download(
+                        remote, Dest::Cache { open_after: true })
+                {
+                    out.cmds.push(cmd);
+                }
+            }
+            Act::Os { path, openable } => {
+                ui.horizontal(|ui| {
+                    os_player_buttons(ui, path, *openable, out);
+                });
+            }
+            Act::Save { reason } => {
+                // a key-matching copy is copied, never downloaded again
+                if widgets::button(ui, egui::Button::new("Save to PC"),
+                                   *reason)
+                    && let Some(cmd) = state.download(remote,
+                                                      Dest::SaveToPc)
+                {
+                    out.cmds.push(cmd);
+                }
+            }
+        }
+    }
+    ui.add_space(space::M);
 }
 
 /// The 3mf preview: automatic for small files, "[Load]" for the rest
@@ -4672,14 +4755,96 @@ mod tests {
         texts.iter().find(|text| text.text == label)
     }
 
-    /// C12, D01: a 3mf with its plate picture and eight facts is taller than
-    /// the pane at 1080x780. The pane scrolls, so the wheel over it brings
-    /// Save to PC into the window. It takes three notches, not the one the
-    /// guidelines hoped for: egui scrolls 40 points a notch on Windows, and
-    /// the button starts below the pane's edge by more than two of them.
-    /// Decision O3 pins the actions, which removes the scroll altogether.
+    /// O3: whatever the block holds, the facts above it stop where it
+    /// starts. A block laid out from the foot up takes what it needs, and
+    /// the body is given the rest: no overlap, and no gap under it.
     #[test]
-    fn a_tall_detail_pane_scrolls_its_actions_into_view() {
+    fn the_facts_stop_where_the_pinned_block_starts() {
+        let size = Vec2::new(1080.0, 780.0);
+        let copy = std::env::temp_dir().join("bambu-o3-copy.avi");
+        let cached = |_: &RemoteEntry| Some(copy.clone());
+        let openable = |_: &Path| true;
+        let now = Instant::now();
+        // every shape of the block: a file on disk with the players, one
+        // that is not, a playable one, and one with a transfer note
+        let cases: [(&str, bool, bool); 4] = [
+            ("/job.gcode.3mf", false, false),
+            ("/timelapse/video_2026-06-01_06-11-57.avi", false, false),
+            ("/timelapse/video_2026-06-01_06-11-57.avi", true, false),
+            ("/timelapse/video_2026-06-01_06-11-57.avi", false, true),
+        ];
+        for (path, on_disk, transferring) in cases {
+            let ctx = ctx();
+            let mut state = browsed();
+            let mut files = files_ui(match path.ends_with(".3mf") {
+                true => Tab::Files,
+                false => Tab::Timelapses,
+            });
+            files.selected = Some(path.to_string());
+            if transferring {
+                let remote = state.timelapses[0].video.clone()
+                    .expect("a video");
+                assert!(state.download(&remote, Dest::SaveToPc).is_some());
+            }
+            let mut view = view(P1S, now);
+            if on_disk {
+                view.cached = Some(&cached);
+                view.shell_openable = Some(&openable);
+            }
+            texts(&ctx, raw_at(size, Vec::new()), &mut state, &mut files,
+                  &view);
+            let painted = texts(&ctx, raw_at(size, Vec::new()), &mut state,
+                                &mut files, &view);
+            // the block: its topmost line is the first of the plan
+            let block: Vec<&Text> = ["Opening…", "Download ~", "Play",
+                                     "Download & play", "Show in folder",
+                                     "Save to PC"].iter()
+                .filter_map(|label| painted.iter()
+                    .find(|text| text.text.starts_with(label)))
+                .collect();
+            assert!(!block.is_empty(), "{path}: no action painted");
+            let top = block.iter()
+                .map(|text| text.rect.min.y)
+                .fold(f32::INFINITY, f32::min);
+            let bottom = block.iter()
+                .map(|text| text.rect.max.y)
+                .fold(0.0, f32::max);
+            assert!(bottom <= size.y,
+                    "{path}: the block is below the window ({bottom})");
+            // the lines keep the plan's order top to bottom: the cost
+            // above the action, the action above Save to PC
+            let order: Vec<(String, f32)> = block.iter()
+                .map(|text| (text.text.clone(), text.rect.min.y))
+                .collect();
+            assert!(order.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+                    "{path}: the block is out of order: {order:?}");
+            // the scrolling body ends where the block starts: its clip
+            // rect is what a fact may be painted inside
+            let details = find(&painted, "DETAILS").expect("the pane");
+            assert!(details.clip.max.y <= top + 1.0,
+                    "{path}: the body is clipped to {:?}, the block starts \
+                     at {top}", details.clip);
+            // and no fact reaches into the block
+            for label in ["DETAILS", "KIND", "SIZE", "TIME", "VIDEO",
+                          "THUMB", "PRINT"] {
+                if let Some(fact) = find(&painted, label) {
+                    assert!(fact.rect.max.y <= top + 1.0,
+                            "{path}: {label} at {:?} overlaps the block \
+                             starting at {top}", fact.rect);
+                }
+            }
+        }
+    }
+
+    /// C12, D01, decision O3: a 3mf with its plate picture and eight
+    /// facts is taller than the pane at 1080x780. Its actions are pinned
+    /// to the foot of the pane, so "Save to PC" is on screen with no
+    /// scroll at all, and the facts are what scrolls under it.
+    ///
+    /// This replaces the stage 2 test that counted the three wheel
+    /// notches it used to take.
+    #[test]
+    fn the_detail_panes_actions_are_pinned_to_its_foot() {
         use crate::threemf::{Filament, ThreeMfInfo};
 
         let ctx = ctx();
@@ -4712,11 +4877,20 @@ mod tests {
         let before = texts(&ctx, raw_at(size, Vec::new()), &mut state,
                            &mut files, &view(P1S, now));
         let details = find(&before, "DETAILS").expect("the pane");
-        // the premise: the pane really is taller than the window allows
-        let save = find(&before, "Save to PC");
-        assert!(save.is_none_or(|save| !save.on_screen(size)),
-                "Save to PC is on screen before any scroll");
+        // the premise: the facts are taller than the pane, so something
+        // has to be out of view
+        let cut = find(&before, "the header was cut short")
+            .or_else(|| find(&before, "Textured PEI Plate"));
+        assert!(cut.is_none_or(|fact| !fact.on_screen(size))
+                || find(&before, "BED").is_none(),
+                "the facts already fit: nothing is being scrolled");
+        // and the action is on screen without touching the wheel
+        let save = find(&before, "Save to PC")
+            .expect("Save to PC is not painted at all");
+        assert!(save.on_screen(size),
+                "Save to PC is off screen with no scroll: {:?}", save.rect);
 
+        // the wheel over the pane scrolls the facts and leaves the block
         let over = details.rect.center() + Vec2::new(0.0, 200.0);
         let notch = || egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Line,
@@ -4724,26 +4898,26 @@ mod tests {
             phase: egui::TouchPhase::Move,
             modifiers: Modifiers::default(),
         };
-        let mut notches = 0;
-        let visible = loop {
-            texts(&ctx, raw_at(size, vec![egui::Event::PointerMoved(over),
-                                          notch()]),
-                  &mut state, &mut files, &view(P1S, now));
-            notches += 1;
-            // the scroll animates over a few frames
-            let mut after = Vec::new();
-            for _ in 0..30 {
-                after = texts(&ctx, raw_at(size, vec![
-                    egui::Event::PointerMoved(over)]),
-                    &mut state, &mut files, &view(P1S, now));
-            }
-            let save = find(&after, "Save to PC")
-                .is_some_and(|save| save.on_screen(size));
-            if save || notches == 3 {
-                break save;
-            }
-        };
-        assert!(visible, "Save to PC is off screen after {notches} notches");
+        let fact_before = find(&before, "TIME").expect("a fact").rect.min.y;
+        texts(&ctx, raw_at(size, vec![egui::Event::PointerMoved(over),
+                                      notch(), notch(), notch()]),
+              &mut state, &mut files, &view(P1S, now));
+        // the scroll animates over a few frames
+        let mut after = Vec::new();
+        for _ in 0..30 {
+            after = texts(&ctx, raw_at(size,
+                                       vec![egui::Event::PointerMoved(over)]),
+                          &mut state, &mut files, &view(P1S, now));
+        }
+        let fact_after = find(&after, "TIME").expect("a fact").rect.min.y;
+        assert!(fact_after < fact_before - 1.0,
+                "the facts did not scroll: {fact_before} to {fact_after}");
+        let moved = find(&after, "Save to PC").expect("the action").rect;
+        assert!((moved.min.y - save.rect.min.y).abs() < 1.0,
+                "the pinned block moved with the scroll: {:?} to {:?}",
+                save.rect, moved);
+        assert!(moved.max.y <= size.y,
+                "the block is below the window: {moved:?}");
     }
 
     /// C13, D03: four failed transfers at 700x480 scroll inside the bar, so
