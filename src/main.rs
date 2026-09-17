@@ -536,6 +536,18 @@ impl App {
         app
     }
 
+    /// Ctrl+scroll and Ctrl+plus change egui's zoom; the level is saved so
+    /// the next launch opens at it (decision O7). A zoom change is a user
+    /// action, so the one small atomic write it costs is allowed (E30).
+    fn save_zoom(&mut self, ctx: &egui::Context) {
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.cfg.ui.zoom).abs() < 0.001 {
+            return;
+        }
+        self.cfg.ui.zoom = zoom;
+        self.save_config();
+    }
+
     /// The cache's used bytes for this frame: the last figure a walk
     /// landed, and a new walk started at most once per
     /// `CACHE_USAGE_REFRESH` (E28, E30). A frame never walks the disk.
@@ -1439,6 +1451,8 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.started {
             self.started = true;
+            // the zoom the window was left at (decision O7)
+            ctx.set_zoom_factor(self.cfg.ui.zoom_factor());
             if !self.printers.is_empty() {
                 self.select(0, ctx);
             }
@@ -1451,6 +1465,7 @@ impl eframe::App for App {
         if self.selected >= self.printers.len() {
             self.selected = 0;
         }
+        self.save_zoom(ctx);
         #[cfg(debug_assertions)]
         self.start_debug_play();
     }

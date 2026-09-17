@@ -1213,6 +1213,42 @@ fn a_context_shot_twice_is_refused() {
     shoot(&ctx, [8, 8], 1.0, Vec::new(), draw);
 }
 
+/// O7: the app opens at the zoom it was left at, and a zoom change is
+/// picked up so the next launch carries it.
+#[test]
+fn the_app_opens_at_the_saved_zoom_and_keeps_changes() {
+    let ctx = context(1.0);
+    let dir = TempDir::new("zoom-level");
+    // no printers: the start path then opens no camera and no session,
+    // and what is left of it is the zoom
+    let mut app = app(&ctx, &[], &dir);
+    app.started = false;
+    app.cfg.ui.zoom = 1.25;
+    let mut frame = eframe::Frame::_new_kittest();
+    let points = vec2(1080.0, 780.0);
+    let mut run = |app: &mut App, step: f64| {
+        let _ = ctx.run_ui(raw_input(points, step, Vec::new()), |ui| {
+            eframe::App::logic(app, ui.ctx(), &mut frame);
+            app.ui(ui, &mut frame);
+        });
+    };
+    // egui takes a new zoom at the start of the next pass
+    run(&mut app, 0.0);
+    run(&mut app, 1.0);
+    assert!((ctx.zoom_factor() - 1.25).abs() < 0.001,
+            "opened at {}", ctx.zoom_factor());
+    // Ctrl+scroll is egui's own; what the app owes is to notice
+    ctx.set_zoom_factor(1.5);
+    run(&mut app, 2.0);
+    run(&mut app, 3.0);
+    assert!((app.cfg.ui.zoom - 1.5).abs() < 0.001,
+            "the change was not picked up: {}", app.cfg.ui.zoom);
+    // and it is not written again while nothing changes
+    let before = app.cfg.ui.zoom;
+    run(&mut app, 4.0);
+    assert_eq!(app.cfg.ui.zoom, before);
+}
+
 /// O13: Remove printer lives in the Edit dialog, at the other end of the
 /// row from Save, and nowhere else. The top bar holds Edit and Add.
 #[test]

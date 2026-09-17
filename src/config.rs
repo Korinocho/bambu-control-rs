@@ -47,10 +47,45 @@ impl FilesCfg {
     }
 }
 
+/// The `[ui]` table: the zoom the window was left at (GUI polish decision
+/// O7). Like `[files]` it is a plain table, so it is written before
+/// `printers`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct UiCfg {
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
+}
+
+/// egui's own default, and what an unreadable or absurd value falls back
+/// to.
+fn default_zoom() -> f32 {
+    1.0
+}
+
+impl Default for UiCfg {
+    fn default() -> Self {
+        Self { zoom: default_zoom() }
+    }
+}
+
+impl UiCfg {
+    /// The zoom to open at: the saved one, or the default when the file
+    /// carries something the window could not be used at. egui's own
+    /// Ctrl+scroll stays inside this range.
+    pub fn zoom_factor(&self) -> f32 {
+        match self.zoom.is_finite() && (0.5..=3.0).contains(&self.zoom) {
+            true => self.zoom,
+            false => default_zoom(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub files: FilesCfg,
+    #[serde(default)]
+    pub ui: UiCfg,
     #[serde(default)]
     pub printers: Vec<PrinterCfg>,
 }
@@ -278,9 +313,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{CertGeneration, Config, FilesCfg, MODEL_PREFIXES, PrinterCfg,
-                Store, cert_generation, files_refused_by_name, load_from,
-                model_from_serial, normalize_serial, other_authority_refusal,
-                save_to};
+                Store, UiCfg, cert_generation, files_refused_by_name,
+                load_from, model_from_serial, normalize_serial,
+                other_authority_refusal, save_to};
 
     #[test]
     fn p1_prefixes_match_bambu_serials() {
@@ -577,6 +612,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let cfg = Config {
             files: FilesCfg { cache_cap_gb: 12 },
+            ui: UiCfg { zoom: 1.25 },
             printers: vec![printer("01P00A000000001")],
         };
         save_to(&path, &cfg).unwrap();
@@ -596,5 +632,38 @@ mod tests {
         let loaded = load_from(&path, &[]).unwrap();
         assert_eq!(loaded.cfg.files.cache_cap_gb, 5);
         assert_eq!(loaded.cfg.printers.len(), 1);
+    }
+
+    /// Decision O7: the zoom the window was left at survives a restart,
+    /// and a file that carries something the window could not be used at
+    /// opens at egui's own default.
+    #[test]
+    fn the_zoom_round_trips_and_absurd_values_do_not() {
+        let dir = TempDir::new("zoom");
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            files: FilesCfg::default(),
+            ui: UiCfg { zoom: 1.5 },
+            printers: vec![printer("01P00A000000001")],
+        };
+        save_to(&path, &cfg).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[ui]") && text.contains("zoom = 1.5"),
+                "{text}");
+        let loaded = load_from(&path, &[]).unwrap();
+        assert_eq!(loaded.cfg.ui.zoom, 1.5);
+        assert_eq!(loaded.cfg.ui.zoom_factor(), 1.5);
+        // the printers are still there, next to the new table
+        assert_eq!(loaded.cfg.printers, cfg.printers);
+
+        // a config written before the table opens at the default
+        std::fs::write(&path, "[files]\ncache_cap_gb = 5\n").unwrap();
+        assert_eq!(load_from(&path, &[]).unwrap().cfg.ui.zoom_factor(),
+                   1.0);
+        // and so does a value nothing could be read at
+        for absurd in [0.0, -1.0, 0.01, 40.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(UiCfg { zoom: absurd }.zoom_factor(), 1.0,
+                       "zoom = {absurd}");
+        }
     }
 }
