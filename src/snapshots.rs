@@ -622,9 +622,15 @@ fn app(ctx: &egui::Context, printers: &[PrinterFixture], dir: &TempDir)
 /// The job a RUNNING printer is on: its objects, their boxes and the plate
 /// picture, as the job bundle brings them.
 fn job(printer: &mut PrinterUi, ctx: &egui::Context) {
+    job_of(printer, ctx, 8);
+}
+
+/// The same job with `count` objects, up to twelve.
+fn job_of(printer: &mut PrinterUi, ctx: &egui::Context, count: usize) {
     let names = ["Soporte base", "Soporte base #2", "Tapa", "Tapa #2",
-                 "Clip", "Clip #2", "Clip #3", "Tornillo largo M3x40"];
-    let objects: Vec<(i64, String)> = names.iter().enumerate()
+                 "Clip", "Clip #2", "Clip #3", "Tornillo largo M3x40",
+                 "Arandela", "Arandela #2", "Tuerca", "Tuerca #2"];
+    let objects: Vec<(i64, String)> = names.iter().take(count).enumerate()
         .map(|(i, name)| (100 + i as i64 * 2, name.to_string()))
         .collect();
     let bboxes = objects.iter().enumerate()
@@ -661,12 +667,14 @@ const MATRIX: [&str; 13] = [
     "dlg-skip", "dlg-move", "dlg-info", "dlg-maintenance",
 ];
 
-/// States the stages look at beyond the matrix, at 1080x780 and 700x480.
-const EXTRAS: [&str; 16] = [
+/// States the stages look at beyond the matrix, at the two smaller sizes.
+const EXTRAS: [&str; 21] = [
     "chips-six", "panel-firmware", "files-loading", "files-empty",
     "files-error", "files-refusal", "files-folders", "files-gcode",
     "dlg-add", "dlg-temp", "dlg-speed", "dlg-fans", "dlg-confirm-stop",
-    "dlg-confirm-remove", "dlg-hms", "no-printers",
+    "dlg-confirm-remove", "dlg-hms", "no-printers", "dlg-skip-many",
+    "dlg-skip-confirm", "files-failed-four", "files-long-name",
+    "files-printing",
 ];
 
 fn files_scene(app: &mut App, tab: Tab) -> &mut PrinterUi {
@@ -840,6 +848,43 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
             app.dialog = Dialog::Hms;
         }
         "no-printers" => app.printers.clear(),
+        "dlg-skip-many" | "dlg-skip-confirm" => {
+            app.selected = 1;
+            job_of(&mut app.printers[1], ctx, 12);
+            app.dialog = Dialog::Skip(dialogs::SkipDlg {
+                selected: HashSet::from([100, 104]),
+                confirm: name == "dlg-skip-confirm",
+            });
+        }
+        "files-failed-four" => {
+            let printer = files_scene(&mut app, Tab::Timelapses);
+            let videos: Vec<RemoteEntry> = printer.browser.timelapses.iter()
+                .filter_map(|item| item.video.clone())
+                .take(4)
+                .collect();
+            for video in &videos {
+                let Some(Cmd::Download { id, .. }) = printer.browser
+                    .download(video, Dest::SaveToPc)
+                else {
+                    panic!("a download");
+                };
+                printer.browser.apply(Event::Done {
+                    id, result: Err(FtpError::SessionLost(
+                        "connection reset".to_string())) });
+            }
+        }
+        "files-long-name" => {
+            let printer = files_scene(&mut app, Tab::Timelapses);
+            printer.cfg.name =
+                "Taller del fondo, impresora grande junto a la ventana 60c"
+                    .to_string();
+        }
+        "files-printing" => {
+            app.selected = 1;
+            app.view = AppView::Files;
+            let printer = &mut app.printers[1];
+            printer.browser = browsed();
+        }
         other => panic!("no scene {other:?}"),
     }
     Scene { app, _dir: dir }
@@ -939,7 +984,9 @@ fn open_player(printer: &mut PrinterUi, ctx: &egui::Context, dir: &Path) {
 
 // ------------------------------------------------------------------ tests
 
-const SIZES: [[usize; 2]; 3] = [[1080, 780], [700, 480], [1920, 1080]];
+/// The default window, the minimum one (960x640 since O2) and a full HD
+/// screen.
+const SIZES: [[usize; 2]; 3] = [[1080, 780], [960, 640], [1920, 1080]];
 const ZOOMS: [f32; 2] = [1.0, 1.5];
 
 fn file_name(scene: &str, size: [usize; 2], zoom: f32) -> String {

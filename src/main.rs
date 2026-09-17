@@ -765,42 +765,53 @@ impl App {
                         // cursor
                         ui.multiply_opacity(0.35);
                     }
-                    egui::Frame::new()
+                    let response = egui::Frame::new()
                         .fill(theme::CARD)
-                        .stroke(if selected {
-                            Stroke::new(stroke::SELECTED,
-                                        theme::CHIP_SELECTED)
-                        } else {
-                            Stroke::new(stroke::HAIRLINE, theme::BORDER)
-                        })
+                        .stroke(Stroke::new(stroke::HAIRLINE, theme::BORDER))
                         .corner_radius(radius::CONTROL)
                         .inner_margin(pad::CHIP)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                let label = font::label();
                                 // baseline-aligned status dot
                                 ui.label(RichText::new("●")
                                     .font(font::caption()).color(color));
-                                ui.label(RichText::new(&printer.cfg.name)
-                                    .font(font::body_strong()));
-                                let mut parts = Vec::new();
+                                // a long name is truncated, and egui shows
+                                // it whole on hover (C4)
+                                let name = &printer.cfg.name;
+                                let strong = font::body_strong();
+                                let name_w = theme::text_width(ui, name,
+                                                               &strong)
+                                    .min(size::CHIP_NAME_MAX_W);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(name_w, size::CONTROL_H),
+                                    egui::Layout::left_to_right(
+                                        egui::Align::Center),
+                                    |ui| {
+                                        ui.set_width(name_w);
+                                        ui.add(egui::Label::new(
+                                            RichText::new(name).font(strong))
+                                            .truncate());
+                                    });
                                 if !gcode_state.is_empty() {
                                     let mut s = gcode_state.to_lowercase();
                                     if let Some(c) = s.get_mut(0..1) {
                                         c.make_ascii_uppercase();
                                     }
-                                    parts.push(s);
+                                    ui.label(RichText::new(s).color(color)
+                                        .font(label.clone()));
                                 }
+                                // numbers sit in slots for their widest
+                                // value, so 9% becoming 10% moves no chip
+                                // to the right of this one (C4)
                                 if matches!(gcode_state.as_str(),
                                             "RUNNING" | "PAUSE")
                                     && pct > 0
                                 {
-                                    parts.push(format!("{pct}%"));
-                                }
-                                if !parts.is_empty() {
-                                    ui.label(RichText::new(
-                                        parts.join("  "))
-                                        .color(color)
-                                        .font(font::label()));
+                                    ui::widgets::slot(ui, "100%",
+                                        RichText::new(format!("{pct}%"))
+                                            .color(color),
+                                        &label, egui::Align::Min);
                                 }
                                 // the download badge of section 6: the
                                 // previous printer's transfers keep running
@@ -808,14 +819,24 @@ impl App {
                                 if let Some(pct) =
                                     printer.browser.running_percent()
                                 {
-                                    ui.label(RichText::new(
-                                        format!("↓ {pct}%"))
-                                        .color(theme::ACCENT)
-                                        .font(font::label()));
+                                    ui::widgets::slot(ui, "↓ 100%",
+                                        RichText::new(format!("↓ {pct}%"))
+                                            .color(theme::ACCENT),
+                                        &label, egui::Align::Min);
                                 }
                             });
                         })
-                        .response
+                        .response;
+                    // the selected ring is painted inside the chip, so
+                    // selecting one never changes its size (E10)
+                    if selected {
+                        ui.painter().rect_stroke(
+                            response.rect, radius::CONTROL,
+                            Stroke::new(stroke::SELECTED,
+                                        theme::CHIP_SELECTED),
+                            StrokeKind::Inside);
+                    }
+                    response
                 }).inner;
 
                 let response = frame_response
@@ -1292,10 +1313,30 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(theme::BG)
                 .inner_margin(pad::BAR))
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    self.chips_bar(ui, ctx);
-                    ui.with_layout(egui::Layout::right_to_left(
-                        egui::Align::Center), |ui| {
+                // the bar is a chip tall; the tool buttons take the right
+                // end of it first and the chips get what is left, so a
+                // long chip row is cut off rather than pushing Edit, Add
+                // and Remove out of the window (C4, D09)
+                let gap = ui.spacing().item_spacing.x;
+                let chip_h = size::CONTROL_H + pad::CHIP.sum().y
+                    + 2.0 * stroke::HAIRLINE;
+                let (bar, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), chip_h), Sense::hover());
+                let tools_w = 3.0 * size::ICON_BUTTON.x + 2.0 * gap;
+                let chips = egui::Rect::from_min_max(
+                    bar.min,
+                    egui::pos2((bar.max.x - tools_w - gap).max(bar.min.x),
+                               bar.max.y));
+                let mut chips_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(chips)
+                    .layout(egui::Layout::left_to_right(egui::Align::Min)));
+                chips_ui.set_clip_rect(chips.intersect(ui.clip_rect()));
+                self.chips_bar(&mut chips_ui, ctx);
+                let mut tools_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(bar)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)));
+                {
+                    let ui = &mut tools_ui;
                         if Self::tool_button(ui, ToolIcon::Trash,
                                              "Remove current printer")
                             && !self.printers.is_empty()
@@ -1324,8 +1365,7 @@ impl eframe::App for App {
                                     error: String::new(),
                                 });
                         }
-                    });
-                });
+                }
             });
 
         egui::CentralPanel::default()

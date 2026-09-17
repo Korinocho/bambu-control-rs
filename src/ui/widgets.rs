@@ -3,9 +3,32 @@
 
 use std::collections::{HashMap, HashSet};
 
-use egui::{Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
+use egui::{Align, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke,
+           StrokeKind, Ui, Vec2, pos2, vec2};
 
 use crate::theme::{self, font, radius, size, stroke};
+
+/// A slot as wide as `widest` in `font`, holding `text` truncated to it: a
+/// number that changes never moves what sits next to it (E10). `Max` puts
+/// the text at the slot's right edge.
+pub fn slot(ui: &mut Ui, widest: &str, text: RichText, font: &FontId,
+            align: Align) -> egui::Response {
+    let width = theme::text_width(ui, widest, font);
+    let height = theme::row_height(ui, font);
+    let layout = match align {
+        Align::Max => Layout::right_to_left(Align::Center),
+        _ => Layout::left_to_right(Align::Center),
+    };
+    ui.allocate_ui_with_layout(vec2(width, height), layout, |ui| {
+        ui.set_width(width);
+        ui.add(egui::Label::new(text.font(font.clone())).truncate());
+    }).response
+}
+
+/// `content` scaled to fit inside `bounds`, keeping its aspect ratio.
+pub fn fit(content: Vec2, bounds: Vec2) -> Vec2 {
+    content * (bounds.x / content.x).min(bounds.y / content.y)
+}
 
 /// iOS-style pill switch, green when on. Returns true when toggled.
 pub fn toggle_switch(ui: &mut Ui, on: &mut bool) -> bool {

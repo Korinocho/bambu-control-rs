@@ -160,6 +160,21 @@ pub fn tight_stack(ui: &mut egui::Ui) {
     ui.spacing_mut().item_spacing.y = space::XS;
 }
 
+/// One row of `font` as egui lays it out: derived heights are built from
+/// this, never measured and fed back (1.8).
+pub fn row_height(ui: &egui::Ui, font: &egui::FontId) -> f32 {
+    ui.fonts_mut(|fonts| fonts.row_height(font))
+}
+
+/// The width `text` takes on one line in `font`: what a slot is sized for
+/// (E10).
+pub fn text_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
+    // rounded up, so a slot sized for a string never truncates it
+    ui.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_string(), font.clone(),
+                                              Color32::PLACEHOLDER).size().x)
+        .ceil()
+}
+
 pub mod pad {
     use egui::Margin;
 
@@ -233,9 +248,17 @@ pub mod size {
     pub const TILE_IMAGE_H: f32 = 94.0;
     pub const DETAIL_W: f32 = 268.0;
     pub const LIST_MIN_W: f32 = 240.0;
+    /// The fact label column, so fact values line up.
+    pub const FACT_LABEL_W: f32 = 76.0;
     /// The panel's left column, as a share of the width.
     pub const LEFT_COLUMN: f32 = 0.58;
+    /// What the panel's right column keeps, however narrow the window.
+    pub const RIGHT_COLUMN_MIN: f32 = 280.0;
     pub const CAMERA_MAX_H: f32 = 420.0;
+    /// A picture well's shape until its first frame arrives (C8).
+    pub const VIDEO_ASPECT: Vec2 = vec2(16.0, 9.0);
+    /// A chip's name is truncated past this.
+    pub const CHIP_NAME_MAX_W: f32 = 160.0;
     pub const REFUSAL_MAX_W: f32 = 640.0;
     pub const SKELETON_MAX_W: f32 = 420.0;
     pub const MODAL_S: f32 = 320.0;
@@ -244,8 +267,11 @@ pub mod size {
     pub const SKIP_LIST_MAX_H: f32 = 220.0;
     pub const MODULES_MAX_H: f32 = 150.0;
     pub const HMS_LIST_MAX_H: f32 = 320.0;
+    /// Transfer rows beyond this many scroll.
+    pub const TRANSFER_ROWS_VISIBLE: usize = 3;
     pub const WINDOW: [f32; 2] = [1080.0, 780.0];
-    pub const WINDOW_MIN: [f32; 2] = [700.0, 480.0];
+    /// Raised from 700 x 480 (decision O2): the layout stays readable.
+    pub const WINDOW_MIN: [f32; 2] = [960.0, 640.0];
 }
 
 /// The one card: cards, tiles (with `pad::TILE`), the detail pane, the
