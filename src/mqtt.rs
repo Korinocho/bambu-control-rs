@@ -18,6 +18,128 @@ pub const SPEED_LEVELS: &[(i64, &str)] = &[
     (4, "Ludicrous"),
 ];
 
+/// Telemetry the read-only probe follows to tell a printing machine from an
+/// idle one. A running print advances at least one of these within a
+/// couple of minutes. Deliberately no `subtask_name` or `gcode_file`: those
+/// are file names, which the live checks never print.
+#[cfg(test)]
+const WATCHED: [&str; 12] = [
+    "gcode_state", "mc_print_stage", "mc_percent", "mc_remaining_time",
+    "layer_num", "total_layer_num", "nozzle_temper", "nozzle_target_temper",
+    "bed_temper", "bed_target_temper", "print_type", "print_error",
+];
+
+/// What a read-only state probe saw.
+#[cfg(test)]
+pub struct StateProbe {
+    /// the printer's `gcode_state`, when it reported one. Bambu pushes
+    /// deltas, so this field only appears when it changes: an idle printer
+    /// never sends it, and its absence is not evidence of anything.
+    pub gcode_state: Option<String>,
+    /// `print` reports received
+    pub reports: usize,
+    /// the broker accepted the connection: tells a silent printer apart
+    /// from one that was never reached
+    pub connected: bool,
+    /// (field, first value seen, last value seen) for `WATCHED`
+    pub watched: Vec<(String, String, String)>,
+}
+
+/// Reads one printer's `gcode_state` without ever publishing, for the live
+/// checks of the file browser (design doc 5.4). `PrinterClient::start`
+/// sends `pushall` and `get_version` as soon as it connects, and the live
+/// rules of the transfer-lane stage allow no MQTT publish at all, so this
+/// probe only subscribes and waits for the printer's own report.
+///
+/// A `gcode_state` of `None` means the printer reported none within
+/// `wait`, which the caller must treat as "state unknown", never as "not
+/// printing": an idle printer sends deltas only when something changes, so
+/// silence is the expected case exactly when nothing is happening.
+#[cfg(test)]
+pub fn subscribe_gcode_state(ip: &str, serial: &str, access_code: &str,
+                             wait: Duration) -> StateProbe {
+    let mut options = MqttOptions::new(
+        format!("bambu-control-probe-{}", std::process::id()), ip, 8883);
+    options.set_credentials("bblp", access_code);
+    options.set_keep_alive(Duration::from_secs(30));
+    // the same certificate handling as the rest of MQTT until issue #1
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .expect("tls connector");
+    options.set_transport(Transport::tls_with_config(
+        rumqttc::TlsConfiguration::NativeConnector(connector)));
+
+    type Seen = (Option<String>, usize, bool,
+                 std::collections::BTreeMap<String, (String, String)>);
+    let (client, mut connection) = Client::new(options, 32);
+    let seen: Arc<Mutex<Seen>> =
+        Arc::new(Mutex::new((None, 0, false, Default::default())));
+    let slot = seen.clone();
+    let topic = format!("device/{serial}/report");
+    let subscriber = client.clone();
+    let reader = std::thread::spawn(move || {
+        for notification in connection.iter() {
+            match notification {
+                // SUBSCRIBE is not a publish: nothing is asked of the
+                // printer, and no command is ever sent
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    slot.lock().unwrap().2 = true;
+                    let _ = subscriber.subscribe(topic.clone(),
+                                                 QoS::AtMostOnce);
+                }
+                Ok(Event::Incoming(Packet::Publish(p))) => {
+                    let Ok(data) =
+                        serde_json::from_slice::<Value>(&p.payload)
+                    else { continue };
+                    let Some(print) = data.get("print") else { continue };
+                    let mut slot = slot.lock().unwrap();
+                    slot.1 += 1;
+                    for field in WATCHED {
+                        let Some(value) = print.get(field) else { continue };
+                        let text = match value {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        slot.3.entry(field.to_string())
+                            .and_modify(|(_, last)| last.clone_from(&text))
+                            .or_insert_with(|| (text.clone(), text));
+                    }
+                    if let Some(state) = print.get("gcode_state")
+                        .and_then(|state| state.as_str())
+                    {
+                        slot.0 = Some(state.to_string());
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        if seen.lock().unwrap().0.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = client.disconnect();
+    // the reader is deliberately not joined: rumqttc's iterator can stay
+    // in a blocking read after a disconnect, and this probe must return at
+    // its deadline rather than hold the caller for ever. The thread ends
+    // with the test process.
+    drop(reader);
+    let (gcode_state, reports, connected, watched) =
+        seen.lock().unwrap().clone();
+    let watched = watched.into_iter()
+        .map(|(field, (first, last))| (field, first, last))
+        .collect();
+    StateProbe { gcode_state, reports, connected, watched }
+}
+
 pub fn speed_name(level: i64) -> &'static str {
     SPEED_LEVELS
         .iter()
