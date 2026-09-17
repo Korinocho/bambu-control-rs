@@ -580,7 +580,7 @@ Add these to `tests/source_rules.rs`. They scan the production part of `src/ui/*
 - **Error card.**
   - Card with `DANGER_BG` fill, 1 px `DANGER` stroke, `radius::CARD`, `pad::CARD`.
   - Body in `body` `DANGER`, which passes contrast with the new `DANGER`.
-  - A Retry accent button at `BUTTON_H`.
+  - The actions of decision O14, in one row, the first as an accent button at `BUTTON_H`: Retry for a connection that dropped; "Edit printer" then Retry for a rejected access code; "Edit printer" alone for a bad address, a missing serial or a model refused by name, where no retry can work; Retry then "Clear cache" when the volume filled up.
   - `FtpError::text` wording unchanged.
 - **Refusal card.** Behaviour and wording unchanged: no trust action, Close focused, Enter and Escape. Tokens only.
 - **Offline printer.**
