@@ -24,7 +24,7 @@ use crate::ftp::{FtpError, RemoteEntry, ServerProfile};
 use crate::player::{self, PlayerCmd};
 use crate::theme::{self, font, pad, radius, size, space, stroke};
 use crate::tls;
-use crate::ui::dialogs::{accent_button_reason, accent_button_response};
+use crate::ui::dialogs::{accent_button_exact, accent_button_response};
 use crate::ui::panel::card_frame;
 use crate::ui::widgets;
 
@@ -907,7 +907,8 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
             // documented fallback for it — but the shell still picks its
             // program by extension, so the same rule decides (F2)
             let openable = may_reach_shell(view, player.path);
-            os_player_buttons(ui, player.path, openable, out);
+            os_player_buttons(ui, player.path, openable,
+                              button_line(ui), out);
         });
     });
 }
@@ -922,12 +923,29 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
 /// the extension, so a card offering "invoice.exe" would otherwise be two
 /// clicks from a ShellExecute under a button labelled as a player (stage 3
 /// security review, F2).
+/// What egui gives a button: its laid-out line, the padding around it and
+/// its own frame outline (1.8). `the_blocks_height_is_what_it_paints`
+/// holds this against what a button really costs.
+fn button_line(ui: &Ui) -> f32 {
+    theme::line_height(ui, &font::button())
+        + 2.0 * ui.spacing().button_padding.y
+        + stroke::HAIRLINE
+}
+
+/// A button wide enough for its own text, at the height the block
+/// promised for its line (1.8, O3).
+fn action_button(ui: &mut Ui, label: &str, height: f32) -> egui::Response {
+    let width = theme::text_width(ui, label, &font::button())
+        + 2.0 * ui.spacing().button_padding.x;
+    ui.add_sized(vec2(width, height), egui::Button::new(label))
+}
+
 fn os_player_buttons(ui: &mut Ui, path: &Path, offer_open: bool,
-                     out: &mut Outcome) {
-    if ui.button("Show in folder").clicked() {
+                     height: f32, out: &mut Outcome) {
+    if action_button(ui, "Show in folder", height).clicked() {
         out.actions.push(Action::Reveal(path.to_path_buf()));
     }
-    if offer_open && ui.button("Open in player").clicked() {
+    if offer_open && action_button(ui, "Open in player", height).clicked() {
         out.actions.push(Action::OpenExternally(path.to_path_buf()));
     }
 }
@@ -962,7 +980,8 @@ fn player_error_card(ui: &mut Ui, view: &View<'_>, note: &str,
                             // section 7 hands it to the OS player — as long
                             // as its header and name agree it is media (F2)
                             let openable = may_reach_shell(view, path);
-                            os_player_buttons(ui, path, openable, out);
+                            os_player_buttons(ui, path, openable,
+                                              button_line(ui), out);
                         }
                     });
             });
@@ -2338,35 +2357,25 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     };
     let inner = (height - pad::CARD.sum().y - 2.0 * stroke::HAIRLINE)
         .max(0.0);
+    // the block's own height, added up from the lines it will declare: no
+    // measurement, and nothing fed back from the last frame (O3, E15)
+    let foot = actions_height(ui, &plan);
     card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
-        // the card is the pane's height, so the block has a bottom edge to
-        // sit on and the body has a rect of its own
+        // the card is the pane's height, whatever it holds
         ui.set_min_height(inner);
-        let card = ui.max_rect();
-        // the block is laid out from the bottom of the card upward and
-        // painted before the facts, so what it takes is known this frame
-        // rather than measured and fed back (O3, E15)
-        let mut block = ui.new_child(egui::UiBuilder::new()
-            .max_rect(card)
-            .layout(egui::Layout::bottom_up(Align::Min)));
-        if let Some((remote, _)) = &target {
-            block.set_width(card.width());
-            paint_actions(&mut block, state, remote, &plan, out);
-        }
-        let foot = block.min_rect().height();
-        // what does not fit above the block scrolls (C12)
-        let body = egui::Rect::from_min_max(
-            card.min,
-            egui::pos2(card.max.x, (card.max.y - foot).max(card.min.y)));
-        let mut body_ui = ui.new_child(egui::UiBuilder::new()
-            .max_rect(body)
-            .layout(egui::Layout::top_down(Align::Min)));
-        let ui = &mut body_ui;
+        // The facts take what they need, up to what is left over the
+        // block; past that they scroll inside it. So the block sits right
+        // under them while they fit, and at the foot of the pane once they
+        // do not — never off screen, and never floating far below a short
+        // pane (C12, D01, decision O3).
+        // the cap leaves the block its room, and the spacing between the
+        // two, so the card holds exactly the pane's height
+        let body = (inner - foot - ui.spacing().item_spacing.y).max(0.0);
         // salted: the list and this pane share one stable id (D33)
         egui::ScrollArea::vertical()
             .id_salt(("files-detail", view.serial))
-            .max_height(body.height())
+            .max_height(body)
             .auto_shrink([false, true])
             .show(ui, |ui| {
         ui.label(RichText::new("DETAILS").color(theme::TEXT_DIM)
@@ -2460,6 +2469,11 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             }
         }
             });
+        // right under the facts, or at the foot once they scroll: either
+        // way the block is the next thing in the card (O3)
+        if let Some((remote, _)) = &target {
+            paint_actions(ui, state, remote, &plan, out);
+        }
     });
     // kept for the next frame, with the key it was found for
     files.chosen = Some((key, picked));
@@ -2548,23 +2562,52 @@ fn actions_plan(state: &BrowserState, view: &View<'_>,
     plan
 }
 
-/// The block itself. The `ui` it is given is laid out bottom-up from the
-/// foot of the pane, so the plan is walked backwards: the last line is
-/// painted first, at the bottom, and the gap above the block last.
+/// The height of one line: a caption row, or the one button height. The
+/// block declares these when it paints, so the pane can add them up
+/// before it does (1.8, O3).
+fn act_height(ui: &Ui, act: &Act) -> f32 {
+    match act {
+        Act::Caption(..) => theme::line_height(ui, &font::caption()),
+        // what egui gives a button: its line, plus the padding around it
+        Act::Play { .. } | Act::DownloadAndPlay { .. } | Act::Os { .. }
+        | Act::Save { .. } => button_line(ui),
+    }
+}
+
+/// What the block costs the column it sits in: the gap above it, one line
+/// each, and the row spacing that follows every one of them — the gap
+/// included, and the last line too (1.8, O3).
+fn actions_height(ui: &Ui, plan: &[Act]) -> f32 {
+    if plan.is_empty() {
+        return 0.0;
+    }
+    let lines: f32 = plan.iter().map(|act| act_height(ui, act)).sum();
+    let spacing = ui.spacing().item_spacing.y;
+    space::M + lines + (plan.len() as f32 + 1.0) * spacing
+}
+
+/// The block itself, top down, each line at the height `act_height`
+/// promised for it.
 fn paint_actions(ui: &mut Ui, state: &mut BrowserState,
                  remote: &RemoteEntry, plan: &[Act], out: &mut Outcome) {
+    ui.add_space(space::M);
     let width = ui.available_width();
-    for act in plan.iter().rev() {
+    for act in plan {
+        let line = vec2(width, act_height(ui, act));
         match act {
             Act::Caption(text, color) => {
-                ui.label(RichText::new(text).color(*color)
-                    .font(font::caption()));
+                // the declared height, and the left edge every other
+                // caption in the pane starts at (C12)
+                ui.allocate_ui_with_layout(
+                    line, egui::Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.add(egui::Label::new(RichText::new(text)
+                            .color(*color).font(font::caption()))
+                            .truncate());
+                    });
             }
             Act::Play { path, reason } => {
-                if accent_button_reason(ui, "Play",
-                                        vec2(width, size::BUTTON_H),
-                                        *reason)
-                {
+                if accent_button_exact(ui, "Play", line, *reason) {
                     // the remote path decides the speed, not the cached
                     // name (section 7)
                     out.actions.push(Action::Play {
@@ -2573,9 +2616,7 @@ fn paint_actions(ui: &mut Ui, state: &mut BrowserState,
                 }
             }
             Act::DownloadAndPlay { reason } => {
-                if accent_button_reason(ui, "Download & play",
-                                        vec2(width, size::BUTTON_H),
-                                        *reason)
+                if accent_button_exact(ui, "Download & play", line, *reason)
                     && let Some(cmd) = state.download(
                         remote, Dest::Cache { open_after: true })
                 {
@@ -2583,14 +2624,15 @@ fn paint_actions(ui: &mut Ui, state: &mut BrowserState,
                 }
             }
             Act::Os { path, openable } => {
-                ui.horizontal(|ui| {
-                    os_player_buttons(ui, path, *openable, out);
-                });
+                ui.allocate_ui_with_layout(
+                    line, egui::Layout::left_to_right(Align::Center),
+                    |ui| os_player_buttons(ui, path, *openable, line.y,
+                                           out));
             }
             Act::Save { reason } => {
                 // a key-matching copy is copied, never downloaded again
-                if widgets::button(ui, egui::Button::new("Save to PC"),
-                                   *reason)
+                if widgets::button_sized(
+                    ui, egui::Button::new("Save to PC"), line, *reason)
                     && let Some(cmd) = state.download(remote,
                                                       Dest::SaveToPc)
                 {
@@ -4834,9 +4876,95 @@ mod tests {
         texts.iter().find(|text| text.text == label)
     }
 
-    /// O3: whatever the block holds, the facts above it stop where it
-    /// starts. A block laid out from the foot up takes what it needs, and
-    /// the body is given the rest: no overlap, and no gap under it.
+    /// O3, the short branch: with few facts the block sits right under
+    /// them, not at the foot of the pane. Recordings is the case the owner
+    /// caught — three facts and a clock note, with the buttons floating
+    /// about 220 px below them.
+    #[test]
+    fn the_block_sits_under_the_facts_while_they_fit() {
+        let ctx = ctx();
+        let size = Vec2::new(1080.0, 780.0);
+        let mut state = browsed();
+        listed(&mut state, "/ipcam", &IPCAM);
+        let mut files = files_ui(Tab::Recordings);
+        files.selected =
+            Some("/ipcam/ipcam-record.2026-06-01.1.avi".to_string());
+        let now = Instant::now();
+        texts(&ctx, raw_at(size, Vec::new()), &mut state, &mut files,
+              &view(P1S, now));
+        let painted = texts(&ctx, raw_at(size, Vec::new()), &mut state,
+                            &mut files, &view(P1S, now));
+        // the last thing the facts say, and the first line of the block
+        let note = find(&painted, "times are the printer's clock")
+            .expect("the clock note");
+        let first = painted.iter()
+            .find(|text| text.text.starts_with("Download ~"))
+            .or_else(|| find(&painted, "Save to PC"))
+            .expect("the block");
+        let gap = first.rect.min.y - note.rect.max.y;
+        // the gap is space::M plus the row spacing; what it must not be is
+        // the 220 px of a block pinned to the foot
+        assert!(gap > 0.0 && gap < 40.0,
+                "the block floats {gap} px under the facts: note {:?}, \
+                 block {:?}", note.rect, first.rect);
+        // and it is not at the foot: the leftover space is below it
+        let details = find(&painted, "DETAILS").expect("the pane");
+        let last = find(&painted, "Save to PC").expect("the last line");
+        assert!(last.rect.max.y < details.clip.max.y - 40.0,
+                "the block reaches the foot of a pane it should not: {:?} \
+                 in {:?}", last.rect, details.clip);
+    }
+
+    /// E15, O3: the height the pane keeps for the block is what the block
+    /// paints. It is added up from the lines the block declares, so a line
+    /// that took its natural height instead would break the sum, and with
+    /// it the branch between "under the facts" and "at the foot".
+    #[test]
+    fn the_blocks_height_is_what_it_paints() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let now = Instant::now();
+        let copy = std::env::temp_dir().join("bambu-o3-copy.avi");
+        let cached = |_: &RemoteEntry| Some(copy.clone());
+        let openable = |_: &Path| true;
+        let video = state.timelapses[0].video.clone().expect("a video");
+        let gcode = state.files[0].remote.clone();
+        assert!(state.download(&video, Dest::SaveToPc).is_some());
+        // every shape: not on disk and plain, not on disk and playable,
+        // on disk with the players, and one with a transfer note
+        let cases: [(&RemoteEntry, bool, bool); 4] = [
+            (&gcode, false, false),
+            (&video, true, false),
+            (&video, true, true),
+            (&gcode, false, true),
+        ];
+        for (remote, playable, on_disk) in cases {
+            let mut view = view(P1S, now);
+            if on_disk {
+                view.cached = Some(&cached);
+                view.shell_openable = Some(&openable);
+            }
+            let plan = actions_plan(&state, &view, remote, playable);
+            assert!(!plan.is_empty(), "an empty plan for {}", remote.name);
+            let mut out = Outcome::default();
+            let mut measured = (0.0, 0.0);
+            let _ = ctx.run_ui(raw(Vec::new()), |ui| {
+                let kept = actions_height(ui, &plan);
+                // what the block costs the layout it sits in, which is
+                // what the pane takes off the body's cap
+                let before = ui.next_widget_position().y;
+                paint_actions(ui, &mut state, remote, &plan, &mut out);
+                let painted = ui.next_widget_position().y - before;
+                measured = (kept, painted);
+            });
+            let (kept, painted) = measured;
+            assert!((kept - painted).abs() < 0.5,
+                    "{}: kept {kept}, painted {painted}", remote.name);
+        }
+    }
+
+    /// O3, the tall branch: whatever the block holds, the facts above it
+    /// stop where it starts, and it keeps the plan's order.
     #[test]
     fn the_facts_stop_where_the_pinned_block_starts() {
         let size = Vec2::new(1080.0, 780.0);
@@ -4897,13 +5025,13 @@ mod tests {
                 .collect();
             assert!(order.windows(2).all(|pair| pair[0].1 <= pair[1].1),
                     "{path}: the block is out of order: {order:?}");
-            // the scrolling body ends where the block starts: its clip
-            // rect is what a fact may be painted inside
+            // the block never starts past the body's own band, so a
+            // scrolling fact cannot be painted under it
             let details = find(&painted, "DETAILS").expect("the pane");
-            assert!(details.clip.max.y <= top + 1.0,
-                    "{path}: the body is clipped to {:?}, the block starts \
-                     at {top}", details.clip);
-            // and no fact reaches into the block
+            assert!(top <= details.clip.max.y + 1.0,
+                    "{path}: the block starts at {top}, past the body's \
+                     band {:?}", details.clip);
+            // no fact reaches into the block
             for label in ["DETAILS", "KIND", "SIZE", "TIME", "VIDEO",
                           "THUMB", "PRINT"] {
                 if let Some(fact) = find(&painted, label) {
@@ -4977,7 +5105,9 @@ mod tests {
             phase: egui::TouchPhase::Move,
             modifiers: Modifiers::default(),
         };
-        let fact_before = find(&before, "TIME").expect("a fact").rect.min.y;
+        // KIND is the first fact and appears once; the 3mf pane below it
+        // has a TIME of its own, so that label is not usable here
+        let fact_before = find(&before, "KIND").expect("a fact").rect.min.y;
         texts(&ctx, raw_at(size, vec![egui::Event::PointerMoved(over),
                                       notch(), notch(), notch()]),
               &mut state, &mut files, &view(P1S, now));
@@ -4988,9 +5118,10 @@ mod tests {
                                        vec![egui::Event::PointerMoved(over)]),
                           &mut state, &mut files, &view(P1S, now));
         }
-        let fact_after = find(&after, "TIME").expect("a fact").rect.min.y;
-        assert!(fact_after < fact_before - 1.0,
-                "the facts did not scroll: {fact_before} to {fact_after}");
+        // it scrolled up, out of the pane or towards its top
+        let fact_after = find(&after, "KIND").map(|fact| fact.rect.min.y);
+        assert!(fact_after.is_none_or(|at| at < fact_before - 1.0),
+                "the facts did not scroll: {fact_before} to {fact_after:?}");
         let moved = find(&after, "Save to PC").expect("the action").rect;
         assert!((moved.min.y - save.rect.min.y).abs() < 1.0,
                 "the pinned block moved with the scroll: {:?} to {:?}",

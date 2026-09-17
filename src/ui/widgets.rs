@@ -199,6 +199,19 @@ pub fn button(ui: &mut Ui, button: egui::Button<'_>, reason: Option<&str>)
     false
 }
 
+/// The same button at exactly `size`. `Button::min_size` is a floor, so a
+/// button inside a block that added up its line heights would take its
+/// natural height instead and break the sum (1.8, O3).
+pub fn button_sized(ui: &mut Ui, button: egui::Button<'_>, size: Vec2,
+                    reason: Option<&str>) -> bool {
+    let Some(reason) = reason else {
+        return ui.add_sized(size, button).clicked();
+    };
+    ui.add_enabled_ui(false, |ui| ui.add_sized(size, button))
+        .inner.on_disabled_hover_text(reason);
+    false
+}
+
 /// The tone of a banner (C3).
 #[derive(Clone, Copy)]
 pub enum Tone {
