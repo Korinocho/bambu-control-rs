@@ -19,6 +19,9 @@
 # Agent / tooling state
 /.claude/
 CLAUDE.local.md
+# Working notes, screenshots and helper scripts of a review pass. Local
+# only: the publish recipe runs `git add -A`, and these would ride along.
+/scratchpad/
 
 # Release packaging
 /dist/
