@@ -14,9 +14,12 @@ publish = false
 [dependencies]
 eframe = "0.35.0"
 egui = "0.35.0"
-# native-tls is used ONLY by MQTT (rumqttc) and the camera, until GitHub
-# issues #1 and #2 move them to the printer certificate verifier. FTPS does
-# not use it; this is not a transition step for FTPS.
+# native-tls is used ONLY by MQTT (rumqttc), until GitHub issue #1 moves it to
+# the printer certificate verifier. The camera stopped using it when issue #2
+# landed. Two sites remain, both in src/mqtt.rs: the #[cfg(test)] idle probe
+# and PrinterClient::start. FTPS does not use it; this is not a transition
+# step for FTPS. Issue #1 (option 2a, design doc 10.5) removes this line, and
+# tokio leaves the tree with it: tokio is here only under rumqttc.
 native-tls = "0.2.18"
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-native-tls"] }
 suppaftp = { version = "10.0.2", features = ["rustls-ring", "deprecated"] }

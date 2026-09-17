@@ -99,15 +99,21 @@ fn main_takes_the_single_instance_mutex() {
     }
 }
 
-/// T24 (the CI grep, locally): no certificate checks disabled in FTPS code,
-/// the vendored suppaftp included.
+/// T24 (the CI grep, locally): no certificate checks disabled in the code
+/// that verifies certificates -- FTPS, the camera since issue #2, and the
+/// vendored suppaftp.
+///
+/// This list must stay equal to the one in `.github/workflows/ci.yml`. A
+/// local mirror that has drifted is worse than no mirror at all: it passes
+/// for a file CI would fail on, so whoever adds a danger flag there is told
+/// "green" locally and cannot see why the build broke.
 #[test]
 fn ftps_code_never_disables_certificate_checks() {
     let src = root().join("src");
     let mut files = vec![src.join("tls.rs"), src.join("files.rs")];
     rust_files(&src.join("tls"), &mut files);
     files.extend(vendored_files());
-    for later in ["ftp.rs", "browser.rs"] {
+    for later in ["ftp.rs", "browser.rs", "camera.rs"] {
         if src.join(later).exists() {
             files.push(src.join(later));
         }
