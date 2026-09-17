@@ -142,16 +142,20 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
             egui::Grid::new("printer-form").num_columns(2)
                 .spacing([space::L, space::M]).show(ui, |ui| {
                     ui.label("Name");
-                    ui.text_edit_singleline(&mut dlg.draft.name);
+                    ui.add(egui::TextEdit::singleline(&mut dlg.draft.name)
+                        .id_salt("printer-name"));
                     ui.end_row();
                     ui.label("IP address");
-                    ui.text_edit_singleline(&mut dlg.draft.ip);
+                    ui.add(egui::TextEdit::singleline(&mut dlg.draft.ip)
+                        .id_salt("printer-ip"));
                     ui.end_row();
                     ui.label("Serial");
-                    ui.text_edit_singleline(&mut dlg.draft.serial);
+                    ui.add(egui::TextEdit::singleline(&mut dlg.draft.serial)
+                        .id_salt("printer-serial"));
                     ui.end_row();
                     ui.label("Access code");
-                    ui.text_edit_singleline(&mut dlg.draft.access_code);
+                    ui.add(egui::TextEdit::singleline(
+                        &mut dlg.draft.access_code).id_salt("printer-code"));
                     ui.end_row();
                 });
             ui.add_space(space::XS);
@@ -216,6 +220,7 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
         if part == Part::Body {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut dlg.value)
+                    .id_salt("temperature")
                     .font(font::metric())
                     .desired_width(ui.available_width() - 40.0)
                     .horizontal_align(egui::Align::Center));
@@ -550,7 +555,8 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
                 ui.add_space(space::M);
                 ui.label(RichText::new("MODULES").color(theme::TEXT_DIM)
                     .font(font::label()));
-                egui::ScrollArea::vertical().max_height(size::MODULES_MAX_H)
+                egui::ScrollArea::vertical().id_salt("info-modules")
+                    .max_height(size::MODULES_MAX_H)
                     .show(ui, |ui| {
                         egui::Grid::new("modules-grid").num_columns(2)
                             .spacing([space::XXL, space::XS]).show(ui, |ui| {
@@ -676,7 +682,8 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
         ui.label(format!(
             "Objects on plate ({}) — click the map or the list",
             bundle.objects.len()));
-        egui::ScrollArea::vertical().max_height(size::SKIP_LIST_MAX_H)
+        egui::ScrollArea::vertical().id_salt("skip-objects")
+            .max_height(size::SKIP_LIST_MAX_H)
             .show(ui, |ui| {
             for (index, (id, label)) in bundle.objects.iter().enumerate() {
                 if locked.contains(id) {
@@ -706,6 +713,22 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
     })
 }
 
+/// Skip objects after a new job cleared the bundle it was showing: the
+/// dialog says so and stays until Close, instead of vanishing (D12).
+pub fn show_skip_gone(ctx: &egui::Context) -> bool {
+    modal(ctx, "skip", size::MODAL_L, Some("Skip objects"), |ui, part| {
+        match part {
+            Part::Body => {
+                ui.label(RichText::new(
+                    "The print changed; there are no objects to skip.")
+                    .color(theme::TEXT_DIM));
+                false
+            }
+            Part::Footer => wide_button(ui, "Close"),
+        }
+    })
+}
+
 // ------------------------------------------------------------------ hms
 /// Printer-error popup: code + description per active HMS entry,
 /// same style as Device information.
@@ -722,7 +745,8 @@ pub fn show_hms(ctx: &egui::Context, printer_name: &str,
                     .color(theme::ACCENT).font(font::body_strong()));
             });
         }
-        egui::ScrollArea::vertical().max_height(size::HMS_LIST_MAX_H)
+        egui::ScrollArea::vertical().id_salt("hms-errors")
+            .max_height(size::HMS_LIST_MAX_H)
             .show(ui, |ui| {
             for (code, intro) in errors {
                 egui::Frame::new()
@@ -848,8 +872,9 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
         });
         ui.horizontal(|ui| {
             ui.label("Temp:");
-            ui.add(egui::DragValue::new(&mut dlg.fil_temp)
-                .range(180..=300).suffix("°C"));
+            ui.push_id("filament-temp", |ui| ui.add(
+                egui::DragValue::new(&mut dlg.fil_temp)
+                    .range(180..=300).suffix("°C")));
             if ui.button("Load").clicked() {
                 client.load_filament(dlg.fil_slot, dlg.fil_temp);
                 dlg.status = "Load started (nozzle heating)".into();

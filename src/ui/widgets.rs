@@ -25,6 +25,39 @@ pub fn slot(ui: &mut Ui, widest: &str, text: RichText, font: &FontId,
     }).response
 }
 
+/// The tone of a banner (C3).
+#[derive(Clone, Copy)]
+pub enum Tone {
+    Warn,
+    Danger,
+    Neutral,
+}
+
+/// The one banner (C3): full width, text wrapping top-down, an optional
+/// title above it. The caller gives it an id scope of its own (E3).
+pub fn banner(ui: &mut Ui, tone: Tone, title: Option<&str>, text: &str)
+              -> egui::Response {
+    let (color, fill) = match tone {
+        Tone::Warn => (theme::WARN, theme::WARN_BG),
+        Tone::Danger => (theme::DANGER, theme::DANGER_BG),
+        Tone::Neutral => (theme::TEXT_DIM, theme::CARD),
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(radius::CONTROL)
+        .inner_margin(theme::pad::BANNER)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if let Some(title) = title {
+                ui.add(egui::Label::new(RichText::new(title).color(color)
+                    .font(font::body_strong())).wrap());
+            }
+            ui.add(egui::Label::new(RichText::new(text).color(color)
+                .font(font::caption())).wrap());
+        })
+        .response
+}
+
 /// `content` scaled to fit inside `bounds`, keeping its aspect ratio.
 pub fn fit(content: Vec2, bounds: Vec2) -> Vec2 {
     content * (bounds.x / content.x).min(bounds.y / content.y)
