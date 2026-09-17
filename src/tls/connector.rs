@@ -408,12 +408,23 @@ fn write_queued(tls: &mut Tls) {
     }
 }
 
-impl TlsConnector for AnchoredConnector {
-    type Stream = AnchoredStream;
-
-    fn connect(&self, domain: &str, stream: TcpStream)
-               -> FtpResult<AnchoredStream> {
-        let failed = || FtpError::SecureError(CONNECTION_FAILED.into());
+impl AnchoredConnector {
+    /// Opens one anchored TLS connection over `stream`, the only place this
+    /// crate builds one.
+    ///
+    /// The `TlsConnector` impl below delegates here in a line and adds
+    /// nothing: two paths that ran their own handshake would drift, and
+    /// they would drift in what the verifier does, not in style. It is
+    /// inherent rather than only a trait method so that callers which are
+    /// not FTP — the camera on 6000, and MQTT on 8883 when issue #1 lands —
+    /// do not reach through a vendored FTP client's trait to open a socket.
+    ///
+    /// The error is `io::Error` because that is what a caller outside FTP
+    /// can use; why a connection really failed lives in its record, which
+    /// is what `ftp::classify` reads, never the text of this error.
+    pub fn connect_stream(&self, domain: &str, stream: TcpStream)
+                          -> io::Result<AnchoredStream> {
+        let failed = || io::Error::other(CONNECTION_FAILED);
         if self.conns.failed() {
             return Err(failed());
         }
@@ -443,11 +454,23 @@ impl TlsConnector for AnchoredConnector {
             handshake: Handshake::NotStarted,
         };
         // the control connection is verified before suppaftp reads the
-        // banner; a data connection waits for its first use (module doc)
+        // banner; a data connection waits for its first use (module doc).
+        // Every non-FTP caller opens a Control connection, so its handshake
+        // is done and checked before this returns.
         if io.conn.kind == ConnKind::Control {
             io.handshake().map_err(|_| failed())?;
         }
         Ok(AnchoredStream { io, close_notify: true })
+    }
+}
+
+impl TlsConnector for AnchoredConnector {
+    type Stream = AnchoredStream;
+
+    fn connect(&self, domain: &str, stream: TcpStream)
+               -> FtpResult<AnchoredStream> {
+        self.connect_stream(domain, stream)
+            .map_err(|_| FtpError::SecureError(CONNECTION_FAILED.into()))
     }
 }
 
@@ -561,6 +584,27 @@ impl Write for AnchoredIo {
         }
         self.handshake()?;
         self.tls.flush().inspect_err(|e| self.conn.record_late(e))
+    }
+}
+
+/// Reading and writing the stream itself, for callers that are not FTP.
+/// suppaftp reaches the same bytes through `mut_ref()`, and both go to the
+/// one `AnchoredIo`: the handshake, the record of the connection and the
+/// cancel flag are its, so there is no second path to harden. Anything
+/// added here must go to `AnchoredIo`, never to this wrapper.
+impl Read for AnchoredStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.io.read(buf)
+    }
+}
+
+impl Write for AnchoredStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.io.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.io.flush()
     }
 }
 

@@ -901,6 +901,107 @@ pub fn holding_server(config: Arc<ServerConfig>, hold: Duration) -> u16 {
     port
 }
 
+/// What a `recording_server` connection does once its handshake ends. A
+/// handshake that failed always ends as `Drain`, whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterHandshake {
+    /// read until the client closes, recording every record it sent
+    Drain,
+    /// read that many plaintext bytes, keep them, then close both
+    /// directions, so a client waiting for a reply fails at once rather
+    /// than at its IO timeout
+    ReadThenClose(usize),
+}
+
+/// One connection of a `recording_server`, as the server saw it.
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    /// the TLS records the client wrote, named by `describe_records`
+    pub records: Vec<String>,
+    /// the plaintext read under `AfterHandshake::ReadThenClose`, empty
+    /// otherwise or if the read failed
+    pub plaintext: Vec<u8>,
+}
+
+impl Recorded {
+    /// Records of content type 23 (application_data): what the client sent
+    /// above the handshake. Counting raw bytes on the socket would not do,
+    /// since a handshake and an alert are bytes too.
+    ///
+    /// Only meaningful while TLS 1.2 is negotiated, where every record
+    /// carries its type in the clear. Under TLS 1.3 the outer type of every
+    /// record after the ClientHello is 23 and this counts nearly all of
+    /// them (design doc 5.3).
+    pub fn application_data(&self) -> usize {
+        self.records.iter().filter(|r| r.starts_with("ApplicationData"))
+            .count()
+    }
+}
+
+/// A TLS server on 127.0.0.1 that records, per connection, the TLS records
+/// the client wrote and any plaintext it read. It speaks no protocol above
+/// TLS, unlike `ftp_server`: it is for the camera, whose own first bytes
+/// after the handshake carry the access code (design doc 5.3).
+pub struct RecordingServer {
+    pub port: u16,
+    seen: Arc<Mutex<Vec<Recorded>>>,
+}
+
+impl RecordingServer {
+    /// One entry per connection, in the order the connections ended.
+    pub fn connections(&self) -> Vec<Recorded> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+pub fn recording_server(config: Arc<ServerConfig>, after: AfterHandshake)
+                        -> RecordingServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(tcp) = stream else { continue };
+            let (config, sink) = (config.clone(), sink.clone());
+            std::thread::spawn(move || {
+                record_connection(tcp, config, after, &sink).ok();
+            });
+        }
+    });
+    RecordingServer { port, seen }
+}
+
+fn record_connection(tcp: TcpStream, config: Arc<ServerConfig>,
+                     after: AfterHandshake, sink: &Mutex<Vec<Recorded>>)
+                     -> io::Result<()> {
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let conn = ServerConnection::new(config).map_err(io::Error::other)?;
+    let mut tls = StreamOwned::new(conn, Tap { sock: tcp, seen: Vec::new() });
+    let handshake = complete_handshake(&mut tls.conn, &mut tls.sock);
+    let mut plaintext = Vec::new();
+    match after {
+        AfterHandshake::ReadThenClose(n) if handshake.is_ok() => {
+            plaintext = vec![0u8; n];
+            if tls.read_exact(&mut plaintext).is_err() {
+                plaintext.clear();
+            }
+            tls.sock.sock.shutdown(Shutdown::Both).ok();
+        }
+        // a refused handshake ends here too: keep reading, so the client's
+        // alert and anything it sends after it are recorded as well
+        _ => {
+            tls.sock.read_to_end(&mut Vec::new()).ok();
+        }
+    }
+    sink.lock().unwrap_or_else(PoisonError::into_inner).push(Recorded {
+        records: describe_records(&tls.sock.seen),
+        plaintext,
+    });
+    Ok(())
+}
+
 /// A TLS server on 127.0.0.1 that answers each ClientHello with its whole
 /// genuine flight, one byte every `interval`, then holds the socket: every
 /// read gets a byte well inside the IO timeout. The app's TCP probe is let

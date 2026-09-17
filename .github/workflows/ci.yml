@@ -57,16 +57,16 @@ jobs:
             exit 1
           fi
 
-      # FTPS must verify certificates; MQTT and the camera keep the flags
-      # until issues #1 and #2, then this grep covers all of src
-      - name: No danger flags in FTPS code
+      # FTPS and the camera verify certificates; only MQTT still keeps the
+      # flags, until issue #1, and then this grep covers all of src
+      - name: No danger flags in verified code
         run: |
           set +e
-          git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src/tls.rs src/tls src/ftp.rs src/browser.rs src/files.rs vendor/suppaftp/src
+          git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src/tls.rs src/tls src/ftp.rs src/browser.rs src/files.rs src/camera.rs vendor/suppaftp/src
           rc=$?
           set -e
           if [ "$rc" -eq 0 ]; then
-            echo "::error::certificate checks disabled in FTPS code (design doc 5.3)"
+            echo "::error::certificate checks disabled in FTPS or camera code (design doc 5.3)"
             exit 1
           elif [ "$rc" -ne 1 ]; then
             echo "::error::git grep failed (exit $rc)"
