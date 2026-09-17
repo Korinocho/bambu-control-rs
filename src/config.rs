@@ -15,8 +15,42 @@ pub struct PrinterCfg {
     pub access_code: String,
 }
 
+/// The `[files]` table (design doc 5.6): the disk cache's size cap, in
+/// gigabytes. It is written before `printers` so the file stays valid TOML —
+/// a plain table after an array of tables would belong to the last printer.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FilesCfg {
+    #[serde(default = "default_cache_cap_gb")]
+    pub cache_cap_gb: u64,
+}
+
+/// Design doc 5.6: the cache cap defaults to 5 GB.
+fn default_cache_cap_gb() -> u64 {
+    5
+}
+
+impl Default for FilesCfg {
+    fn default() -> Self {
+        Self { cache_cap_gb: default_cache_cap_gb() }
+    }
+}
+
+impl FilesCfg {
+    /// The cap in bytes. A cap of 0 would evict every file the moment it
+    /// lands, so it is read as the default instead.
+    pub fn cache_cap_bytes(&self) -> u64 {
+        let gb = match self.cache_cap_gb {
+            0 => default_cache_cap_gb(),
+            gb => gb,
+        };
+        gb.saturating_mul(1024 * 1024 * 1024)
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub files: FilesCfg,
     #[serde(default)]
     pub printers: Vec<PrinterCfg>,
 }
@@ -243,8 +277,8 @@ pub fn other_authority_refusal(serial: &str) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{CertGeneration, Config, MODEL_PREFIXES, PrinterCfg, Store,
-                cert_generation, files_refused_by_name, load_from,
+    use super::{CertGeneration, Config, FilesCfg, MODEL_PREFIXES, PrinterCfg,
+                Store, cert_generation, files_refused_by_name, load_from,
                 model_from_serial, normalize_serial, other_authority_refusal,
                 save_to};
 
@@ -387,7 +421,8 @@ mod tests {
     fn config_save_is_atomic_and_reports_errors() {
         let dir = TempDir::new("save");
         let path = dir.path().join("config.toml");
-        let cfg = Config { printers: vec![printer("01P00A000000001")] };
+        let cfg = Config { printers: vec![printer("01P00A000000001")],
+                           ..Default::default() };
         save_to(&path, &cfg).unwrap();
         assert_eq!(dir.entries(), ["config.toml"], "no temp file left");
         let first = std::fs::read_to_string(&path).unwrap();
@@ -405,7 +440,9 @@ mod tests {
             use std::os::windows::fs::OpenOptionsExt;
             let lock = std::fs::OpenOptions::new().read(true).share_mode(0)
                 .open(&path).unwrap();
-            let changed = Config { printers: vec![printer("01P00A000000002")] };
+            let changed = Config {
+                printers: vec![printer("01P00A000000002")],
+                ..Default::default() };
             assert!(save_to(&path, &changed).is_err());
             drop(lock);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
@@ -421,7 +458,9 @@ mod tests {
             // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
             let mut old = std::fs::OpenOptions::new().read(true)
                 .share_mode(0x7).open(&path).unwrap();
-            let changed = Config { printers: vec![printer("01P00A000000004")] };
+            let changed = Config {
+                printers: vec![printer("01P00A000000004")],
+                ..Default::default() };
             save_to(&path, &changed).unwrap();
             let mut seen = String::new();
             old.read_to_string(&mut seen).unwrap();
@@ -435,6 +474,7 @@ mod tests {
         // and a later save replaces the whole content
         let two = Config {
             printers: vec![printer("01P00A000000003"), printer("0390000")],
+            ..Default::default()
         };
         save_to(&path, &two).unwrap();
         let loaded = load_from(&path, &[]).unwrap();
@@ -479,7 +519,8 @@ mod tests {
     fn save_after_a_failed_load_is_refused() {
         let dir = TempDir::new("blocked");
         let path = dir.path().join("config.toml");
-        let cfg = Config { printers: vec![printer("01P00A000000001")] };
+        let cfg = Config { printers: vec![printer("01P00A000000001")],
+                           ..Default::default() };
         let broken = "[[printers]]\nname = \"P1S\"\naccess_code = SECRETCODE\n";
         std::fs::write(&path, broken).unwrap();
         let (store, loaded) = Store::open(path.clone(), &[]);
@@ -510,13 +551,50 @@ mod tests {
         assert_eq!(normalize_serial(" 01p00a000000001\t"), "01P00A000000001");
         let dir = TempDir::new("serial");
         let path = dir.path().join("config.toml");
-        save_to(&path, &Config { printers: vec![printer(" 01p00a0001 ")] })
-            .unwrap();
+        save_to(&path, &Config {
+            printers: vec![printer(" 01p00a0001 ")],
+            ..Default::default() }).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("serial = \"01P00A0001\""), "{text}");
         std::fs::write(&path, "[[printers]]\nname = \"a\"\nip = \"b\"\n\
             serial = \" 039x \"\naccess_code = \"c\"\n").unwrap();
         let loaded = load_from(&path, &[]).unwrap();
         assert_eq!(loaded.cfg.printers[0].serial, "039X");
+    }
+
+    /// Design doc 5.6: the cache cap is a `[files]` table, it defaults to
+    /// 5 GB, and a config written before the table still loads.
+    #[test]
+    fn the_files_table_carries_the_cache_cap() {
+        assert_eq!(FilesCfg::default().cache_cap_gb, 5);
+        assert_eq!(FilesCfg::default().cache_cap_bytes(),
+                   5 * 1024 * 1024 * 1024);
+        // a cap of 0 would evict every file the moment it landed
+        assert_eq!(FilesCfg { cache_cap_gb: 0 }.cache_cap_bytes(),
+                   FilesCfg::default().cache_cap_bytes());
+
+        let dir = TempDir::new("files");
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            files: FilesCfg { cache_cap_gb: 12 },
+            printers: vec![printer("01P00A000000001")],
+        };
+        save_to(&path, &cfg).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[files]")
+                && text.contains("cache_cap_gb = 12"), "{text}");
+        assert_eq!(load_from(&path, &[]).unwrap().cfg.files.cache_cap_gb, 12);
+
+        // every printer still round-trips next to the new table
+        assert_eq!(load_from(&path, &[]).unwrap().cfg.printers,
+                   cfg.printers);
+
+        // a config written before the table reads as the default, and is
+        // not rejected
+        std::fs::write(&path, "[[printers]]\nname = \"a\"\nip = \"b\"\n\
+            serial = \"039X\"\naccess_code = \"c\"\n").unwrap();
+        let loaded = load_from(&path, &[]).unwrap();
+        assert_eq!(loaded.cfg.files.cache_cap_gb, 5);
+        assert_eq!(loaded.cfg.printers.len(), 1);
     }
 }
