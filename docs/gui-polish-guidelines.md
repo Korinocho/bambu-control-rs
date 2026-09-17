@@ -102,12 +102,12 @@ Every ratio is the WCAG contrast ratio, computed from the hex values.
 
 | Token | Value | Status | Role | Contrast |
 |---|---|---|---|---|
-| `BG` | `#0B0D0C` | kept | Canvas: top bar, CentralPanel, modal fill, popup fill | TEXT 16.73, TEXT_DIM 7.28 |
+| `BG` | `#0B0D0C` | kept | Canvas: top bar, CentralPanel, popup fill (a modal is `CARD` since decision O11) | TEXT 16.73, TEXT_DIM 7.28 |
 | `CARD` | `#181C1A` | kept | Cards, tiles, list rows, chips, transfer rows | TEXT 14.77, TEXT_DIM 6.42 |
 | `CARD_HOVER` | `#232826` | kept | Rest fill of buttons and inputs (`extreme_bg_color`, progress track); hover fill of clickable surfaces; job-thumbnail well; skeletons; jog inner ring | TEXT 12.84, TEXT_DIM 5.59 |
 | `HOVER_FILL` | `#2B312D` | named (literal at `theme.rs:61-62`) | Hover fill of egui widgets; jog home disc (was `#2C322F`, `widgets.rs:121`) | TEXT 11.41, TEXT_DIM 4.96, DANGER 4.59 |
 | `PRESSED_FILL` | `#1D2220` | **changed** (was `#14171A`, `theme.rs:64-65`: blue-tinted and darker than CARD) | Pressed and keyboard-focused fill | TEXT 13.84, TEXT_DIM 6.02, DANGER 5.57 |
-| `BORDER` | `#2B302D` | kept | 1 px rest outline of cards, tiles, rows, chips, modal, inputs | decorative (A3) |
+| `BORDER` | `#454C48` | **lighter** (decision O11; was `#2B302D`) | 1 px rest outline of cards, tiles, rows, chips, modal, inputs | decorative (A3); 1.95 on CARD, 2.21 on BG |
 | `TEXT` | `#ECEEED` | kept | Primary text; selected-tab text; focus ring; plate-map numbers | — |
 | `TEXT_DIM` | `#98A09B` | kept | Captions, units, section labels, placeholders | ≥ 4.96 on every surface above. **Illegal on ACCENT_DARK (2.30).** |
 | `ACCENT` | `#22B14C` | kept | Primary button fill, toggle on, progress fill, selection ring, Running state | CARD 6.12, HOVER_FILL 4.72. **Illegal on ACCENT_DARK (2.19).** |
@@ -530,7 +530,7 @@ Add these to `tests/source_rules.rs`. They scan the production part of `src/ui/*
 ### C15. Dialogs
 
 - **One shell:** `modal(ctx, id, width, header, body, footer)`.
-  - Frame: fill `BG`, 1 px `BORDER`, `radius::CARD`, `pad::MODAL`.
+  - Frame: fill `CARD` (decision O11; it was `BG`, which matched the canvas), 1 px `BORDER`, `radius::CARD`, `pad::MODAL`.
   - Header: `title`, centred.
   - Body: inside `ScrollArea::vertical().id_salt(id)`, max height = screen height − 2·`pad::MODAL` − header − footer − 2·`space::L`.
   - Footer: the action row or Close, outside the scroll and always visible.
