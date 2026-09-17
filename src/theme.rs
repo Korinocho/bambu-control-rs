@@ -21,7 +21,9 @@ pub const HOVER_FILL: Color32 = Color32::from_rgb(0x2b, 0x31, 0x2d);
 /// Pressed and keyboard-focused fill.
 pub const PRESSED_FILL: Color32 = Color32::from_rgb(0x1d, 0x22, 0x20);
 /// 1 px rest outline of cards, tiles, rows, chips, modal, inputs.
-pub const BORDER: Color32 = Color32::from_rgb(0x2b, 0x30, 0x2d);
+/// Decorative (A3), and light enough to read as an edge: 1.95:1 on CARD,
+/// where the flat #2B302D it replaced was 1.28:1 (decision O11).
+pub const BORDER: Color32 = Color32::from_rgb(0x45, 0x4c, 0x48);
 pub const TEXT: Color32 = Color32::from_rgb(0xec, 0xee, 0xed);
 /// Captions, units, section labels, placeholders. Never on ACCENT_DARK.
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0x98, 0xa0, 0x9b);
@@ -497,7 +499,26 @@ mod tests {
         ("KNOB on TRACK_OFF", KNOB, TRACK_OFF, 4.88, LARGE_MIN),
         ("TEXT_DIM on MEDIA_WELL", TEXT_DIM, MEDIA_WELL, 7.84, TEXT_MIN),
         ("TEXT on PLATE_OBJECT", TEXT, PLATE_OBJECT, 9.10, TEXT_MIN),
+        // a dialog is a CARD surface since O11, so every pair its text
+        // makes is the CARD pair, already above; what is new is the
+        // outline that surrounds both, and it is decorative (A3)
     ];
+
+    /// 1.2 and decision O11: the outline is decorative, so it has no
+    /// floor to clear, but it has to read as an edge. These are the two
+    /// surfaces it is drawn on.
+    #[test]
+    fn the_outline_reads_as_an_edge_on_both_surfaces() {
+        for (name, under, documented) in [("CARD", CARD, 1.95),
+                                          ("BG", BG, 2.21)] {
+            let ratio = contrast(BORDER, under);
+            assert!((ratio - documented).abs() < 0.01,
+                    "BORDER on {name}: {ratio:.3}, the table says \
+                     {documented}");
+            // the flat #2B302D it replaced was 1.28:1 on CARD
+            assert!(ratio > 1.5, "BORDER on {name} is flat: {ratio:.2}");
+        }
+    }
 
     /// A1 and A2: every pair section 1.2 allows clears its floor, and its
     /// ratio is the one the table documents.

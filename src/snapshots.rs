@@ -1202,6 +1202,57 @@ fn a_context_shot_twice_is_refused() {
     shoot(&ctx, [8, 8], 1.0, Vec::new(), draw);
 }
 
+/// O11: a dialog is a card over the canvas. With the old `BG` fill its
+/// only edge was the outline, and on the canvas that read as flat.
+#[test]
+fn a_dialog_is_filled_like_a_card() {
+    let ctx = context(1.0);
+    let dir = TempDir::new("modal-fill");
+    let mut app = app(&ctx, &PRINTERS, &dir);
+    app.dialog = Dialog::Temp(dialogs::TempDlg {
+        nozzle: true, value: "220".to_string() });
+    let mut frame = eframe::Frame::_new_kittest();
+    let points = vec2(1080.0, 780.0);
+    let mut rects: Vec<(egui::Rect, egui::Color32)> = Vec::new();
+    fn walk(shape: &egui::Shape,
+            found: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match shape {
+            egui::Shape::Rect(rect) => found.push((rect.rect, rect.fill)),
+            egui::Shape::Vec(shapes) =>
+                shapes.iter().for_each(|shape| walk(shape, found)),
+            _ => {}
+        }
+    }
+    for step in 0..3 {
+        let out = ctx.run_ui(raw_input(points, f64::from(step), Vec::new()),
+                             |ui| app.ui(ui, &mut frame));
+        if step == 2 {
+            for clipped in &out.shapes {
+                walk(&clipped.shape, &mut rects);
+            }
+        }
+    }
+    // the dialog is the widest thing under the middle of the window that
+    // is not the canvas behind it
+    let middle = (points / 2.0).to_pos2();
+    // a modal is centred on the window and exactly as wide as its size
+    // token plus its own margin
+    // its own hairline sits outside the margin
+    let wide = crate::theme::size::MODAL_M
+        + crate::theme::pad::MODAL.sum().x
+        + 2.0 * crate::theme::stroke::HAIRLINE;
+    let (rect, fill) = rects.iter()
+        .filter(|(rect, _)| rect.contains(middle)
+                && (rect.center().x - middle.x).abs() < 2.0
+                && (rect.width() - wide).abs() < 1.0)
+        .max_by(|a, b| a.0.area().total_cmp(&b.0.area()))
+        .copied()
+        .expect("a dialog centred on the window");
+    assert_eq!(fill, crate::theme::CARD,
+               "the dialog at {rect:?} is not filled like a card");
+    assert_ne!(fill, crate::theme::BG, "the dialog matches the canvas");
+}
+
 /// A8: the tool buttons take the keyboard in the order they are painted,
 /// left to right. They sit at the right end of the bar, and laying them
 /// out right to left would walk them backwards.

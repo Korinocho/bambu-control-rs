@@ -52,7 +52,9 @@ fn modal(ctx: &egui::Context, id: &str, width: f32, title: Option<&str>,
     let footer_id = egui::Id::new(id).with("footer-height");
     let response = egui::Modal::new(egui::Id::new(id))
         .frame(egui::Frame::new()
-            .fill(theme::BG)
+            // a dialog is a card over the canvas, not more canvas: with
+            // the BG fill its edge was the outline alone (decision O11)
+            .fill(theme::CARD)
             .stroke(Stroke::new(stroke::HAIRLINE, theme::BORDER))
             .corner_radius(radius::CARD)
             .inner_margin(pad::MODAL))
