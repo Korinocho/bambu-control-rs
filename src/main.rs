@@ -17,6 +17,8 @@ mod hms;
 mod instance;
 mod mqtt;
 mod player;
+#[cfg(test)]
+mod snapshots;
 mod theme;
 mod threemf;
 mod tls;
