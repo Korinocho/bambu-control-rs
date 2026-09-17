@@ -1002,6 +1002,42 @@ fn record_connection(tcp: TcpStream, config: Arc<ServerConfig>,
     Ok(())
 }
 
+/// A TLS server on 127.0.0.1 that waits `delay` before it touches the
+/// handshake at all, then completes it and sends one byte, then holds the
+/// socket. The client's handshake blocks for `delay` in one piece, which a
+/// per-byte trickle cannot express: `trickle_server` paces every byte, so
+/// no single wait is long. The app's TCP probe is let go.
+pub fn slow_handshake_server(config: Arc<ServerConfig>, delay: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(tcp) = stream else { continue };
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let mut first = [0u8; 1];
+                if tcp.peek(&mut first).unwrap_or(0) == 0 {
+                    return;
+                }
+                std::thread::sleep(delay);
+                let Ok(conn) = ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = StreamOwned::new(conn, tcp);
+                while tls.conn.is_handshaking() {
+                    if tls.conn.complete_io(&mut tls.sock).is_err() {
+                        return;
+                    }
+                }
+                tls.write_all(b"x").ok();
+                tls.flush().ok();
+                std::thread::sleep(HOLD);
+            });
+        }
+    });
+    port
+}
+
 /// A TLS server on 127.0.0.1 that answers each ClientHello with its whole
 /// genuine flight, one byte every `interval`, then holds the socket: every
 /// read gets a byte well inside the IO timeout. The app's TCP probe is let

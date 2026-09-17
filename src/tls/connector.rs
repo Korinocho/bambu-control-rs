@@ -270,13 +270,18 @@ pub struct SessionSocket {
     received: u64,
     /// set while a handshake or a close runs
     deadline: Option<Instant>,
+    /// the caller's per-operation budget for data, or None for `io_timeout`
+    /// (5.2). Taken out for the handshake and the close, which have budgets
+    /// of their own.
+    command: Option<Duration>,
 }
 
 impl SessionSocket {
     fn new(sock: TcpStream, io_timeout: Duration, conns: Arc<SessionConns>)
            -> io::Result<Self> {
         sock.set_nonblocking(true)?;
-        Ok(Self { sock, io_timeout, conns, received: 0, deadline: None })
+        Ok(Self { sock, io_timeout, conns, received: 0, deadline: None,
+                  command: None })
     }
 
     fn cancelled(&self) -> io::Error {
@@ -290,9 +295,17 @@ impl SessionSocket {
                mut op: impl FnMut(&mut TcpStream) -> io::Result<R>)
                -> io::Result<R> {
         let started = Instant::now();
+        // A caller's command budget only ever tightens: `io_timeout` is the
+        // ceiling, so a per-call value can shorten a wait but never lengthen
+        // one, and a distracted caller cannot hold a lane open (5.2). The
+        // handshake and the close take `command` out first, so this is
+        // `io_timeout` for them whatever the caller asked for.
+        let budget = match self.command {
+            Some(command) => command.min(self.io_timeout),
+            None => self.io_timeout,
+        };
         let limit = self.deadline
-            .map_or(started + self.io_timeout,
-                    |d| d.min(started + self.io_timeout));
+            .map_or(started + budget, |d| d.min(started + budget));
         let past_limit = || io::Error::new(io::ErrorKind::TimedOut,
                                            "no progress within the time limit");
         // a peer whose bytes never make a read wait still meets the deadline
@@ -398,7 +411,16 @@ fn outcome_of(err: &io::Error, received: u64) -> ConnOutcome {
 }
 
 /// Writes what rustls has queued within CLOSE_LIMIT; never reads.
+///
+/// This ignores the caller's command budget, deliberately. Its two callers
+/// are the failed handshake, which is inside the phase that already ignores
+/// it, and `Drop for AnchoredStream`, which nobody waits on --
+/// `dropping_a_stream_never_waits_for_the_peer` holds it under a second and
+/// it never reads. So the budget would tighten nothing a user is waiting
+/// for, while a close_notify cut short can leave the session open on the
+/// printer, and printer session slots are the scarce resource (gate G4).
 fn write_queued(tls: &mut Tls) {
+    tls.sock.command = None;
     tls.sock.deadline = Some(Instant::now() + CLOSE_LIMIT.min(tls.sock.io_timeout));
     while tls.conn.wants_write() {
         match tls.conn.write_tls(&mut tls.sock) {
@@ -507,6 +529,19 @@ impl AnchoredIo {
         &self.tls.conn
     }
 
+    /// The caller's per-operation budget for reads and writes once the
+    /// handshake is done, or None for the construction `io_timeout` (5.2).
+    ///
+    /// It only tightens: `wait` caps it at `io_timeout`, so a caller can ask
+    /// for less time than the lane allows and never for more. The handshake
+    /// and the close ignore it and keep their own budgets.
+    #[cfg_attr(not(test), allow(dead_code,
+        reason = "the caller-supplied budget of 5.2; MQTT is its first app \
+                  caller, when issue #1 lands"))]
+    pub fn set_command_budget(&mut self, budget: Option<Duration>) {
+        self.tls.sock.command = budget;
+    }
+
     /// Runs this connection's handshake once and records its outcome. A
     /// failed handshake closes the connection: the queued alert is written
     /// within CLOSE_LIMIT, nothing is read, and the socket is shut down.
@@ -517,6 +552,13 @@ impl AnchoredIo {
                 return Err(io::Error::new(kind, CONNECTION_FAILED)),
             Handshake::NotStarted => {}
         }
+        // The handshake never runs on a caller's command budget (5.2): it is
+        // measured in hundreds of milliseconds on these printers, while a UI
+        // command budget is tens, so letting one govern the other would be
+        // the io_timeout defect again with more steps. Its budget comes from
+        // construction alone -- io_timeout per operation, and this limit for
+        // the phase.
+        let command = self.tls.sock.command.take();
         let limit = self.tls.sock.io_timeout * HANDSHAKE_IO_TIMEOUTS;
         self.tls.sock.deadline = Some(Instant::now() + limit);
         let result = complete_handshake(&mut self.tls)
@@ -524,6 +566,8 @@ impl AnchoredIo {
         self.tls.sock.deadline = None;
         match result {
             Ok(()) => {
+                // restored for data only: from here the caller's budget rules
+                self.tls.sock.command = command;
                 self.handshake = Handshake::Done;
                 Ok(())
             }
@@ -584,6 +628,17 @@ impl Write for AnchoredIo {
         }
         self.handshake()?;
         self.tls.flush().inspect_err(|e| self.conn.record_late(e))
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code,
+    reason = "the caller-supplied budget of 5.2; MQTT is its first app \
+              caller, when issue #1 lands"))]
+impl AnchoredStream {
+    /// Delegates to `AnchoredIo`, which owns every socket setting: see the
+    /// note below on why nothing is implemented on this wrapper.
+    pub fn set_command_budget(&mut self, budget: Option<Duration>) {
+        self.io.set_command_budget(budget);
     }
 }
 
