@@ -24,7 +24,7 @@ use crate::ftp::{FtpError, RemoteEntry, ServerProfile};
 use crate::player::{self, PlayerCmd};
 use crate::theme::{self, font, pad, radius, size, space, stroke};
 use crate::tls;
-use crate::ui::dialogs::accent_button_response;
+use crate::ui::dialogs::{accent_button_reason, accent_button_response};
 use crate::ui::panel::card_frame;
 use crate::ui::widgets;
 
@@ -440,7 +440,7 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 ui.set_width(list_w);
                 // the list never eats the detail pane's width
                 ui.set_max_width(list_w);
-                list(ui, state, files, view, &rows, &mut out);
+                list(ui, state, files, view, &rows, columns, &mut out);
             });
             ui.allocate_ui_with_layout(vec2(ui.available_width(), body),
                 egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -1446,9 +1446,9 @@ fn damaged_dirs(state: &BrowserState, tab: Tab) -> Vec<(String, usize)> {
 // -------------------------------------------------------------- the list
 
 fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
-        view: &View<'_>, rows: &Rows, out: &mut Outcome) {
+        view: &View<'_>, rows: &Rows, columns: usize, out: &mut Outcome) {
     if rows.loading && rows.rows.is_empty() {
-        skeletons(ui, files.tab);
+        skeletons(ui, files.tab, columns);
         return;
     }
     if let Some(empty) = &rows.empty {
@@ -1536,7 +1536,10 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     .color(theme::TEXT_DIM).font(font::caption()))
                     .truncate());
             }
-            Row::Skeleton => skeleton_row(ui, reserved.row),
+            Row::Skeleton => skeleton(
+                ui, vec2(ui.available_width()
+                             .min(size::SKELETON_MAX_W),
+                         reserved.row)),
         }
     });
     // the heights come from the style, never from what was painted: this
@@ -1663,23 +1666,34 @@ fn virtual_rows(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::Debug,
     measured
 }
 
-fn skeletons(ui: &mut Ui, tab: Tab) {
+fn skeletons(ui: &mut Ui, tab: Tab, columns: usize) {
     ui.label(RichText::new(match tab {
         Tab::Timelapses => "listing /timelapse…",
         Tab::Recordings => "listing /ipcam…",
         Tab::Files => "listing /cache…",
     }).color(theme::TEXT_DIM).font(font::caption()));
-    let height = Heights::of(ui).row;
+    let reserved = Heights::of(ui);
+    // the placeholders have the shape of what replaces them, so the list
+    // does not relayout when the listing lands (C17, D30)
+    if tab == Tab::Timelapses {
+        for _ in 0..2 {
+            ui.horizontal_top(|ui| {
+                for _ in 0..columns {
+                    skeleton(ui, vec2(size::TILE_W, reserved.tile));
+                }
+            });
+        }
+        return;
+    }
     for _ in 0..6 {
-        skeleton_row(ui, height);
+        skeleton(ui, vec2(ui.available_width().min(size::SKELETON_MAX_W),
+                          reserved.row));
     }
 }
 
-/// A placeholder as tall as the list row it stands for.
-fn skeleton_row(ui: &mut Ui, height: f32) {
-    let (rect, _) = ui.allocate_exact_size(
-        vec2(ui.available_width().min(size::SKELETON_MAX_W), height),
-        Sense::hover());
+/// A placeholder shaped like what will replace it (C17).
+fn skeleton(ui: &mut Ui, size: egui::Vec2) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter().rect_filled(rect, radius::CONTROL, theme::CARD_HOVER);
 }
 
@@ -1712,13 +1726,15 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     let selected = files.selected.as_deref() == Some(key.as_str());
 
     // the outline is a hairline in every state, so a tile is exactly
-    // TILE_W wide whether or not it is selected (C10, E10)
-    let shown = egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(Stroke::new(stroke::HAIRLINE, theme::BORDER))
-        .corner_radius(radius::CARD)
-        .inner_margin(pad::TILE)
-        .show(ui, |ui| {
+    // TILE_W wide whether or not it is selected (C10, E10). The tile is
+    // itself the widget, so hover, pressed and focus land on it (C2, C10)
+    let shown = widgets::clickable(
+        ui, ("tile", key.as_str()),
+        widgets::Surface::card()
+            .radius(radius::CARD)
+            .padding(pad::TILE)
+            .selected(selected, false),
+        |ui| {
             let inner = size::TILE_W - pad::TILE.sum().x
                 - 2.0 * stroke::HAIRLINE;
             ui.set_width(inner);
@@ -1769,9 +1785,19 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 ui.add(egui::Label::new(RichText::new("⚠ no video")
                     .color(theme::WARN).font(font::caption())).truncate());
             } else if failed {
-                retry_at = Some(ui.add(egui::Label::new(
+                // a real widget, so it hovers and takes the keyboard; its
+                // interact rect is grown to INLINE_TARGET_H without moving
+                // the line (A5, C10)
+                ui.spacing_mut().button_padding.x = 0.0;
+                let retry = ui.add(egui::Button::new(
                     RichText::new("⟳ retry").color(theme::ACCENT)
-                        .font(font::caption()))).rect);
+                        .font(font::caption())).small().frame(false));
+                let grow = ((size::INLINE_TARGET_H - retry.rect.height())
+                    / 2.0).max(0.0);
+                let target = retry.rect.expand2(vec2(0.0, grow));
+                let hit = ui.interact(target, retry.id.with("target"),
+                                      Sense::click());
+                retry_at = Some((target, retry.clicked() || hit.clicked()));
             } else {
                 ui.add(egui::Label::new(RichText::new(when_text(started))
                     .color(theme::TEXT_DIM).font(font::caption()))
@@ -1781,20 +1807,16 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 .font(font::caption())).truncate());
             retry_at
         });
-    // the selection ring is painted over the tile, inside its edge
-    if selected {
-        ui.painter().rect_stroke(shown.response.rect, radius::CARD,
-                                 Stroke::new(stroke::SELECTED, theme::ACCENT),
-                                 egui::StrokeKind::Inside);
-    }
     let retry_at = shown.inner;
-    let response = shown.response.interact(Sense::click());
-    if response.hovered() {
-        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-    }
-    if response.clicked() {
-        let on_retry = retry_at.zip(response.interact_pointer_pos())
-            .is_some_and(|(rect, pos)| rect.contains(pos));
+    let response = shown.response
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // the retry takes its own click; the tile's click over the same spot
+    // is the same answer, so a pointer the scope kept still retries
+    let retried = retry_at.is_some_and(|(_, clicked)| clicked);
+    if retried || response.clicked() {
+        let on_retry = retried || retry_at
+            .zip(response.interact_pointer_pos())
+            .is_some_and(|((rect, _), pos)| rect.contains(pos));
         match (on_retry, &thumb) {
             // a failed tile is asked for again here and nowhere else:
             // never once per frame for as long as it is on screen
@@ -1900,14 +1922,15 @@ fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
         if indent > 0.0 {
             ui.add_space(indent);
         }
-        egui::Frame::new()
-            .fill(if selected { theme::CARD_HOVER } else { theme::CARD })
-            .stroke(Stroke::new(stroke::HAIRLINE,
-                                if selected { theme::ACCENT }
-                                else { theme::BORDER }))
-            .corner_radius(radius::CONTROL)
-            .inner_margin(pad::ROW)
-            .show(ui, |ui| {
+        // the row is the widget: hover, pressed and focus land on it and
+        // its selection is a ring over the same hairline (C2, C11, E24)
+        widgets::clickable(
+            ui, ("row", entry.path.as_str()),
+            widgets::Surface::card()
+                .radius(radius::CONTROL)
+                .padding(pad::ROW)
+                .selected(selected, true),
+            |ui| {
                 ui.set_width(ui.available_width());
                 let caption = font::caption();
                 let dim = theme::TEXT_DIM;
@@ -1959,10 +1982,13 @@ fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
                     });
             })
             .response
-    }).inner.interact(Sense::click());
-    if response.hovered() && !entry.unreadable {
-        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-    }
+    }).inner;
+    // a name the listing could not decode is not a target, so the cursor
+    // stays as it is (A11, E23)
+    let response = match entry.unreadable {
+        true => response,
+        false => response.on_hover_cursor(egui::CursorIcon::PointingHand),
+    };
     let clicked = response.clicked() && !entry.unreadable;
     if clicked && !entry.is_dir {
         files.selected = Some(entry.path.clone());
@@ -2259,6 +2285,11 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
     let local = state.local_copy(&remote.path).map(Path::to_path_buf)
         .or_else(|| view.cached.and_then(|cached| cached(remote)));
     let width = ui.available_width();
+    // a file already on its way is not downloaded twice: the buttons say
+    // so instead of dropping the click (D11, browser.rs `download`)
+    let busy = state.transfer_of(&remote.path)
+        .is_some_and(TransferUi::active)
+        .then_some("Already downloading");
     match &local {
         Some(path) => {
             if playable
@@ -2276,7 +2307,7 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
             let openable = may_reach_shell(view, path);
             ui.horizontal(|ui| os_player_buttons(ui, path, openable, out));
             // a key-matching copy is copied, never downloaded again (5.6)
-            if ui.button("Save to PC").clicked()
+            if widgets::button(ui, egui::Button::new("Save to PC"), busy)
                 && let Some(cmd) = state.download(remote, Dest::SaveToPc)
             {
                 out.cmds.push(cmd);
@@ -2287,15 +2318,14 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                 "Download {}", download_eta(remote.size, state.rate_bps)))
                 .color(theme::TEXT_DIM).font(font::caption()));
             if playable
-                && accent_button_response(ui, "Download & play",
-                                          vec2(width, size::BUTTON_H))
-                    .clicked()
+                && accent_button_reason(ui, "Download & play",
+                                        vec2(width, size::BUTTON_H), busy)
                 && let Some(cmd) = state.download(
                     remote, Dest::Cache { open_after: true })
             {
                 out.cmds.push(cmd);
             }
-            if ui.button("Save to PC").clicked()
+            if widgets::button(ui, egui::Button::new("Save to PC"), busy)
                 && let Some(cmd) = state.download(remote, Dest::SaveToPc)
             {
                 out.cmds.push(cmd);
@@ -2616,6 +2646,12 @@ mod tests {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         theme::apply(&ctx);
+        // a tooltip waits for a real pointer to rest; there is none here,
+        // so the wait goes and what it would say is painted
+        ctx.all_styles_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
         ctx
     }
 
@@ -2717,6 +2753,32 @@ mod tests {
         frame(ctx, raw(vec![moved.clone()]), state, files, view);
         frame(ctx, raw(vec![moved.clone(), button(true)]), state, files, view);
         frame(ctx, raw(vec![moved, button(false)]), state, files, view).out
+    }
+
+    /// The pointer resting over whatever painted `label`, and what that
+    /// frame painted — a disabled control's reason among it.
+    ///
+    /// It builds a context of its own: egui keeps one tooltip open per
+    /// context, and a second hover in the same one never opens a tooltip
+    /// for the widget it moved to.
+    fn hover(state: &mut BrowserState, files: &mut FilesUi,
+             view: &View<'_>, label: &str) -> Painted {
+        let ctx = ctx();
+        // one frame to size everything, so the label is where it will stay
+        frame(&ctx, raw(Vec::new()), state, files, view);
+        let spot = frame(&ctx, raw(Vec::new()), state, files, view)
+            .spot(label)
+            .unwrap_or_else(|| panic!("nothing painted for {label:?}"));
+        let moved = egui::Event::PointerMoved(spot);
+        // a tooltip opens once the pointer has rested on the widget past
+        // the delay, so the clock moves with the frames, forwards only
+        let start = ctx.input(|input| input.time);
+        let timed = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            time: Some(start + time),
+            ..raw(events)
+        };
+        frame(&ctx, timed(0.1, vec![moved.clone()]), state, files, view);
+        frame(&ctx, timed(0.8, vec![moved]), state, files, view)
     }
 
     fn entries(dir: &str, lines: &[&str]) -> Vec<RemoteEntry> {
@@ -3060,6 +3122,86 @@ mod tests {
         assert!(!painted.has("No timelapses on this printer"));
     }
 
+    /// C17, D30: what stands in for a listing has the shape of what
+    /// replaces it — tiles on Timelapses, rows on Print files — so the
+    /// list does not relayout when the listing lands.
+    #[test]
+    fn the_placeholders_have_the_shape_of_what_replaces_them() {
+        /// Every rect painted in `fill`, on a tab given as it is.
+        fn rects(state: &mut BrowserState, files: &mut FilesUi,
+                 fill: egui::Color32) -> Vec<Rect> {
+            let ctx = ctx();
+            let view = view(P1S, Instant::now());
+            let mut rects = Vec::new();
+            fn walk(shape: &egui::Shape, fill: egui::Color32,
+                    rects: &mut Vec<Rect>) {
+                match shape {
+                    egui::Shape::Rect(rect) if rect.fill == fill =>
+                        rects.push(rect.rect),
+                    egui::Shape::Vec(shapes) => shapes.iter()
+                        .for_each(|shape| walk(shape, fill, rects)),
+                    _ => {}
+                }
+            }
+            // one frame to size everything, then the one that is read
+            frame(&ctx, raw(Vec::new()), state, files, &view);
+            let full = ctx.run_ui(raw(Vec::new()), |ui| {
+                show(ui, state, files, &view);
+            });
+            for clipped in &full.shapes {
+                walk(&clipped.shape, fill, &mut rects);
+            }
+            rects
+        }
+        // buttons and the selected tab are painted in the placeholder's
+        // own fill, so a placeholder is what the list body holds: below
+        // the filter row and above the cache line
+        let placeholders = |tab: Tab| {
+            let mut files = files_ui(tab);
+            let mut loading = BrowserState::default();
+            let _ = loading.refresh();
+            let chrome = frame(&ctx(), raw(Vec::new()), &mut loading,
+                               &mut files, &view(P1S, Instant::now()));
+            let filter = chrome.spot("filter…").expect("no filter row").y;
+            let cache = chrome.spot("cache ").expect("no cache line").y;
+            let placed: Vec<Rect> =
+                rects(&mut loading, &mut files, theme::CARD_HOVER)
+                    .into_iter()
+                    .filter(|rect| rect.min.y > filter && rect.max.y < cache)
+                    .collect();
+            let shapes = rects(&mut browsed(), &mut files, theme::CARD);
+            (placed, shapes)
+        };
+        // the grid: a placeholder is a tile's box, and they stand in rows
+        // of their own, not one bar per line
+        let (placed, shapes) = placeholders(Tab::Timelapses);
+        assert!(!placed.is_empty(), "no placeholder on a loading grid");
+        let tile = shapes.into_iter()
+            .find(|rect| rect.width() == size::TILE_W)
+            .expect("no tile once the listing landed");
+        for rect in &placed {
+            assert_eq!(rect.width(), tile.width(),
+                       "placeholder {rect:?} against tile {tile:?}");
+            // to the pixel: a placeholder stands in for the tile
+            assert!((rect.height() - tile.height()).abs() < 1.0,
+                    "placeholder {rect:?} against tile {tile:?}");
+        }
+        let first = placed[0].min.y;
+        assert!(placed.iter().filter(|rect| rect.min.y == first).count() >= 2,
+                "the placeholders are stacked, not a grid: {placed:?}");
+        // the list: a placeholder is as tall as the row that replaces it
+        let (placed, shapes) = placeholders(Tab::Files);
+        assert!(!placed.is_empty(), "no placeholder on a loading list");
+        let row = shapes.into_iter()
+            .filter(|rect| rect.width() > size::TILE_W)
+            .min_by(|a, b| a.height().total_cmp(&b.height()))
+            .expect("no row once the listing landed");
+        for rect in &placed {
+            assert_eq!(rect.height(), row.height(),
+                       "placeholder {rect:?} against row {row:?}");
+        }
+    }
+
     /// 5.5: the reasons an empty Timelapses tab gives.
     #[test]
     fn the_empty_timelapse_tab_gives_the_reason() {
@@ -3361,6 +3503,35 @@ mod tests {
         assert!(out.cmds.iter().any(|cmd|
             matches!(cmd, Cmd::Cancel(cancelled) if *cancelled == id)),
             "{:?}", out.cmds);
+    }
+
+    /// D11, D23: a file already on its way says so on both buttons instead
+    /// of taking a click that starts nothing (`BrowserState::download`).
+    #[test]
+    fn a_transferring_file_says_why_its_buttons_are_off() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let video = "/timelapse/video_2026-06-01_06-11-57.avi";
+        files.selected = Some(video.to_string());
+        let now = Instant::now();
+        let labels = ["Download & play", "Save to PC"];
+        // the positive control: nothing is running, so nothing says this
+        for label in labels {
+            let painted = hover(&mut state, &mut files,
+                                &view(P1S, now), label);
+            assert!(!painted.has("Already downloading"),
+                    "{label} before any transfer");
+        }
+        click(&ctx, &mut state, &mut files, &view(P1S, now),
+              "Download & play");
+        assert_eq!(state.active_transfers(), 1);
+        for label in labels {
+            let painted = hover(&mut state, &mut files,
+                                &view(P1S, now), label);
+            assert!(painted.has("Already downloading"),
+                    "{label} says nothing: {:?}", painted.spots);
+        }
     }
 
     /// 5.10: a queued transfer says why it is waiting, on its tile.

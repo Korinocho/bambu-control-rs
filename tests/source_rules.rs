@@ -324,6 +324,61 @@ fn the_identity_scan_finds_unnamed_state() {
                        "sample.rs:3: push_id keyed by an index"]);
 }
 
+/// Every line that reaches for a pattern the rules name instead of the
+/// helper that replaces it (E23, E24, E44).
+fn state_hits(file: &Path, text: &str) -> Vec<String> {
+    let rules: [(&str, &str); 3] = [
+        (r"cursor_icon\s*=", "cursor set through output_mut"),
+        (r"\.interact\(\s*(egui::)?Sense::click",
+         "container made clickable after the fact"),
+        (r"\{[a-z_.]*:\?\}", "Debug formatting in text a user sees"),
+    ];
+    let line_of = |at: usize| text[..at].lines().count();
+    let mut found = Vec::new();
+    for (pattern, why) in rules {
+        let rule = regex_lite::Regex::new(pattern).expect("pattern");
+        for hit in rule.find_iter(text) {
+            found.push(format!("{}:{}: {why}",
+                               file.display(), line_of(hit.start())));
+        }
+    }
+    found.sort_by_key(|line| line.split(':').nth(1)
+        .and_then(|number| number.parse::<usize>().ok()).unwrap_or(0));
+    found
+}
+
+/// E23, E24, E44: cursors, clickable containers and user-visible text.
+#[test]
+fn ui_code_states_are_built_from_the_helpers() {
+    let sources = ui_production_sources();
+    // the scan is worth nothing if it is reading no interaction at all
+    let senses = sources.iter()
+        .map(|(_, text)| text.matches("Sense::click").count())
+        .sum::<usize>();
+    assert!(senses >= 5, "only {senses} click senses scanned");
+    let found: Vec<String> = sources.iter()
+        .flat_map(|(file, text)| state_hits(file, text))
+        .collect();
+    assert!(found.is_empty(), "hand-rolled states:\n{}", found.join("\n"));
+}
+
+/// The control for the scan above.
+#[test]
+fn the_state_scan_finds_each_hand_rolled_state() {
+    let sample = "\
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);\n\
+        response.on_hover_cursor(egui::CursorIcon::PointingHand);\n\
+        let response = frame.response.interact(Sense::click());\n\
+        let response = ui.response();\n\
+        format!(\"offline: {why:?}\")\n\
+        format!(\"offline: {}\", why.text())\n";
+    let found = state_hits(Path::new("sample.rs"), sample);
+    assert_eq!(found,
+               ["sample.rs:1: cursor set through output_mut",
+                "sample.rs:3: container made clickable after the fact",
+                "sample.rs:5: Debug formatting in text a user sees"]);
+}
+
 /// T24 (the CI grep, locally): no certificate checks disabled anywhere.
 ///
 /// Every path to a printer verifies now -- FTPS on 990, the camera on 6000

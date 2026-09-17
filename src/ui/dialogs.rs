@@ -118,6 +118,22 @@ pub(crate) fn accent_button_response(ui: &mut egui::Ui, text: &str,
     ui.add(btn)
 }
 
+/// The same button where it may be refused: with a reason it drops the
+/// accent and looks like any other disabled button, and says why on hover
+/// (C8, D11, D23).
+pub(crate) fn accent_button_reason(ui: &mut egui::Ui, text: &str,
+                                  min_size: egui::Vec2,
+                                  reason: Option<&str>)
+                            -> bool {
+    let Some(reason) = reason else {
+        return accent_button_response(ui, text, min_size).clicked();
+    };
+    let btn = egui::Button::new(
+        RichText::new(text).font(font::button_strong()))
+        .min_size(min_size);
+    widgets::button(ui, btn, Some(reason))
+}
+
 // ------------------------------------------------------------ add/edit
 pub struct AddPrinterDlg {
     pub draft: PrinterCfg,
@@ -130,6 +146,22 @@ pub enum AddResult {
     Save(PrinterCfg, Option<usize>),
 }
 
+/// One form field. A required one the Save refused is outlined in
+/// `DANGER`, so the error line's "required" names something the user can
+/// see (C16). The outline is a hairline painted inside, so nothing moves.
+fn form_field(ui: &mut egui::Ui, value: &mut String, salt: &str,
+              refused: bool) {
+    let empty = value.trim().is_empty();
+    let response =
+        ui.add(egui::TextEdit::singleline(value).id_salt(salt));
+    if refused && empty {
+        ui.painter().rect_stroke(
+            response.rect, radius::CONTROL,
+            Stroke::new(stroke::HAIRLINE, theme::DANGER),
+            egui::StrokeKind::Inside);
+    }
+}
+
 pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                         -> (AddResult, bool) {
     let mut result = AddResult::None;
@@ -139,23 +171,25 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                       |ui, part| {
         let mut done = false;
         if part == Part::Body {
+            // the three fields a Save refuses are outlined only after it
+            // refused one: a form nobody filled in yet is not an error
+            let refused = !dlg.error.is_empty();
             egui::Grid::new("printer-form").num_columns(2)
                 .spacing([space::L, space::M]).show(ui, |ui| {
                     ui.label("Name");
-                    ui.add(egui::TextEdit::singleline(&mut dlg.draft.name)
-                        .id_salt("printer-name"));
+                    form_field(ui, &mut dlg.draft.name, "printer-name",
+                               false);
                     ui.end_row();
                     ui.label("IP address");
-                    ui.add(egui::TextEdit::singleline(&mut dlg.draft.ip)
-                        .id_salt("printer-ip"));
+                    form_field(ui, &mut dlg.draft.ip, "printer-ip", refused);
                     ui.end_row();
                     ui.label("Serial");
-                    ui.add(egui::TextEdit::singleline(&mut dlg.draft.serial)
-                        .id_salt("printer-serial"));
+                    form_field(ui, &mut dlg.draft.serial, "printer-serial",
+                               refused);
                     ui.end_row();
                     ui.label("Access code");
-                    ui.add(egui::TextEdit::singleline(
-                        &mut dlg.draft.access_code).id_salt("printer-code"));
+                    form_field(ui, &mut dlg.draft.access_code,
+                               "printer-code", refused);
                     ui.end_row();
                 });
             ui.add_space(space::XS);
@@ -163,7 +197,8 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                 "Printer must be in LAN mode with Developer Mode ON.")
                 .color(theme::TEXT_DIM).font(font::caption()));
             if !dlg.error.is_empty() {
-                ui.label(RichText::new(&dlg.error).color(theme::DANGER));
+                ui.add(egui::Label::new(RichText::new(&dlg.error)
+                    .color(theme::DANGER).font(font::caption())).wrap());
             }
             return false;
         }
@@ -239,18 +274,23 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
             });
             return false;
         }
-        if accent_button(ui, "Set temperature") {
-            match dlg.value.trim().replace(',', ".").parse::<f64>() {
-                Ok(temp) if (0.0..=max as f64).contains(&temp) => {
-                    if dlg.nozzle {
-                        client.set_nozzle_temp(temp as i64);
-                    } else {
-                        client.set_bed_temp(temp as i64);
-                    }
-                    done = true;
-                }
-                _ => {}
+        // a value the printer would refuse keeps the button disabled,
+        // with the range on it, rather than swallowing the click (D11, D23)
+        let wanted = dlg.value.trim().replace(',', ".").parse::<f64>().ok()
+            .filter(|temp| (0.0..=max as f64).contains(temp));
+        let reason = format!("Enter 0–{max} °C");
+        let reason = wanted.is_none().then_some(reason.as_str());
+        if accent_button_reason(ui, "Set temperature",
+                                egui::vec2(ui.available_width(),
+                                           size::BUTTON_H), reason)
+            && let Some(temp) = wanted
+        {
+            if dlg.nozzle {
+                client.set_nozzle_temp(temp as i64);
+            } else {
+                client.set_bed_temp(temp as i64);
             }
+            done = true;
         }
         done
     })
@@ -322,7 +362,7 @@ pub fn show_fans(ctx: &egui::Context,
                         ui.with_layout(egui::Layout::right_to_left(
                             egui::Align::Center), |ui| {
                             let mut on = value > 0;
-                            if widgets::toggle_switch(ui, &mut on) {
+                            if widgets::toggle_switch(ui, &mut on, false) {
                                 client.set_fan(
                                     index, if on { 100 } else { 0 });
                             }
@@ -598,6 +638,10 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
                 egui::Area::new(egui::Id::new("fw-toast"))
                     .fixed_pos(pos)
                     .pivot(egui::Align2::CENTER_TOP)
+                    // above the modal, which paints at Foreground, and it
+                    // takes no click: it only says what happened (D20, A12)
+                    .order(egui::Order::Tooltip)
+                    .interactable(false)
                     .show(ctx, |ui| {
                         egui::Frame::new()
                             .fill(theme::WARN_BG)
@@ -641,25 +685,25 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
                     "Skip {} object(s)? Skipped objects cannot be resumed \
                      for this print.", dlg.selected.len()))
                     .color(theme::WARN).font(font::body_strong()));
-                ui.horizontal(|ui| {
-                    if ui.button("No").clicked() {
-                        dlg.confirm = false;
-                    }
-                    if accent_button(ui, "Yes, skip") {
-                        let ids: Vec<i64> =
-                            dlg.selected.iter().copied().collect();
-                        client.skip_objects(&ids);
-                        done = true;
-                    }
-                });
+                let (no, yes) = confirm_row(ui, "No", "Yes, skip");
+                if no {
+                    dlg.confirm = false;
+                }
+                if yes {
+                    let ids: Vec<i64> =
+                        dlg.selected.iter().copied().collect();
+                    client.skip_objects(&ids);
+                    done = true;
+                }
             } else {
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         done = true;
                     }
-                    if ui.add_enabled(!dlg.selected.is_empty(),
-                                      egui::Button::new("Skip selected"))
-                        .clicked()
+                    let none = dlg.selected.is_empty()
+                        .then_some("Select an object on the plate first");
+                    if widgets::button(
+                        ui, egui::Button::new("Skip selected"), none)
                     {
                         dlg.confirm = true;
                     }
@@ -836,24 +880,27 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
             ui.label(RichText::new(
                 "The printer will move and heat. Clear the bed first!")
                 .color(theme::WARN).font(font::body_strong()));
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    dlg.cal_confirm = false;
-                }
-                if accent_button(ui, "Yes, start calibration") {
-                    let option = (dlg.cal_noise as i64)
-                        | ((dlg.cal_bed as i64) << 1)
-                        | ((dlg.cal_vibration as i64) << 2);
-                    client.calibrate(option);
-                    dlg.status = "Calibration started".into();
-                    dlg.cal_confirm = false;
-                }
-            });
-        } else if ui.add_enabled(
-            dlg.cal_bed || dlg.cal_vibration || dlg.cal_noise,
-            egui::Button::new("Start calibration")).clicked()
-        {
-            dlg.cal_confirm = true;
+            let (no, yes) =
+                confirm_row(ui, "Cancel", "Yes, start calibration");
+            if no {
+                dlg.cal_confirm = false;
+            }
+            if yes {
+                let option = (dlg.cal_noise as i64)
+                    | ((dlg.cal_bed as i64) << 1)
+                    | ((dlg.cal_vibration as i64) << 2);
+                client.calibrate(option);
+                dlg.status = "Calibration started".into();
+                dlg.cal_confirm = false;
+            }
+        } else {
+            let none = (!(dlg.cal_bed || dlg.cal_vibration || dlg.cal_noise))
+                .then_some("Tick what to calibrate first");
+            if widgets::button(
+                ui, egui::Button::new("Start calibration"), none)
+            {
+                dlg.cal_confirm = true;
+            }
         }
         ui.separator();
 
@@ -926,28 +973,38 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
 }
 
 // ------------------------------------------------------------- confirms
+/// A confirmation's answer row: "No" first and holding focus, then
+/// `space::XL`, then the destructive answer (C16, D23, A8).
+pub(crate) fn confirm_row(ui: &mut egui::Ui, no_label: &str,
+                          yes_label: &str) -> (bool, bool) {
+    let mut answer = (false, false);
+    ui.horizontal(|ui| {
+        let no = ui.button(no_label);
+        answer.0 = no.clicked();
+        // Enter answers the safe way while the user has focused nothing
+        if ui.memory(|m| m.focused().is_none()) {
+            no.request_focus();
+        }
+        ui.add_space(space::XL);
+        let danger = egui::Button::new(
+            RichText::new(yes_label).color(theme::DANGER))
+            .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER));
+        answer.1 = ui.add(danger).clicked();
+    });
+    answer
+}
+
 pub fn show_confirm(ctx: &egui::Context, id: &str, text: &str,
                     yes_label: &str) -> (bool, bool) {
     let mut confirmed = false;
     let close = modal(ctx, id, size::MODAL_S, None, |ui, part| {
-        let mut done = false;
         if part == Part::Body {
             ui.label(RichText::new(text).font(font::body_strong()));
             return false;
         }
-        ui.horizontal(|ui| {
-            if ui.button("No").clicked() {
-                done = true;
-            }
-            let danger = egui::Button::new(
-                RichText::new(yes_label).color(theme::DANGER))
-                .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER));
-            if ui.add(danger).clicked() {
-                confirmed = true;
-                done = true;
-            }
-        });
-        done
+        let (no, yes) = confirm_row(ui, "No", yes_label);
+        confirmed = yes;
+        no || yes
     });
     (close, confirmed)
 }

@@ -572,7 +572,8 @@ fn printer_ui(ctx: &egui::Context, cache: &Arc<cache::Cache>,
     *client.device_info.lock().unwrap() = device_info();
     *client.conn.lock().unwrap() = match fixture.online {
         true => (true, "online".to_string()),
-        false => (false, "offline (Tls(\"handshake failed\"))".to_string()),
+        false => (false, format!("offline: {}",
+            mqtt::ProbeOutcome::Tls("handshake failed".into()).text())),
     };
     let ftp = crate::browser::FtpWorker::start(&cfg, ctx, cache.clone());
     PrinterUi {
@@ -597,6 +598,7 @@ fn printer_ui(ctx: &egui::Context, cache: &Arc<cache::Cache>,
         last_job: String::new(),
         last_gcode_state: String::new(),
         light_pending: None,
+        light_unconfirmed: false,
     }
 }
 
@@ -687,13 +689,14 @@ const MATRIX: [&str; 13] = [
 ];
 
 /// States the stages look at beyond the matrix, at the two smaller sizes.
-const EXTRAS: [&str; 23] = [
+const EXTRAS: [&str; 25] = [
     "chips-six", "panel-firmware", "files-loading", "files-empty",
     "files-error", "files-refusal", "files-folders", "files-gcode",
     "dlg-add", "dlg-temp", "dlg-speed", "dlg-fans", "dlg-confirm-stop",
     "dlg-confirm-remove", "dlg-hms", "no-printers", "dlg-skip-many",
     "dlg-skip-confirm", "files-failed-four", "files-long-name",
     "files-printing", "files-open-error", "files-companion",
+    "panel-light-unconfirmed", "dlg-temp-invalid",
 ];
 
 fn files_scene(app: &mut App, tab: Tab) -> &mut PrinterUi {
@@ -727,6 +730,9 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
         }
         "panel-firmware" =>
             app.printers[0].fw_latest = "01.09.00.00".to_string(),
+        // the light command went and telemetry never agreed (C18, D40)
+        "panel-light-unconfirmed" =>
+            app.printers[0].light_unconfirmed = true,
         "files-timelapses" => {
             let printer = files_scene(&mut app, Tab::Timelapses);
             printer.files.selected = printer.browser.timelapses[1].video
@@ -846,6 +852,9 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
             }),
         "dlg-temp" => app.dialog = Dialog::Temp(dialogs::TempDlg {
             nozzle: true, value: "220".to_string() }),
+        // a value the printer would refuse: the button says the range
+        "dlg-temp-invalid" => app.dialog = Dialog::Temp(dialogs::TempDlg {
+            nozzle: true, value: "420".to_string() }),
         "dlg-speed" => {
             app.selected = 1;
             app.dialog = Dialog::Speed;

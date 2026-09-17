@@ -5,7 +5,7 @@ use egui::{RichText, Sense, Stroke, Ui, Vec2, vec2};
 use serde_json::{Map, Value};
 
 use crate::mqtt::speed_name;
-use crate::theme::{self, font, pad, radius, size, space, stroke};
+use crate::theme::{self, font, radius, size, space, stroke};
 use crate::ui::widgets;
 
 pub const IDLE_STATES: &[&str] = &["IDLE", "FINISH", "FAILED", ""];
@@ -80,6 +80,10 @@ pub struct PanelView<'a> {
     pub show_humidity: bool,
     pub model: String,
     pub light_shown_on: bool,
+    /// the light command was sent and telemetry has not agreed yet (C18)
+    pub light_pending: bool,
+    /// the printer never confirmed the last light command (C18, D40)
+    pub light_unconfirmed: bool,
     /// FILES card value: counts from the listing taken this session, else
     /// the tab names (design doc 6)
     pub files_summary: String,
@@ -119,25 +123,43 @@ fn value_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     });
 }
 
-fn clickable_card(ui: &mut Ui, title: &str, value: &str) -> bool {
-    let response = card_frame(ui, |ui| {
-        ui.set_width(ui.available_width());
-        card_title(ui, title, true);
-        value_row(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(value)
-                .font(font::title())).truncate());
-        });
-    });
-    let response = response.interact(Sense::click());
-    if response.hovered() {
-        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-    }
-    response.clicked()
+/// A card that opens something. `reason`, when it is there, says why the
+/// card cannot be opened: the card greys out and the reason is on hover,
+/// instead of a click that does nothing (C2, C16, A11, D11).
+fn clickable_card(ui: &mut Ui, title: &str, value: &str, dim: bool,
+                  reason: Option<&str>) -> bool {
+    let color = match dim {
+        true => theme::TEXT_DIM,
+        false => theme::TEXT,
+    };
+    let card = |ui: &mut Ui| {
+        widgets::clickable(ui, title, widgets::Surface::card(), |ui| {
+            ui.set_width(ui.available_width());
+            card_title(ui, title, true);
+            value_row(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(value)
+                    .font(font::title()).color(color)).truncate());
+            });
+        }).response
+    };
+    let Some(reason) = reason else {
+        let response = card(ui);
+        return response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked();
+    };
+    ui.add_enabled_ui(false, card).inner.on_disabled_hover_text(reason);
+    false
 }
 
 fn temp_card(ui: &mut Ui, title: &str, current: Option<f64>,
-             target: Option<f64>) -> bool {
-    let response = card_frame(ui, |ui| {
+             target: Option<f64>, dim: bool) -> bool {
+    let color = match dim {
+        true => theme::TEXT_DIM,
+        false => theme::TEXT,
+    };
+    let response = widgets::clickable(ui, title, widgets::Surface::card(),
+                                      |ui| {
         ui.set_width(ui.available_width());
         card_title(ui, title, true);
         let metric = font::metric();
@@ -152,17 +174,13 @@ fn temp_card(ui: &mut Ui, title: &str, current: Option<f64>,
                 .unwrap_or_else(|| "/ —°C".into());
             // the reading changes every report: a slot keeps the target
             // from shifting with it (C6)
-            widgets::slot(ui, "888", RichText::new(cur), &metric,
-                          egui::Align::Min);
+            widgets::slot(ui, "888", RichText::new(cur).color(color),
+                          &metric, egui::Align::Min);
             ui.add(egui::Label::new(RichText::new(tgt)
                 .font(font::caption()).color(theme::TEXT_DIM)).truncate());
         });
-    });
-    let response = response.interact(Sense::click());
-    if response.hovered() {
-        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
-    }
-    response.clicked()
+    }).response;
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 fn has_rfid(tray: &Value) -> bool {
@@ -302,6 +320,21 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
     let gcode_state = s_str(state, "gcode_state").to_string();
     let running = gcode_state == "RUNNING";
     let paused = gcode_state == "PAUSE";
+    // offline: the last values stay, in the dim colour and never in a
+    // state colour, so nothing reads as live (C6, D10)
+    let dim = !view.connected.0;
+    // MOVEMENT while a print runs is refused by the printer, so the card
+    // says so instead of swallowing the click (D11)
+    let move_reason = (!IDLE_STATES.contains(&gcode_state.as_str()))
+        .then_some("Only while the printer is idle");
+    let job = s_str(state, "subtask_name");
+    let job = match job.is_empty() {
+        true => s_str(state, "gcode_file"),
+        false => job,
+    };
+    // nothing is printing: the job card says so (C8, D18)
+    let idle = job.is_empty()
+        && IDLE_STATES.contains(&gcode_state.as_str());
 
     ui.horizontal_top(|ui| {
         // the right column keeps what its cards need, the left the rest
@@ -332,9 +365,10 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 .corner_radius(radius::CARD)
                 .paint_at(ui, rect);
         } else {
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
-                              &view.cam_status,
-                              font::body(), theme::TEXT_DIM);
+            // a widget, truncated to the well, rather than painter text
+            // that spills past it on a narrow window (E7, D41)
+            ui.place(rect, egui::Label::new(RichText::new(&view.cam_status)
+                .font(font::body()).color(theme::TEXT_DIM)).truncate());
         }
         ui.add_space(space::M);
 
@@ -356,28 +390,29 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                             thumb.center(), size * scale));
                 }
                 ui.vertical(|ui| {
-                    let job = s_str(state, "subtask_name");
-                    let job = if job.is_empty() {
-                        s_str(state, "gcode_file")
-                    } else {
-                        job
+                    // nothing printing: the card says so, rather than
+                    // showing a print stuck at zero (C8, D18)
+                    let name = match idle {
+                        true => "No print running",
+                        false => job,
+                    };
+                    let name_color = match idle || dim {
+                        true => theme::TEXT_DIM,
+                        false => theme::TEXT,
                     };
                     // a long name truncates instead of widening the column
-                    ui.add(egui::Label::new(RichText::new(
-                        if job.is_empty() { "—" } else { job })
-                        .font(font::body_strong())).truncate());
-                    let display = if gcode_state.is_empty() {
-                        "—"
-                    } else {
-                        &gcode_state
-                    };
+                    ui.add(egui::Label::new(RichText::new(name)
+                        .font(font::body_strong()).color(name_color))
+                        .truncate());
+                    let (word, word_color) =
+                        theme::state_word(&gcode_state, view.connected.0);
                     // the state and the connection never overlap: the
                     // connection detail gives way (C8)
                     egui::Sides::new().shrink_right().truncate().show(ui,
                         |ui| {
-                            ui.label(RichText::new(display)
+                            ui.label(RichText::new(word)
                                 .font(font::body_strong())
-                                .color(theme::state_color(&gcode_state)));
+                                .color(word_color));
                         },
                         |ui| {
                             let (ok, detail) = &view.connected;
@@ -393,12 +428,21 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             // never moves the rest of the row (C6)
             let pct = s_i64(state, "mc_percent").unwrap_or(0);
             let caption = font::caption();
+            let readout = match idle || dim {
+                true => theme::TEXT_DIM,
+                false => theme::TEXT,
+            };
             egui::Sides::new().show(ui,
                 |ui| {
-                    widgets::slot(ui, "100%", RichText::new(format!("{pct}%")),
+                    let percent = match idle {
+                        true => "—".to_string(),
+                        false => format!("{pct}%"),
+                    };
+                    widgets::slot(ui, "100%",
+                                  RichText::new(percent).color(readout),
                                   &font::metric(), egui::Align::Min);
                     let mins = s_i64(state, "mc_remaining_time").unwrap_or(0);
-                    let eta = match mins > 0 {
+                    let eta = match mins > 0 && !idle {
                         true => format!("~{}h {:02}m left", mins / 60,
                                         mins % 60),
                         false => String::new(),
@@ -410,7 +454,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 |ui| {
                     let layer = match (s_i64(state, "layer_num"),
                                        s_i64(state, "total_layer_num")) {
-                        (Some(layer), Some(total)) if total > 0 =>
+                        (Some(layer), Some(total)) if total > 0 && !idle =>
                             format!("layer {layer}/{total}"),
                         _ => String::new(),
                     };
@@ -418,21 +462,43 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                                   RichText::new(layer).color(theme::TEXT_DIM),
                                   &caption, egui::Align::Max);
                 });
-            let bar = egui::ProgressBar::new(pct as f32 / 100.0)
-                .desired_height(size::PROGRESS_H)
-                .fill(theme::ACCENT);
-            ui.add(bar);
+            // no bar for a print that does not exist; the row keeps its
+            // height, so the card does not change shape when one starts
+            match idle {
+                true => {
+                    ui.allocate_exact_size(
+                        vec2(ui.available_width(), size::PROGRESS_H),
+                        Sense::hover());
+                }
+                false => {
+                    ui.add(egui::ProgressBar::new(pct as f32 / 100.0)
+                        .desired_height(size::PROGRESS_H)
+                        .fill(theme::ACCENT)
+                        .text(RichText::new(format!("{pct}%"))
+                            .font(font::caption())));
+                }
+            }
             ui.add_space(space::S);
 
             ui.horizontal(|ui| {
-                let can_act = running || paused;
+                // every reason the three buttons refuse a click (D11, D23)
+                let act_reason = match running || paused {
+                    true => None,
+                    false => Some("No print running"),
+                };
+                let fetching = view.fetch_progress.is_some_and(|p| p < 100);
+                let skip_reason = act_reason.or(match view.object_count {
+                    0 if fetching => Some("Loading the job's objects…"),
+                    0 => Some("This job lists no objects"),
+                    _ => None,
+                });
                 let skip_label = if view.object_count > 0 {
                     format!("Skip objects ({})", view.object_count)
                 } else {
                     "Skip objects".to_string()
                 };
-                if ui.add_enabled(can_act,
-                                  egui::Button::new(skip_label)).clicked() {
+                if widgets::button(ui, egui::Button::new(skip_label),
+                                      skip_reason) {
                     actions.push(PanelAction::OpenSkip);
                 }
                 if let Some(p) = view.fetch_progress
@@ -444,14 +510,19 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 }
                 let pause_label =
                     if paused { "▶ Resume" } else { "⏸ Pause" };
-                if ui.add_enabled(can_act,
-                                  egui::Button::new(pause_label)).clicked() {
+                if widgets::button(ui, egui::Button::new(pause_label),
+                                      act_reason) {
                     actions.push(PanelAction::TogglePause);
                 }
-                let stop = egui::Button::new(
-                    RichText::new("⏹ Stop").color(theme::DANGER))
-                    .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER));
-                if ui.add_enabled(can_act, stop).clicked() {
+                // DANGER text and outline only while it can act (C8)
+                let stop = match act_reason {
+                    None => egui::Button::new(
+                        RichText::new("⏹ Stop").color(theme::DANGER))
+                        .stroke(Stroke::new(stroke::HAIRLINE,
+                                            theme::DANGER)),
+                    Some(_) => egui::Button::new("⏹ Stop"),
+                };
+                if widgets::button(ui, stop, act_reason) {
                     actions.push(PanelAction::AskStop);
                 }
             });
@@ -475,11 +546,12 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                         h.get("attr").and_then(|v| v.as_u64()).unwrap_or(0),
                         h.get("code").and_then(|v| v.as_u64()).unwrap_or(0)))
                     .collect();
-                let response = egui::Frame::new()
-                    .fill(theme::DANGER_BG)
-                    .corner_radius(radius::CONTROL)
-                    .inner_margin(pad::BANNER)
-                    .show(ui, |ui| {
+                // the banner is the widget, so hover, pressed and
+                // keyboard focus all land on it (C2, C3, E24)
+                let response = widgets::clickable(
+                    ui, "hms-banner",
+                    widgets::Surface::banner(widgets::Tone::Danger),
+                    |ui| {
                         ui.set_width(ui.available_width());
                         theme::tight_stack(ui);
                         ui.label(RichText::new(format!(
@@ -498,13 +570,8 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                                     .font(font::caption()))
                                 .wrap());
                         }
-                    })
-                    .response.interact(Sense::click());
-                if response.hovered() {
-                    ui.output_mut(|o| {
-                        o.cursor_icon = egui::CursorIcon::PointingHand;
-                    });
-                }
+                    }).response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if response.clicked() {
                     actions.push(PanelAction::OpenHmsDialog);
                 }
@@ -513,23 +580,17 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
 
             // firmware banner
             if crate::firmware::is_newer(&view.fw_latest, &view.fw_current) {
-                let response = egui::Frame::new()
-                    .fill(theme::WARN_BG)
-                    .corner_radius(radius::CONTROL)
-                    .inner_margin(pad::BANNER)
-                    .show(ui, |ui| {
+                let response = widgets::clickable(
+                    ui, "firmware-banner",
+                    widgets::Surface::banner(widgets::Tone::Warn), |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new(format!(
+                        ui.add(egui::Label::new(RichText::new(format!(
                             "⬆ Firmware update available: {} → {}",
                             view.fw_current, view.fw_latest))
-                            .color(theme::WARN).font(font::body_strong()));
-                    })
-                    .response.interact(Sense::click());
-                if response.hovered() {
-                    ui.output_mut(|o| {
-                        o.cursor_icon = egui::CursorIcon::PointingHand;
-                    });
-                }
+                            .color(theme::WARN).font(font::body_strong()))
+                            .wrap());
+                    }).response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 if response.clicked() {
                     actions.push(PanelAction::OpenInfo);
                 }
@@ -543,18 +604,19 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             ui.columns(2, |cards| {
                 if temp_card(&mut cards[0], "NOZZLE",
                              s_f64(state, "nozzle_temper"),
-                             s_f64(state, "nozzle_target_temper")) {
+                             s_f64(state, "nozzle_target_temper"), dim) {
                     actions.push(PanelAction::OpenNozzle);
                 }
                 if temp_card(&mut cards[1], "BED",
                              s_f64(state, "bed_temper"),
-                             s_f64(state, "bed_target_temper")) {
+                             s_f64(state, "bed_target_temper"), dim) {
                     actions.push(PanelAction::OpenBed);
                 }
             });
             ui.columns(2, |cards| {
                 let lvl = s_i64(state, "spd_lvl").unwrap_or(2);
-                if clickable_card(&mut cards[0], "SPEED", speed_name(lvl)) {
+                if clickable_card(&mut cards[0], "SPEED", speed_name(lvl),
+                                  dim, None) {
                     actions.push(PanelAction::OpenSpeed);
                 }
                 // light card with toggle
@@ -562,14 +624,26 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     ui.set_width(ui.available_width());
                     card_title(ui, "LIGHT", false);
                     let mut on = view.light_shown_on;
-                    let word = if on { "On" } else { "Off" };
+                    // a command the printer never confirmed is said here,
+                    // in the value row, so the card keeps the height its
+                    // neighbour has (C5, C18, D40)
+                    let (word, color) = match view.light_unconfirmed {
+                        true => ("Printer didn't confirm", theme::WARN),
+                        false if on => ("On", theme::TEXT),
+                        false => ("Off", theme::TEXT),
+                    };
+                    let font = match view.light_unconfirmed {
+                        true => font::caption(),
+                        false => font::title(),
+                    };
                     egui::Sides::new().height(size::CONTROL_H).show(ui,
                         |ui| {
-                            ui.label(RichText::new(word)
-                                .font(font::title()));
+                            ui.add(egui::Label::new(RichText::new(word)
+                                .font(font).color(color)).truncate());
                         },
                         |ui| {
-                            if widgets::toggle_switch(ui, &mut on) {
+                            if widgets::toggle_switch(ui, &mut on,
+                                                      view.light_pending) {
                                 actions.push(PanelAction::SetLight(on));
                             }
                         });
@@ -584,10 +658,12 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     }
                 }
                 if clickable_card(&mut cards[0], "FANS",
-                                  &format!("{fans_on} fan(s) on")) {
+                                  &format!("{fans_on} fan(s) on"), dim,
+                                  None) {
                     actions.push(PanelAction::OpenFans);
                 }
-                if clickable_card(&mut cards[1], "MOVEMENT", "XYZ") {
+                if clickable_card(&mut cards[1], "MOVEMENT", "XYZ", dim,
+                                  move_reason) {
                     actions.push(PanelAction::OpenMove);
                 }
             });
@@ -596,7 +672,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             } else {
                 format!("{}  ·  {}", view.model, view.fw_current)
             };
-            if clickable_card(ui, "DEVICE INFO", &info_value) {
+            if clickable_card(ui, "DEVICE INFO", &info_value, dim, None) {
                 actions.push(PanelAction::OpenInfo);
             }
             // screen-menu replacement (calibration / filament / nozzle)
@@ -609,11 +685,11 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     else { "Stainless" }),
                 _ => "Calibration · Filament · Nozzle".to_string(),
             };
-            if clickable_card(ui, "MAINTENANCE", &maint_value) {
+            if clickable_card(ui, "MAINTENANCE", &maint_value, dim, None) {
                 actions.push(PanelAction::OpenMaintenance);
             }
             // the printer's SD card: timelapses, recordings, print files
-            if clickable_card(ui, "FILES", &view.files_summary) {
+            if clickable_card(ui, "FILES", &view.files_summary, dim, None) {
                 actions.push(PanelAction::OpenFiles);
             }
             ams_card(ui, state, view.show_humidity);
@@ -638,11 +714,35 @@ mod tests {
         rects: Vec<(Rect, egui::Color32)>,
     }
 
+    /// What the pointer does over the panel: nowhere, resting on a point
+    /// long enough for a tooltip, or clicking it.
+    #[derive(Clone, Copy)]
+    enum Pointer {
+        Away,
+        Resting(Pos2),
+        Clicking(Pos2),
+    }
+
     fn render(width: f32, state: &Map<String, Value>) -> Painted {
+        run(width, state, |_| {}, Pointer::Away).0
+    }
+
+    /// The panel over four frames: egui sizes everything, the pointer
+    /// arrives, and time passes so a tooltip's delay is over. What the last
+    /// frame painted, and the actions it reported, are the answer.
+    fn run(width: f32, state: &Map<String, Value>,
+           tweak: impl Fn(&mut PanelView<'_>), pointer: Pointer)
+           -> (Painted, Vec<PanelAction>) {
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         theme::apply(&ctx);
-        let view = PanelView {
+        // a tooltip waits for the pointer to rest; there is no real pointer
+        // here, so the wait is taken out and what it would show is painted
+        ctx.all_styles_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        let mut view = PanelView {
             state,
             connected: (true, "online".to_string()),
             cam_texture: None,
@@ -655,16 +755,46 @@ mod tests {
             show_humidity: false,
             model: "Bambu Lab A1".to_string(),
             light_shown_on: true,
+            light_pending: false,
+            light_unconfirmed: false,
             files_summary: "Timelapses · Recordings · Print files".to_string(),
         };
-        let input = || egui::RawInput {
+        tweak(&mut view);
+        let at = match pointer {
+            Pointer::Away => None,
+            Pointer::Resting(at) | Pointer::Clicking(at) => Some(at),
+        };
+        let input = |time: f64, events: Vec<egui::Event>| egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO,
                                                   Vec2::new(width, 900.0))),
+            time: Some(time),
+            events,
             ..Default::default()
         };
-        // the second frame, once egui has sized everything
-        let _ = ctx.run_ui(input(), |ui| { show(ui, &view); });
-        let full = ctx.run_ui(input(), |ui| { show(ui, &view); });
+        let mut actions = Vec::new();
+        let mut full = None;
+        // the pointer arrives on the second frame and stays put: egui shows
+        // a tooltip only once it has rested past `tooltip_delay`
+        for (frame, time) in [0.0_f64, 0.1, 0.6, 1.2].into_iter().enumerate() {
+            let mut events = Vec::new();
+            if let Some(at) = at.filter(|_| frame > 0) {
+                events.push(egui::Event::PointerMoved(at));
+            }
+            if let (Pointer::Clicking(at), 3) = (pointer, frame) {
+                for pressed in [true, false] {
+                    events.push(egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+            }
+            full = Some(ctx.run_ui(input(time, events), |ui| {
+                actions = show(ui, &view);
+            }));
+        }
+        let full = full.expect("four frames");
         let mut painted = Painted { texts: Vec::new(), rects: Vec::new() };
         fn walk(shape: &egui::Shape, painted: &mut Painted) {
             match shape {
@@ -681,7 +811,7 @@ mod tests {
         for clipped in &full.shapes {
             walk(&clipped.shape, &mut painted);
         }
-        painted
+        (painted, actions)
     }
 
     fn idle() -> Map<String, Value> {
@@ -730,6 +860,145 @@ mod tests {
                            "{width}: {left} {a:?} and {right} {b:?}");
             }
         }
+    }
+
+    fn printing() -> Map<String, Value> {
+        let mut state = idle();
+        state.insert("gcode_state".to_string(), json!("RUNNING"));
+        state.insert("mc_percent".to_string(), json!(42));
+        state
+    }
+
+    /// C2: a card is the widget, so a click anywhere on it opens what it
+    /// stands for — its own text does not take the click off it.
+    #[test]
+    fn a_click_anywhere_on_a_card_opens_it() {
+        type Wanted = fn(&PanelAction) -> bool;
+        let cards: [(&str, Wanted); 4] = [
+            ("NOZZLE", |action| matches!(action, PanelAction::OpenNozzle)),
+            ("SPEED", |action| matches!(action, PanelAction::OpenSpeed)),
+            ("FILES", |action| matches!(action, PanelAction::OpenFiles)),
+            ("MOVEMENT", |action| matches!(action, PanelAction::OpenMove)),
+        ];
+        for (title, is_wanted) in cards {
+            let painted = run(1200.0, &idle(), |_| {}, Pointer::Away).0;
+            // the title, and the value under it: both are the card
+            let spots = [painted.text(title).center(),
+                         painted.card(title).center()];
+            for at in spots {
+                let (_, actions) =
+                    run(1200.0, &idle(), |_| {}, Pointer::Clicking(at));
+                assert!(actions.iter().any(is_wanted),
+                        "{title} did not open from {at:?}");
+            }
+        }
+    }
+
+    /// D11, D23: the three job buttons refuse the click while nothing is
+    /// printing, and say why on hover instead of swallowing it.
+    #[test]
+    fn idle_job_buttons_say_why_and_do_nothing() {
+        let idle_at = |label: &str| {
+            run(1200.0, &idle(), |_| {}, Pointer::Away).0.text(label).center()
+        };
+        // the idle job card already names the state, so the reason is
+        // the second copy of it: one on the card, one on the hover
+        let said = |painted: &Painted| painted.texts.iter()
+            .filter(|(text, _)| text == "No print running").count();
+        assert_eq!(said(&run(1200.0, &idle(), |_| {}, Pointer::Away).0), 1,
+                   "the card does not name the idle state");
+        for label in ["Skip objects", "⏸ Pause", "⏹ Stop"] {
+            let at = idle_at(label);
+            let (painted, actions) =
+                run(1200.0, &idle(), |_| {}, Pointer::Resting(at));
+            assert_eq!(said(&painted), 2,
+                       "{label} says nothing while idle: {:?}",
+                       painted.texts.iter().map(|(text, _)| text)
+                           .collect::<Vec<_>>());
+            let (_, clicked) =
+                run(1200.0, &idle(), |_| {}, Pointer::Clicking(at));
+            assert!(clicked.is_empty() && actions.is_empty(),
+                    "{label} acted while idle");
+        }
+        // the positive control: the same three buttons act while a print
+        // runs, and no reason is shown
+        type Wanted = fn(&PanelAction) -> bool;
+        let wanted: [(&str, Wanted); 3] = [
+            ("Skip objects (3)",
+             |action| matches!(action, PanelAction::OpenSkip)),
+            ("⏸ Pause",
+             |action| matches!(action, PanelAction::TogglePause)),
+            ("⏹ Stop", |action| matches!(action, PanelAction::AskStop)),
+        ];
+        for (label, is_wanted) in wanted {
+            let at = run(1200.0, &printing(), |view| view.object_count = 3,
+                         Pointer::Away).0.text(label).center();
+            let (painted, actions) =
+                run(1200.0, &printing(), |view| view.object_count = 3,
+                    Pointer::Clicking(at));
+            assert!(!painted.texts.iter()
+                        .any(|(text, _)| text == "No print running"),
+                    "{label} shows a reason while printing");
+            assert!(actions.iter().any(is_wanted),
+                    "{label} reported nothing that acts");
+        }
+    }
+
+    /// D11: Skip objects tells the two reasons of its own apart while a
+    /// print runs — the bundle still coming, and a job with no objects.
+    #[test]
+    fn skip_objects_names_the_reason_it_cannot_open() {
+        let cases = [(Some(40_u8), "Loading the job's objects…"),
+                     (None, "This job lists no objects")];
+        for (progress, reason) in cases {
+            let tweak = |view: &mut PanelView<'_>| {
+                view.fetch_progress = progress;
+                view.object_count = 0;
+            };
+            let at = run(1200.0, &printing(), tweak, Pointer::Away).0
+                .text("Skip objects").center();
+            let (painted, _) =
+                run(1200.0, &printing(), tweak, Pointer::Resting(at));
+            assert!(painted.texts.iter().any(|(text, _)| text == reason),
+                    "no {reason:?}: {:?}",
+                    painted.texts.iter().map(|(text, _)| text)
+                        .collect::<Vec<_>>());
+        }
+        // the positive control: with objects, it opens and says no reason
+        let at = run(1200.0, &printing(), |view| view.object_count = 2,
+                     Pointer::Away).0.text("Skip objects (2)").center();
+        let (painted, actions) =
+            run(1200.0, &printing(), |view| view.object_count = 2,
+                Pointer::Clicking(at));
+        assert!(!painted.texts.iter().any(|(text, _)|
+                    text.starts_with("Loading") || text.ends_with("objects")
+                        && text.starts_with("This job")));
+        assert!(actions.iter().any(|action|
+                    matches!(action, PanelAction::OpenSkip)),
+                "Skip objects did not open with a bundle");
+    }
+
+    /// C18, D40: a light command the printer never confirmed is said in the
+    /// card, and the card keeps the height its neighbour has (C5).
+    #[test]
+    fn an_unconfirmed_light_is_said_without_moving_the_card() {
+        let (painted, _) = run(1200.0, &idle(),
+                               |view| view.light_unconfirmed = true,
+                               Pointer::Away);
+        assert!(painted.texts.iter()
+                    .any(|(text, _)| text == "Printer didn't confirm"),
+                "{:?}", painted.texts.iter().map(|(text, _)| text)
+                    .collect::<Vec<_>>());
+        let (light, speed) = (painted.card("LIGHT"), painted.card("SPEED"));
+        assert_eq!((light.min.y, light.max.y), (speed.min.y, speed.max.y),
+                   "LIGHT {light:?} and SPEED {speed:?}");
+        // the positive control: a confirmed light says On, in the same box
+        let (painted, _) = run(1200.0, &idle(), |_| {}, Pointer::Away);
+        assert!(painted.texts.iter().any(|(text, _)| text == "On"));
+        let (on, speed) = (painted.card("LIGHT"), painted.card("SPEED"));
+        assert_eq!((on.min.y, on.max.y), (speed.min.y, speed.max.y));
+        assert_eq!((on.min.y, on.max.y), (light.min.y, light.max.y),
+                   "the unconfirmed card is not where the confirmed one is");
     }
 
     /// E39, D16: a filament colour that is not ASCII hex and a unit id past
