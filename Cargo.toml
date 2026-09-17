@@ -19,9 +19,10 @@ egui = "0.35.0"
 # other crates when this changed. tokio DOES stay: rumqttc declares tokio,
 # tokio-stream and tokio-util as non-optional dependencies, so the async
 # runtime comes with the crate whatever the features -- an earlier version of
-# this comment claimed it would leave, and that was measured false. Its
-# `mqttbytes`
-# module is a plain `pub mod`, re-exported unconditionally (lib.rs:111, :141),
+# this comment claimed it would leave, and that was measured false.
+#
+# Its `mqttbytes` module is a plain `pub mod`, re-exported unconditionally
+# (lib.rs:111, :141),
 # unlike every TLS item beside it, which is feature-gated. The connection loop
 # is ours and runs over AnchoredStream, so the printer certificate is verified
 # before CONNECT carries the access code (design doc 5.3).
