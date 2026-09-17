@@ -1186,6 +1186,25 @@ fn controls(ui: &mut Ui, files: &mut FilesUi, serial: &str) {
 
 /// The error card of 5.10: the condition's text and a Retry. Never a spinner
 /// that goes on forever.
+/// What the card offers to do about an error, the first one first (5.10,
+/// decision O14). Retry is the answer to a connection that dropped; an
+/// error a retry cannot fix offers what can instead.
+fn error_actions(error: &FtpError) -> Vec<(&'static str, Action)> {
+    let edit = ("Edit printer", Action::EditPrinter);
+    let retry = ("Retry", Action::Retry);
+    match error {
+        // the access code, the serial and the address are all in the Edit
+        // dialog, and no retry fixes any of them
+        FtpError::AuthRejected => vec![edit, retry],
+        FtpError::NoVerifier(_) | FtpError::BadAddress
+        | FtpError::RefusedByName => vec![edit],
+        // the volume filled up: the app's own cache is what it can free
+        FtpError::DiskFull { .. } =>
+            vec![retry, ("Clear cache", Action::ClearCache)],
+        _ => vec![retry],
+    }
+}
+
 fn error_card(ui: &mut Ui, error: &FtpError, serial: &str,
               out: &mut Outcome) {
     egui::Frame::new()
@@ -1198,12 +1217,21 @@ fn error_card(ui: &mut Ui, error: &FtpError, serial: &str,
             ui.add(egui::Label::new(RichText::new(error.text(serial))
                 .color(theme::DANGER).font(font::body())).wrap());
             ui.add_space(space::S);
-            if accent_button_response(ui, "Retry",
-                                      vec2(0.0, size::BUTTON_H))
-                .clicked()
-            {
-                out.actions.push(Action::Retry);
-            }
+            ui.horizontal(|ui| {
+                for (at, (label, action)) in
+                    error_actions(error).into_iter().enumerate()
+                {
+                    // the first is the one to press
+                    let clicked = match at {
+                        0 => accent_button_response(
+                            ui, label, vec2(0.0, size::BUTTON_H)).clicked(),
+                        _ => ui.button(label).clicked(),
+                    };
+                    if clicked {
+                        out.actions.push(action);
+                    }
+                }
+            });
         });
 }
 
@@ -3765,6 +3793,57 @@ mod tests {
         let out = click(&ctx, &mut state, &mut files, &view(P1S, now),
                         "Retry");
         assert!(out.actions.contains(&Action::Retry), "{:?}", out.actions);
+    }
+
+    /// 5.10 and decision O14: the card offers what can fix the error it
+    /// shows. A rejected access code is not something a retry answers.
+    #[test]
+    fn the_error_card_offers_what_fixes_the_error() {
+        let now = Instant::now();
+        // (the error, what the card offers, what the first button does)
+        let cases: [(FtpError, &[&str], Action); 5] = [
+            (FtpError::AuthRejected, &["Edit printer", "Retry"],
+             Action::EditPrinter),
+            (FtpError::BadAddress, &["Edit printer"],
+             Action::EditPrinter),
+            (FtpError::RefusedByName, &["Edit printer"],
+             Action::EditPrinter),
+            (FtpError::DiskFull { need: 1 << 30, free: 1 << 20 },
+             &["Retry", "Clear cache"], Action::Retry),
+            (FtpError::PortClosed, &["Retry"], Action::Retry),
+        ];
+        for (error, offered, first) in cases {
+            let ctx = ctx();
+            let mut state = browsed();
+            state.conn = ConnState::Stopped(error.clone());
+            state.error = Some(error.clone());
+            let mut files = FilesUi::default();
+            let painted = frame(&ctx, raw(Vec::new()), &mut state,
+                                &mut files, &view(P1S, now));
+            // the card owns the band under its text; the footer has a
+            // Clear cache of its own, far below it
+            let said = painted.spot(&error.text(P1S))
+                .expect("the error text");
+            let in_card = |label: &str| painted.spots.iter()
+                .any(|(text, at)| text == label
+                     && at.y > said.y && at.y < said.y + 80.0);
+            for label in offered {
+                assert!(in_card(label),
+                        "{error:?}: {label} is not offered: {:?}",
+                        painted.spots);
+            }
+            // and nothing else: a retry that cannot work is not offered
+            for label in ["Edit printer", "Retry", "Clear cache"] {
+                if !offered.contains(&label) {
+                    assert!(!in_card(label),
+                            "{error:?}: {label} is offered anyway");
+                }
+            }
+            let out = click(&ctx, &mut state, &mut files,
+                            &view(P1S, now), offered[0]);
+            assert!(out.actions.contains(&first),
+                    "{error:?}: {:?}", out.actions);
+        }
     }
 
     // ------------------------------------------------ print files and tiles
