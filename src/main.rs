@@ -83,6 +83,12 @@ struct PrinterUi {
     /// the file's first bytes, and the view asks for it while painting
     /// (design doc 5.1 rule 5; stage 3 security review, F2)
     shell_openable: RefCell<HashMap<PathBuf, bool>>,
+    /// Which remote entries already have a complete copy on disk. The
+    /// answer is an `is_file()` on the cache's own key, which the detail
+    /// pane asked for on every frame it painted (E30, D08). Both this and
+    /// `shell_openable` are forgotten when a transfer of any file
+    /// finishes, on Clear cache and on Back (E28).
+    cached_copy: RefCell<HashMap<String, Option<PathBuf>>>,
     job_bundle: Option<files::JobBundle>,
     plate_texture: Option<egui::TextureHandle>,
     current_job: String,
@@ -93,6 +99,18 @@ struct PrinterUi {
     light_pending: Option<(bool, Instant)>,
     /// the printer never agreed with the last light command (C18, D40)
     light_unconfirmed: bool,
+    /// The HMS errors on screen, resolved once: a lookup takes the global
+    /// table's lock per code, and the banner asked for three of them on
+    /// every frame it painted (D38). Rebuilt in `sync` when the codes
+    /// change, which is the only thing that changes the lines.
+    hms_codes: Vec<String>,
+    hms_lines: Vec<String>,
+    /// a player being opened on a thread: the file, the speed it asked
+    /// for, and the slot the thread leaves the result in (E30, D07)
+    #[allow(clippy::type_complexity, reason = "one slot, read in sync")]
+    opening: Option<(PathBuf, f32,
+                     Arc<Mutex<Option<Result<Arc<MjpegPlayer>,
+                                             player::PlayerError>>>>)>,
 }
 
 impl PrinterUi {
@@ -136,13 +154,17 @@ impl PrinterUi {
             player_error: None,
             open_error: None,
             shell_openable: RefCell::new(HashMap::new()),
+            cached_copy: RefCell::new(HashMap::new()),
             job_bundle: None,
             plate_texture: None,
             current_job: String::new(),
             last_job: String::new(),
             last_gcode_state: String::new(),
+            hms_codes: Vec::new(),
+            hms_lines: Vec::new(),
             light_pending: None,
             light_unconfirmed: false,
+            opening: None,
         }
     }
 
@@ -175,11 +197,29 @@ impl PrinterUi {
     /// Opens a local file in the app's MJPEG player (5.8). A format it
     /// cannot decode is not a failure: the message and the OS player take
     /// its place in the view (section 7, option B).
+    /// Opening walks the whole AVI to build its index, which on a long
+    /// timelapse takes seconds: it runs on a thread and the view says
+    /// "Opening…" until the result lands in `opening` (E30, E31, D07).
     fn open_player(&mut self, path: PathBuf, speed: f32,
                    ctx: &egui::Context) {
         self.close_player();
-        match MjpegPlayer::open(path.clone(), self.cache.clone(),
-                                ctx.clone()) {
+        let slot = Arc::new(Mutex::new(None));
+        self.opening = Some((path.clone(), speed, slot.clone()));
+        let (cache, ctx) = (self.cache.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let opened = MjpegPlayer::open(path, cache, ctx.clone());
+            *slot.lock().unwrap() = Some(opened);
+            ctx.request_repaint();
+        });
+    }
+
+    /// The opening thread's result, taken in `sync`.
+    fn take_opened(&mut self) {
+        let Some((path, speed, slot)) = &self.opening else { return };
+        let Some(opened) = slot.lock().unwrap().take() else { return };
+        let (path, speed) = (path.clone(), *speed);
+        self.opening = None;
+        match opened {
             Ok(player) => {
                 // a cached copy is named by a hash, so the speed comes
                 // from the remote path the view resolved (section 7)
@@ -193,6 +233,44 @@ impl PrinterUi {
                 self.player_error = Some((err.text(), path));
             }
         }
+    }
+
+    /// The HMS lines the banner shows, resolved when the codes change and
+    /// not while painting (D38). The table is fetched once, here, for the
+    /// same reason.
+    fn sync_hms(&mut self, ctx: &egui::Context) {
+        let codes: Vec<String> = {
+            let state = self.client.state.lock().unwrap();
+            state.get("hms").and_then(|v| v.as_array())
+                .map(|errors| errors.iter().take(3)
+                    .map(|error| {
+                        let field = |name: &str| error.get(name)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        hms::ecode(field("attr"), field("code"))
+                    })
+                    .collect())
+                .unwrap_or_default()
+        };
+        if codes == self.hms_codes {
+            return;
+        }
+        if !codes.is_empty() {
+            hms::ensure_loaded(ctx);
+        }
+        // description only; the code stays in the dialog
+        self.hms_lines = codes.iter()
+            .map(|ecode| hms::lookup(ecode)
+                .unwrap_or_else(|| hms::dashed(ecode)))
+            .collect();
+        self.hms_codes = codes;
+    }
+
+    /// Forgets what this printer knows about the disk: which files have a
+    /// copy, and which may be handed to the shell (E28).
+    fn forget_disk_answers(&mut self) {
+        self.cached_copy.borrow_mut().clear();
+        self.shell_openable.borrow_mut().clear();
     }
 
     /// Ends the decode thread and releases the file in the cache. It never
@@ -238,6 +316,7 @@ impl PrinterUi {
                 }
             }
         }
+        self.take_opened();
         // at most 64 worker events per frame (design doc 5.9)
         for _ in 0..64 {
             let Ok(event) = self.ftp.events.try_recv() else { break };
@@ -250,6 +329,11 @@ impl PrinterUi {
                 // the files view (stage 2 part 2) shows the rest; a bundle
                 // for another job is dropped, as JobFetcher dropped it
                 event => {
+                    // a transfer that landed changed the disk, so what
+                    // this printer knows about it is forgotten (E28)
+                    if matches!(event, Event::Done { .. }) {
+                        self.forget_disk_answers();
+                    }
                     for cmd in self.browser.apply(event) {
                         self.ftp.send(cmd);
                     }
@@ -261,11 +345,15 @@ impl PrinterUi {
             {
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
-                self.plate_texture = Some(ctx.load_texture(
-                    format!("plate-{tex}"),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        size, rgba.as_raw()),
-                    Default::default()));
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    size, rgba.as_raw());
+                // a job that follows another replaces the picture in the
+                // texture it already has (E35)
+                match &mut self.plate_texture {
+                    Some(handle) => handle.set(image, Default::default()),
+                    None => self.plate_texture = Some(ctx.load_texture(
+                        format!("plate-{tex}"), image, Default::default())),
+                }
             }
             self.job_bundle = Some(bundle);
         }
@@ -276,17 +364,21 @@ impl PrinterUi {
             self.open_player(path, speed, ctx);
         }
 
-        // auto-fetch job data when a new print shows up
-        let state = self.client.state.lock().unwrap().clone();
-        let gcode_state = panel::s_str(&state, "gcode_state").to_string();
-        let job = {
-            let s = panel::s_str(&state, "subtask_name");
-            if s.is_empty() {
-                panel::s_str(&state, "gcode_file")
-            } else {
-                s
-            }
-        }.to_string();
+        self.sync_hms(ctx);
+        // auto-fetch job data when a new print shows up. The four fields
+        // this needs are read under the lock: cloning the whole map here
+        // copied every printer's telemetry on every frame (E25, D35)
+        let (gcode_state, job, file_name, print_type) = {
+            let state = self.client.state.lock().unwrap();
+            let job = match panel::s_str(&state, "subtask_name") {
+                "" => panel::s_str(&state, "gcode_file"),
+                name => name,
+            };
+            (panel::s_str(&state, "gcode_state").to_string(),
+             job.to_string(),
+             panel::s_str(&state, "gcode_file").to_string(),
+             panel::s_str(&state, "print_type").to_string())
+        };
         // a job preparing or starting closes an idle session at once
         // (design doc 4, rule 5)
         if gcode_state != self.last_gcode_state || job != self.last_job {
@@ -313,11 +405,7 @@ impl PrinterUi {
             self.plate_texture = None;
             // a fetch still running for the previous job name is cancelled,
             // and this one runs on the browse session (design doc 5.4)
-            self.ftp.send(Cmd::JobBundle {
-                job,
-                file_name: panel::s_str(&state, "gcode_file").to_string(),
-                print_type: panel::s_str(&state, "print_type").to_string(),
-            });
+            self.ftp.send(Cmd::JobBundle { job, file_name, print_type });
         }
     }
 }
@@ -380,6 +468,16 @@ struct App {
     store: config::Store,
     /// the disk cache of design doc 5.6, one per app
     cache: Arc<cache::Cache>,
+    /// The cache's used bytes, walked on a thread: the walk reads every
+    /// file in the cache directory and must never run inside a frame
+    /// (E30, D08). The figure the view shows is the last one that landed;
+    /// `asked_at` keeps the 2 s rule, and Clear cache and a transfer that
+    /// finishes clear the memo in `cache` itself (E28).
+    cache_usage: Arc<Mutex<Option<u64>>>,
+    cache_asked_at: Option<Instant>,
+    /// Clear cache deletes files, so it runs on a thread too; while the
+    /// flag is up the button says "Clearing…" (E30, E31).
+    clearing: Arc<std::sync::atomic::AtomicBool>,
     /// a failed save, or an unreadable config.toml; shown above the panel
     config_error: Option<String>,
     /// the app was asked to close while transfers were running, so the
@@ -433,6 +531,9 @@ impl App {
         let mut app = Self {
             cfg, printers, selected: 0, dialog, view: AppView::Panel,
             started: false, store, cache, config_error,
+            cache_usage: Arc::new(Mutex::new(None)),
+            cache_asked_at: None,
+            clearing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_close: false, closing: false, pending_edit: None,
             #[cfg(debug_assertions)]
             debug_play: std::env::var("BAMBU_CONTROL_PLAY").ok(),
@@ -441,6 +542,30 @@ impl App {
             app.save_config();
         }
         app
+    }
+
+    /// The cache's used bytes for this frame: the last figure a walk
+    /// landed, and a new walk started at most once per
+    /// `CACHE_USAGE_REFRESH` (E28, E30). A frame never walks the disk.
+    fn cache_usage(&mut self, ctx: &egui::Context) -> u64 {
+        /// The walk reads every file in the cache directory, so it runs
+        /// at most this often (design doc 5.1, rule 5).
+        const CACHE_USAGE_REFRESH: Duration = Duration::from_secs(2);
+
+        let stale = self.cache_asked_at
+            .is_none_or(|asked| asked.elapsed() >= CACHE_USAGE_REFRESH);
+        if stale && !self.clearing.load(Ordering::SeqCst) {
+            self.cache_asked_at = Some(Instant::now());
+            let (cache, slot) =
+                (self.cache.clone(), self.cache_usage.clone());
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let bytes = cache.usage_bytes();
+                *slot.lock().unwrap() = Some(bytes);
+                ctx.request_repaint();
+            });
+        }
+        self.cache_usage.lock().unwrap().unwrap_or(0)
     }
 
     /// Saves atomically and shows a failure. While config.toml is unreadable
@@ -526,20 +651,15 @@ impl App {
     /// The files view of design doc 6, in place of the printer panel.
     fn show_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let selected = self.selected;
-        // the session line ticks while a session connects or sits idle
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // no repaint rate of its own: every counter and every gate in the
+        // view asks for the moment it needs, and the earliest wins (E32,
+        // D34). An idle view with a listing repaints once a second.
         // a dialog is painted over this view (Edit printer, for example):
         // it owns the keyboard while it is open (design doc 6)
-        /// The cache's usage is a walk of the whole cache directory, and
-        /// this view repaints at least ten times a second, so it is
-        /// re-walked at most this often (design doc 5.1, rule 5). Clear
-        /// cache and every finished download forget the memo, so the line
-        /// never keeps showing a figure that has changed.
-        const CACHE_USAGE_REFRESH: Duration = Duration::from_secs(2);
-
         let dialog_open = !matches!(self.dialog, Dialog::None);
-        let cache_usage = self.cache.usage_bytes_cached(CACHE_USAGE_REFRESH);
+        let cache_usage = self.cache_usage(ctx);
         let cache_cap = self.cache.cap_bytes();
+        let clearing = self.clearing.load(Ordering::SeqCst);
         let disk = self.cache.clone();
         let (actions, cmds) = {
             let printer = &mut self.printers[selected];
@@ -554,10 +674,17 @@ impl App {
             // ETA (design doc 5.6). The key is the worker's own, so the two
             // always name the same file.
             let printer_key = cache::Cache::printer_key(&printer.cfg.serial);
+            let copies = &printer.cached_copy;
             let cached = move |entry: &ftp::RemoteEntry| -> Option<PathBuf> {
+                if let Some(known) = copies.borrow().get(&entry.path) {
+                    return known.clone();
+                }
                 let key = cache::Cache::key(&printer_key, entry, None);
                 let ext = browser::extension_of(&entry.name);
-                disk.get(&printer_key, cache::Kind::File, key, &ext)
+                let hit = disk.get(&printer_key, cache::Kind::File, key,
+                                   &ext);
+                copies.borrow_mut().insert(entry.path.clone(), hit.clone());
+                hit
             };
             // Whether a local file may be handed to the Windows shell: its
             // header and its extension must agree that it is media, because
@@ -603,6 +730,8 @@ impl App {
                 now: Instant::now(),
                 cache_usage,
                 cache_cap,
+                clearing,
+                opening: printer.opening.is_some(),
                 cached: Some(&cached),
                 shell_openable: Some(&shell_openable),
                 player: player_view,
@@ -621,6 +750,7 @@ impl App {
         for action in actions {
             match action {
                 files_view::Action::Back => {
+                    self.printers[selected].forget_disk_answers();
                     self.printers[selected].open_error = None;
                     self.printers[selected].files.close();
                     self.printers[selected].close_player();
@@ -649,8 +779,25 @@ impl App {
                         .map(|e| format!("couldn't show the file ({e})"));
                 }
                 files_view::Action::ClearCache => {
-                    // it skips the file the player has open (5.6)
-                    self.cache.clear();
+                    // deleting every cached file is disk work: it runs on
+                    // a thread, and the button says so until it is done
+                    // (E30, E31, D08)
+                    let (cache, clearing) =
+                        (self.cache.clone(), self.clearing.clone());
+                    let usage = self.cache_usage.clone();
+                    let ctx = ctx.clone();
+                    clearing.store(true, Ordering::SeqCst);
+                    self.cache_asked_at = None;
+                    for printer in &mut self.printers {
+                        printer.forget_disk_answers();
+                    }
+                    std::thread::spawn(move || {
+                        // it skips the file the player has open (5.6)
+                        cache.clear();
+                        *usage.lock().unwrap() = Some(cache.usage_bytes());
+                        clearing.store(false, Ordering::SeqCst);
+                        ctx.request_repaint();
+                    });
                 }
                 files_view::Action::Refresh => {
                     let printer = &mut self.printers[selected];
@@ -1441,6 +1588,10 @@ impl eframe::App for App {
                         printer.light_unconfirmed = true;
                     } else {
                         shown_on = desired;
+                        // the timeout is a deadline: without it nothing
+                        // would repaint to notice it passed (E32)
+                        ctx.request_repaint_after(
+                            LIGHT_PENDING.saturating_sub(ts.elapsed()));
                     }
                 }
 
@@ -1470,6 +1621,7 @@ impl eframe::App for App {
                     fw_latest: printer.fw_latest.clone(),
                     show_humidity: !model.contains("A1"),
                     model,
+                    hms: &printer.hms_lines,
                     light_shown_on: shown_on,
                     light_pending: printer.light_pending.is_some(),
                     light_unconfirmed: printer.light_unconfirmed,

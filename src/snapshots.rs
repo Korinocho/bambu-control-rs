@@ -592,13 +592,17 @@ fn printer_ui(ctx: &egui::Context, cache: &Arc<cache::Cache>,
         player_error: None,
         open_error: None,
         shell_openable: RefCell::new(HashMap::new()),
+        cached_copy: RefCell::new(HashMap::new()),
         job_bundle: None,
         plate_texture: None,
         current_job: String::new(),
         last_job: String::new(),
         last_gcode_state: String::new(),
+        hms_codes: Vec::new(),
+        hms_lines: Vec::new(),
         light_pending: None,
         light_unconfirmed: false,
+        opening: None,
     }
 }
 
@@ -631,6 +635,9 @@ fn app(ctx: &egui::Context, printers: &[PrinterFixture], dir: &TempDir)
         started: true,
         store: config::Store::load().0,
         cache,
+        cache_usage: Arc::new(Mutex::new(None)),
+        cache_asked_at: None,
+        clearing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         config_error: None,
         pending_close: false,
         closing: false,
@@ -873,6 +880,9 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
             app.printers[1].client.state.lock().unwrap().insert(
                 "hms".to_string(),
                 json!([{ "attr": 0x0700_2000u64, "code": 0x0002_0001u64 }]));
+            // the banner's lines are resolved in `sync`, which a shot
+            // does not run: the scene resolves them itself (D38)
+            app.printers[1].sync_hms(ctx);
             app.dialog = Dialog::Hms;
         }
         "no-printers" => app.printers.clear(),

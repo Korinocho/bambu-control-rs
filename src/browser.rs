@@ -2632,6 +2632,11 @@ pub struct BrowserState {
     next_transfer_id: u64,
     /// listing generation: results of older ones are ignored
     generation: u64,
+    /// Bumped by everything the row model reads: a worker event, a
+    /// refresh, and a directory opened on demand. The view keys its rows,
+    /// its used-space sums and its selection on it (E27), so a listing
+    /// that lands is the only thing that rebuilds them.
+    revision: u64,
     recordings_opened: bool,
 }
 
@@ -2640,6 +2645,7 @@ impl BrowserState {
     /// once the root says they exist (5.5).
     pub fn refresh(&mut self) -> Vec<Cmd> {
         self.generation += 1;
+        self.revision += 1;
         self.cert_alert = None;
         self.error = None;
         self.dirs.clear();
@@ -2661,8 +2667,14 @@ impl BrowserState {
         self.generation
     }
 
+    /// What the view keys its O(listing) work on (E27).
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// The Recordings tab was opened: `/ipcam` is listed on demand (5.5).
     pub fn open_recordings(&mut self) -> Vec<Cmd> {
+        self.revision += 1;
         self.recordings_opened = true;
         match self.root_dir(RECORDINGS_DIR) {
             Some(dir) if !self.dirs.contains_key(&dir) => vec![self.list(&dir)],
@@ -2676,6 +2688,7 @@ impl BrowserState {
         if self.dirs.contains_key(dir) {
             return Vec::new();
         }
+        self.revision += 1;
         vec![self.list(dir)]
     }
 
@@ -2848,6 +2861,9 @@ impl BrowserState {
 
     /// Folds one worker event in and returns the listings it starts.
     pub fn apply(&mut self, event: Event) -> Vec<Cmd> {
+        // every event can change what the rows are, so the row model's
+        // key changes with it (E27, E28)
+        self.revision += 1;
         match event {
             Event::Conn(conn) => {
                 if let ConnState::Stopped(err) = &conn {
@@ -3389,6 +3405,16 @@ impl VisibleSince {
     pub fn ready(&mut self, path: &str, now: Instant) -> bool {
         let since = *self.0.entry(path.to_string()).or_insert(now);
         now.saturating_duration_since(since) >= PREFETCH_VISIBLE
+    }
+
+    /// How long `path` still has to wait for its gate, so the view can ask
+    /// to be repainted exactly then instead of polling (E32). `None` once
+    /// the wait is over, or for a tile that was never seen.
+    pub fn wait(&self, path: &str, now: Instant) -> Option<Duration> {
+        let since = *self.0.get(path)?;
+        PREFETCH_VISIBLE
+            .checked_sub(now.saturating_duration_since(since))
+            .filter(|left| !left.is_zero())
     }
 
     /// Forgets the tiles that are no longer visible.

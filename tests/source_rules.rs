@@ -347,6 +347,89 @@ fn state_hits(file: &Path, text: &str) -> Vec<String> {
     found
 }
 
+/// The body of every `std::thread::spawn(…)` in `text`, as byte ranges.
+fn spawned_blocks(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut blocks = Vec::new();
+    for (at, _) in text.match_indices("std::thread::spawn") {
+        let Some(open) = text[at..].find('{').map(|off| at + off) else {
+            continue;
+        };
+        let mut depth = 0_i32;
+        for (off, ch) in text[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => continue,
+            }
+            if depth == 0 {
+                blocks.push(open..open + off);
+                break;
+            }
+        }
+    }
+    blocks
+}
+
+/// Every call that can block the UI thread, outside a spawned thread (E30).
+fn blocking_hits(file: &Path, text: &str) -> Vec<String> {
+    let calls = ["MjpegPlayer::open", "cache.clear()", "usage_bytes",
+                 "std::fs::"];
+    let threads = spawned_blocks(text);
+    let line_of = |at: usize| text[..at].lines().count();
+    let mut found = Vec::new();
+    for call in calls {
+        for (at, _) in text.match_indices(call) {
+            // the doc comments that name these calls are not calls
+            let line_start = text[..at].rfind('\n').map_or(0, |nl| nl + 1);
+            if text[line_start..at].trim_start().starts_with("//") {
+                continue;
+            }
+            if threads.iter().any(|block| block.contains(&at)) {
+                continue;
+            }
+            found.push(format!("{}:{}: {call} on the UI thread",
+                               file.display(), line_of(at)));
+        }
+    }
+    found
+}
+
+/// E30: what can block runs on a thread, not inside a frame.
+#[test]
+fn blocking_work_runs_off_the_ui_thread() {
+    let main = root().join("src").join("main.rs");
+    let text = std::fs::read_to_string(&main).expect("utf-8 source");
+    let production = text.split("#[cfg(test)]\nmod tests")
+        .next().unwrap_or(&text);
+    // the scan is worth nothing if it found no spawned thread at all
+    let threads = spawned_blocks(production).len();
+    assert!(threads >= 3, "only {threads} spawned threads in main.rs");
+    let found = blocking_hits(&main, production);
+    assert!(found.is_empty(), "blocking calls:\n{}", found.join("\n"));
+}
+
+/// The control for the scan above.
+#[test]
+fn the_blocking_scan_finds_a_call_left_in_a_frame() {
+    let sample = "\
+        fn logic() {\n\
+            let bytes = cache.usage_bytes();\n\
+            std::thread::spawn(move || {\n\
+                let opened = MjpegPlayer::open(path, cache, ctx);\n\
+                cache.clear();\n\
+            });\n\
+            std::fs::remove_file(path).ok();\n\
+        }\n";
+    let found = blocking_hits(Path::new("sample.rs"), sample);
+    // the two outside the thread are found; the two inside it are not
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.iter().any(|hit| hit.contains("usage_bytes")), "{found:?}");
+    assert!(found.iter().any(|hit| hit.contains("std::fs::")), "{found:?}");
+    assert!(!found.iter().any(|hit| hit.contains("MjpegPlayer")
+                              || hit.contains("cache.clear")),
+            "a call inside the thread was reported: {found:?}");
+}
+
 /// E23, E24, E44: cursors, clickable containers and user-visible text.
 #[test]
 fn ui_code_states_are_built_from_the_helpers() {
