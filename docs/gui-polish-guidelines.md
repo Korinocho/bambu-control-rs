@@ -16,7 +16,7 @@ This is a polish pass, not a redesign. The research inputs were gathered as if t
 
 - **The screens.** The printer panel. The files view, where the player takes over the grid area. The 11 `Dialog` variants (`dialogs.rs:16-29`). The close and connection-edit confirmations (`main.rs:1114-1150`).
 - **What lives where, and how each feature is reached:**
-  - Top bar: printer chips plus Edit, Add and Remove.
+  - Top bar: printer chips plus Edit and Add (Remove moved into the Edit dialog with decision O13).
   - Panel: camera, job card, control cards, AMS.
   - The FILES card opens the files view, which has the Timelapses, Recordings and Print files tabs.
   - The detail pane holds Play, Download & play, Save to PC, Show in folder, Open in player, Load preview and Read header.
@@ -353,7 +353,7 @@ Add these to `tests/source_rules.rs`. They scan the production part of `src/ui/*
   - The percentage sits in a slot sized for "100%", and the badge in a slot sized for "↓ 100%" while it is present.
 - The state word and its colour come from the single vocabulary in C6. When MQTT is disconnected the chip shows **"Offline"**, the dot and word are `TEXT_DIM`, and there is no percentage.
 - The selected chip gets its white ring from the painter, so its size doesn't change. Hover fill is `CARD_HOVER`. The drag fade, insertion marker and ghost are unchanged.
-- Tool buttons are `size::ICON_BUTTON`. Edit and Remove are disabled with a reason when there is no printer. Tab order matches the visual order: Edit, Add, Remove.
+- Tool buttons are `size::ICON_BUTTON`. Edit is disabled with a reason when there is no printer. Tab order matches the visual order: Edit, Add. Removing a printer lives in the Edit dialog (decision O13), at the other end of its action row from Save, and still goes through the confirmation of 5.4.
 - Never reorder, hide or merge chips. Never move the tool buttons (O1, O13).
 
 ### C5. Printer panel card grid
@@ -895,7 +895,7 @@ No text changes, no layout-structure changes.
 - **Panel.** A new panel harness at 700 px shows SPEED and LIGHT with equal rects, and card titles in a row at the same y.
 
 And manually:
-- 6 configured printers at 700×780 (TEST-NET addresses such as 192.0.2.x are fine) keep Edit, Add and Remove visible.
+- 6 configured printers at 700×780 (TEST-NET addresses such as 192.0.2.x are fine) keep Edit and Add visible.
 - Skip objects at 1080×780 with a job of 12 or more objects shows its buttons in both steps.
 - Measure the "≈" heights in D01–D03 and record them in the PR.
 - Design doc §6 "reserves what its rows really paint" note is updated.

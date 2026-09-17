@@ -31,7 +31,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, RichText, Sense, Stroke, StrokeKind};
+use egui::{RichText, Sense, Stroke, StrokeKind};
 
 use theme::{font, pad, radius, size, stroke};
 
@@ -422,28 +422,20 @@ fn active_transfers(printer: &PrinterUi) -> usize {
 enum ToolIcon {
     Edit,
     Add,
-    Trash,
 }
 
 /// The tool buttons' glyphs, in points from the button's centre: geometry
 /// private to that one painter. Segments are [x0, y0, x1, y1].
 mod tool_icon {
-    use egui::CornerRadius;
 
     pub const STROKE: f32 = 1.7;
     pub const PENCIL_STROKE: f32 = 2.4;
-    pub const THIN_STROKE: f32 = 1.2;
     pub const PLUS_H: [f32; 4] = [-6.0, 0.0, 6.0, 0.0];
     pub const PLUS_V: [f32; 4] = [0.0, -6.0, 0.0, 6.0];
     pub const PENCIL_BODY: [f32; 4] = [-4.5, 5.5, 4.0, -3.0];
     pub const PENCIL_TIP: [[f32; 2]; 4] =
         [[4.9, -6.4], [6.4, -4.9], [3.2, -2.2], [2.2, -3.2]];
-    pub const TRASH_LID: [f32; 4] = [-7.0, -5.0, 7.0, -5.0];
-    pub const TRASH_HANDLE: [f32; 4] = [-2.5, -7.5, 2.5, -7.5];
-    pub const TRASH_BODY: [f32; 4] = [-5.0, -3.0, 5.0, 7.0];
-    pub const TRASH_BODY_RADIUS: CornerRadius = CornerRadius::same(2);
-    pub const TRASH_LINE_LEFT: [f32; 4] = [-1.7, -1.0, -1.7, 5.0];
-    pub const TRASH_LINE_RIGHT: [f32; 4] = [1.7, -1.0, 1.7, 5.0];
+
 }
 
 /// The chip drag feedback: how far the insertion marker sits outside the
@@ -884,21 +876,6 @@ impl App {
                         .collect(),
                     color, Stroke::NONE));
             }
-            ToolIcon::Trash => {
-                // lid + handle
-                p.line_segment(segment(tool_icon::TRASH_LID), s);
-                p.line_segment(segment(tool_icon::TRASH_HANDLE), s);
-                // body
-                let [x0, y0, x1, y1] = tool_icon::TRASH_BODY;
-                let body = egui::Rect::from_min_max(at([x0, y0]),
-                                                    at([x1, y1]));
-                p.rect(body, tool_icon::TRASH_BODY_RADIUS,
-                       Color32::TRANSPARENT, s, StrokeKind::Inside);
-                // inner lines
-                let inner = Stroke::new(tool_icon::THIN_STROKE, color);
-                p.line_segment(segment(tool_icon::TRASH_LINE_LEFT), inner);
-                p.line_segment(segment(tool_icon::TRASH_LINE_RIGHT), inner);
-            }
         }
         // an icon button has no text, so its name is the one on its
         // tooltip (A9)
@@ -1103,6 +1080,11 @@ impl App {
             Dialog::AddPrinter(mut dlg) => {
                 let (result, close) =
                     dialogs::show_add_printer(ctx, &mut dlg);
+                if let dialogs::AddResult::Remove(index) = result {
+                    // the confirmation of 5.4 still asks, and it says
+                    // what a running download would lose (O13)
+                    self.dialog = Dialog::ConfirmRemove(index);
+                }
                 if let dialogs::AddResult::Save(new_cfg, editing) = result {
                     match editing {
                         Some(index) if index < self.printers.len() => {
@@ -1262,13 +1244,14 @@ impl App {
                     self.dialog = Dialog::ConfirmStop;
                 }
             }
-            Dialog::ConfirmRemove => {
-                let name =
-                    self.printers[self.selected].cfg.name.clone();
+            Dialog::ConfirmRemove(index) => {
+                if index >= self.printers.len() {
+                    return;
+                }
+                let name = self.printers[index].cfg.name.clone();
                 // removing a printer stops its worker, so a running
                 // download is discarded and the question says so (5.4)
-                let running =
-                    active_transfers(&self.printers[self.selected]);
+                let running = active_transfers(&self.printers[index]);
                 let mut text = format!("Remove {name} from the app?");
                 if let Some(note) =
                     files_view::active_transfer_note(running)
@@ -1279,17 +1262,17 @@ impl App {
                 let (close, yes) = dialogs::show_confirm(
                     ctx, "confirm-remove", &text, "Remove");
                 if yes {
-                    let mut printer = self.printers.remove(self.selected);
+                    let mut printer = self.printers.remove(index);
                     printer.shutdown();
                     self.save_config();
                     if !self.printers.is_empty() {
-                        let index =
+                        let next =
                             self.selected.min(self.printers.len() - 1);
-                        self.select(index, ctx);
+                        self.select(next, ctx);
                     }
                 }
                 if !close {
-                    self.dialog = Dialog::ConfirmRemove;
+                    self.dialog = Dialog::ConfirmRemove(index);
                 }
             }
         }
@@ -1500,7 +1483,8 @@ impl eframe::App for App {
                     + 2.0 * stroke::HAIRLINE;
                 let (bar, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), chip_h), Sense::hover());
-                let tools_w = 3.0 * size::ICON_BUTTON.x + 2.0 * gap;
+                // Edit and Add; Remove moved into the Edit dialog (O13)
+                let tools_w = 2.0 * size::ICON_BUTTON.x + gap;
                 let chips = egui::Rect::from_min_max(
                     bar.min,
                     egui::pos2((bar.max.x - tools_w - gap).max(bar.min.x),
@@ -1546,11 +1530,6 @@ impl eframe::App for App {
                                     editing: None,
                                     error: String::new(),
                                 });
-                        }
-                        if Self::tool_button(ui, ToolIcon::Trash,
-                                             "Remove current printer", none)
-                        {
-                            self.dialog = Dialog::ConfirmRemove;
                         }
                 }
             });
