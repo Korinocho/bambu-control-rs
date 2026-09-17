@@ -58,14 +58,42 @@ pub fn reported(rgb: [u8; 3]) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
-pub fn state_color(state: &str) -> Color32 {
-    match state {
-        "RUNNING" => ACCENT,
-        "PAUSE" | "PREPARE" | "SLICING" => WARN,
-        "FINISH" => BLUE,
-        "FAILED" => DANGER,
-        _ => TEXT_DIM,
+/// The one state vocabulary (C6): the word and the colour for a printer's
+/// `gcode_state`, used by the chip and by the job card so they never read
+/// differently. A printer the app cannot reach is Offline, whatever its
+/// last telemetry said (D10, D28).
+pub fn state_word(gcode_state: &str, online: bool) -> (String, Color32) {
+    if !online {
+        return ("Offline".to_string(), TEXT_DIM);
     }
+    let (word, color) = match gcode_state {
+        "RUNNING" => ("Running", ACCENT),
+        "PAUSE" => ("Paused", WARN),
+        "PREPARE" => ("Preparing", WARN),
+        "SLICING" => ("Slicing", WARN),
+        "FINISH" => ("Finished", BLUE),
+        "FAILED" => ("Failed", DANGER),
+        "IDLE" => ("Idle", TEXT_DIM),
+        "" => ("—", TEXT_DIM),
+        // anything the printer invents, in title case and no state colour
+        other => return (title_case(other), TEXT_DIM),
+    };
+    (word.to_string(), color)
+}
+
+/// "SOME_STATE" as "Some state": a word the app does not know, said
+/// plainly rather than shouted.
+fn title_case(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (at, ch) in text.chars().enumerate() {
+        let ch = match ch {
+            '_' => ' ',
+            ch if at == 0 => ch.to_ascii_uppercase(),
+            ch => ch.to_ascii_lowercase(),
+        };
+        out.push(ch);
+    }
+    out
 }
 
 // -------------------------------------------------------------------- type
@@ -225,6 +253,9 @@ pub mod size {
     use egui::{Vec2, vec2};
 
     pub const CONTROL_H: f32 = 32.0;
+    /// The smallest interact height an inline text button may have. The
+    /// text keeps its own row height; only the interact rect grows (A5).
+    pub const INLINE_TARGET_H: f32 = 24.0;
     /// What a default button paints: an 18 px text row plus 2 x 8 padding.
     pub const BUTTON_H: f32 = 34.0;
     pub const BUTTON_H_LARGE: f32 = 40.0;

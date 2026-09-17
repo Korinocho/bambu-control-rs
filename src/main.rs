@@ -91,6 +91,8 @@ struct PrinterUi {
     last_job: String,
     last_gcode_state: String,
     light_pending: Option<(bool, Instant)>,
+    /// the printer never agreed with the last light command (C18, D40)
+    light_unconfirmed: bool,
 }
 
 impl PrinterUi {
@@ -140,6 +142,7 @@ impl PrinterUi {
             last_job: String::new(),
             last_gcode_state: String::new(),
             light_pending: None,
+            light_unconfirmed: false,
         }
     }
 
@@ -696,18 +699,29 @@ impl App {
     }
 
     // ------------------------------------------------------------ chips
-    fn tool_button(ui: &mut egui::Ui, icon: ToolIcon,
-                   tip: &str) -> bool {
+    /// One icon button. With a `reason` it doesn't sense clicks at all: it
+    /// draws in the dim colour and says why on hover, instead of looking
+    /// live and swallowing the click (D11, D23, A11).
+    fn tool_button(ui: &mut egui::Ui, icon: ToolIcon, tip: &str,
+                   reason: Option<&str>) -> bool {
+        let sense = match reason {
+            Some(_) => Sense::hover(),
+            None => Sense::click(),
+        };
         let (rect, response) = ui.allocate_exact_size(
-            size::ICON_BUTTON, Sense::click());
+            size::ICON_BUTTON, sense);
         let visuals = ui.style().interact(&response);
+        let color = match reason {
+            Some(_) => theme::TEXT_DIM,
+            None => theme::TEXT,
+        };
         ui.painter().rect(rect, radius::CONTROL,
                           visuals.bg_fill, visuals.bg_stroke,
                           StrokeKind::Inside);
         let c = rect.center();
         let at = |[x, y]: [f32; 2]| c + egui::Vec2::new(x, y);
         let segment = |[x0, y0, x1, y1]: [f32; 4]| [at([x0, y0]), at([x1, y1])];
-        let s = Stroke::new(tool_icon::STROKE, theme::TEXT);
+        let s = Stroke::new(tool_icon::STROKE, color);
         let p = ui.painter();
         match icon {
             ToolIcon::Add => {
@@ -716,12 +730,12 @@ impl App {
             }
             ToolIcon::Edit => {
                 // pencil: body + tip
-                let body = Stroke::new(tool_icon::PENCIL_STROKE, theme::TEXT);
+                let body = Stroke::new(tool_icon::PENCIL_STROKE, color);
                 p.line_segment(segment(tool_icon::PENCIL_BODY), body);
                 p.add(egui::Shape::convex_polygon(
                     tool_icon::PENCIL_TIP.iter().map(|point| at(*point))
                         .collect(),
-                    theme::TEXT, Stroke::NONE));
+                    color, Stroke::NONE));
             }
             ToolIcon::Trash => {
                 // lid + handle
@@ -734,17 +748,22 @@ impl App {
                 p.rect(body, tool_icon::TRASH_BODY_RADIUS,
                        Color32::TRANSPARENT, s, StrokeKind::Inside);
                 // inner lines
-                let inner = Stroke::new(tool_icon::THIN_STROKE, theme::TEXT);
+                let inner = Stroke::new(tool_icon::THIN_STROKE, color);
                 p.line_segment(segment(tool_icon::TRASH_LINE_LEFT), inner);
                 p.line_segment(segment(tool_icon::TRASH_LINE_RIGHT), inner);
             }
         }
-        if response.hovered() {
-            ui.output_mut(|o| {
-                o.cursor_icon = egui::CursorIcon::PointingHand;
-            });
+        // the cursor changes only where the click acts (A11, E23)
+        match reason {
+            Some(reason) => {
+                response.on_hover_text(reason);
+                false
+            }
+            None => response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(tip)
+                .clicked(),
         }
-        response.on_hover_text(tip).clicked()
     }
 
     fn chips_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -761,7 +780,10 @@ impl App {
                     panel::s_str(&state, "gcode_state").to_string();
                 let pct = panel::s_i64(&state, "mc_percent").unwrap_or(0);
                 drop(state);
-                let color = theme::state_color(&gcode_state);
+                // a printer the app cannot reach reads Offline, with no
+                // percentage: its last telemetry is not news (C4, D10)
+                let online = printer.client.conn.lock().unwrap().0;
+                let (word, color) = theme::state_word(&gcode_state, online);
                 let selected = i == self.selected;
                 let is_dragged = dragging == Some(i);
 
@@ -771,12 +793,17 @@ impl App {
                         // cursor
                         ui.multiply_opacity(0.35);
                     }
-                    let response = egui::Frame::new()
-                        .fill(theme::CARD)
-                        .stroke(Stroke::new(stroke::HAIRLINE, theme::BORDER))
-                        .corner_radius(radius::CONTROL)
-                        .inner_margin(pad::CHIP)
-                        .show(ui, |ui| {
+                    // the chip is the widget, so hover, pressed and
+                    // focus land on it and the drag starts on it (C2, C4)
+                    ui::widgets::clickable_sense(
+                        ui, ("chip", printer.cfg.serial.as_str()),
+                        ui::widgets::Surface::card()
+                            .radius(radius::CONTROL)
+                            .padding(pad::CHIP)
+                            .selected(selected, false)
+                            .ring(theme::CHIP_SELECTED),
+                        Sense::click_and_drag(),
+                        |ui| {
                             ui.horizontal(|ui| {
                                 let label = font::label();
                                 // baseline-aligned status dot
@@ -799,20 +826,16 @@ impl App {
                                             RichText::new(name).font(strong))
                                             .truncate());
                                     });
-                                if !gcode_state.is_empty() {
-                                    let mut s = gcode_state.to_lowercase();
-                                    if let Some(c) = s.get_mut(0..1) {
-                                        c.make_ascii_uppercase();
-                                    }
-                                    ui.label(RichText::new(s).color(color)
-                                        .font(label.clone()));
+                                if !word.is_empty() {
+                                    ui.label(RichText::new(&word)
+                                        .color(color).font(label.clone()));
                                 }
                                 // numbers sit in slots for their widest
                                 // value, so 9% becoming 10% moves no chip
                                 // to the right of this one (C4)
                                 if matches!(gcode_state.as_str(),
                                             "RUNNING" | "PAUSE")
-                                    && pct > 0
+                                    && pct > 0 && online
                                 {
                                     ui::widgets::slot(ui, "100%",
                                         RichText::new(format!("{pct}%"))
@@ -831,27 +854,15 @@ impl App {
                                         &label, egui::Align::Min);
                                 }
                             });
-                        })
-                        .response;
-                    // the selected ring is painted inside the chip, so
-                    // selecting one never changes its size (E10)
-                    if selected {
-                        ui.painter().rect_stroke(
-                            response.rect, radius::CONTROL,
-                            Stroke::new(stroke::SELECTED,
-                                        theme::CHIP_SELECTED),
-                            StrokeKind::Inside);
-                    }
-                    response
+                        }).response
                 }).inner;
 
-                let response = frame_response
-                    .interact(Sense::click_and_drag());
+                let mut response = frame_response;
                 chip_rects.push(response.rect);
-                if response.hovered() && dragging.is_none() {
-                    ui.output_mut(|o| {
-                        o.cursor_icon = egui::CursorIcon::PointingHand;
-                    });
+                // while something is being dragged the grab cursor rules
+                if dragging.is_none() {
+                    response = response.on_hover_cursor(
+                        egui::CursorIcon::PointingHand);
                 }
                 if response.clicked() {
                     clicked = Some(i);
@@ -866,9 +877,7 @@ impl App {
         if let Some(src) = dragging
             && src < self.printers.len()
         {
-            ctx.output_mut(|o| {
-                o.cursor_icon = egui::CursorIcon::Grabbing;
-            });
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             let pointer = ctx.input(|i| i.pointer.latest_pos());
             if let Some(pos) = pointer
                 && !chip_rects.is_empty()
@@ -1278,6 +1287,7 @@ impl App {
             }
             PanelAction::SetLight(on) => {
                 printer.light_pending = Some((on, Instant::now()));
+                printer.light_unconfirmed = false;
                 printer.client.set_light(on);
             }
             PanelAction::OpenFiles => self.open_files(),
@@ -1348,14 +1358,17 @@ impl eframe::App for App {
                     .layout(egui::Layout::right_to_left(egui::Align::Center)));
                 {
                     let ui = &mut tools_ui;
+                        // with no printers there is nothing to edit or
+                        // remove, and the buttons say so (D11)
+                        let none = self.printers.is_empty()
+                            .then_some("No printers yet");
                         if Self::tool_button(ui, ToolIcon::Trash,
-                                             "Remove current printer")
-                            && !self.printers.is_empty()
+                                             "Remove current printer", none)
                         {
                             self.dialog = Dialog::ConfirmRemove;
                         }
                         if Self::tool_button(ui, ToolIcon::Add,
-                                             "Add printer")
+                                             "Add printer", None)
                         {
                             self.dialog = Dialog::AddPrinter(
                                 dialogs::AddPrinterDlg {
@@ -1365,8 +1378,7 @@ impl eframe::App for App {
                                 });
                         }
                         if Self::tool_button(ui, ToolIcon::Edit,
-                                             "Edit current printer")
-                            && !self.printers.is_empty()
+                                             "Edit current printer", none)
                         {
                             self.dialog = Dialog::AddPrinter(
                                 dialogs::AddPrinterDlg {
@@ -1419,10 +1431,14 @@ impl eframe::App for App {
                 let mut shown_on =
                     panel::light_on(&state).unwrap_or(false);
                 if let Some((desired, ts)) = printer.light_pending {
-                    if shown_on == desired
-                        || ts.elapsed().as_secs() > LIGHT_PENDING.as_secs()
-                    {
+                    if shown_on == desired {
                         printer.light_pending = None;
+                        printer.light_unconfirmed = false;
+                    } else if ts.elapsed() > LIGHT_PENDING {
+                        // the command went and telemetry never agreed: say
+                        // so rather than snapping the switch back (C18, D40)
+                        printer.light_pending = None;
+                        printer.light_unconfirmed = true;
                     } else {
                         shown_on = desired;
                     }
@@ -1455,6 +1471,8 @@ impl eframe::App for App {
                     show_humidity: !model.contains("A1"),
                     model,
                     light_shown_on: shown_on,
+                    light_pending: printer.light_pending.is_some(),
+                    light_unconfirmed: printer.light_unconfirmed,
                     files_summary,
                 };
                 let actions = panel::show(ui, &view);

@@ -25,6 +25,156 @@ pub fn slot(ui: &mut Ui, widest: &str, text: RichText, font: &FontId,
     }).response
 }
 
+/// How a clickable surface is drawn (C2): its shape, its rest fill, and
+/// whether it is the selected one.
+#[derive(Clone, Copy)]
+pub struct Surface {
+    pub radius: egui::CornerRadius,
+    pub padding: egui::Margin,
+    /// the fill at rest; hover and pressed come from the palette
+    pub fill: egui::Color32,
+    /// the hairline outline, where the surface has one
+    pub stroke: Option<egui::Color32>,
+    /// the fill under the pointer, and the pressed fill with it. A banner
+    /// has none: its tone must not turn grey while the pointer is on it,
+    /// so it shows the hover with the cursor and the focus ring alone.
+    pub hover: Option<egui::Color32>,
+    /// a selected surface keeps a ring, and (a row, not a tile) a fill
+    pub selected: bool,
+    pub selected_fill: bool,
+    pub ring: egui::Color32,
+}
+
+impl Surface {
+    /// A card: the one card shape, filled `CARD`, with an accent ring when
+    /// it is the selected one.
+    pub fn card() -> Self {
+        Self {
+            radius: radius::CARD,
+            padding: theme::pad::CARD,
+            fill: theme::CARD,
+            stroke: Some(theme::BORDER),
+            hover: Some(theme::CARD_HOVER),
+            selected: false,
+            selected_fill: false,
+            ring: theme::ACCENT,
+        }
+    }
+
+    /// A banner (C3): the control shape, the banner padding, the tone's
+    /// background and no outline.
+    pub fn banner(tone: Tone) -> Self {
+        Self {
+            radius: radius::CONTROL,
+            padding: theme::pad::BANNER,
+            fill: banner_colors(tone).1,
+            stroke: None,
+            hover: None,
+            selected: false,
+            selected_fill: false,
+            ring: theme::ACCENT,
+        }
+    }
+
+    pub fn radius(mut self, radius: egui::CornerRadius) -> Self {
+        self.radius = radius;
+        self
+    }
+
+    pub fn padding(mut self, padding: egui::Margin) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Selected: a ring, and for a row also the hover fill (C11).
+    pub fn selected(mut self, selected: bool, fill: bool) -> Self {
+        self.selected = selected;
+        self.selected_fill = fill;
+        self
+    }
+
+    pub fn ring(mut self, ring: egui::Color32) -> Self {
+        self.ring = ring;
+        self
+    }
+}
+
+/// One clickable surface — a card, a banner, a chip, a tile, a row (C2).
+///
+/// The surface itself is the widget: `UiBuilder::sense` makes the scope
+/// clickable, rather than interacting with the frame's response afterwards
+/// (E24). Hover, pressed and keyboard focus change only colours and painted
+/// rings, never a size (E10), and the cursor is set through the response.
+pub fn clickable<R>(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debug,
+                    surface: Surface, add: impl FnOnce(&mut Ui) -> R)
+                    -> egui::InnerResponse<R> {
+    clickable_sense(ui, id_salt, surface, Sense::click(), add)
+}
+
+/// The same surface with a sense of its own: a chip is dragged as well as
+/// clicked (C4), and nothing else needs more than a click.
+pub fn clickable_sense<R>(ui: &mut Ui,
+                          id_salt: impl std::hash::Hash + std::fmt::Debug,
+                          surface: Surface, sense: Sense,
+                          add: impl FnOnce(&mut Ui) -> R)
+                          -> egui::InnerResponse<R> {
+    let scope = ui.scope_builder(
+        egui::UiBuilder::new().id_salt(id_salt).sense(sense),
+        |ui| {
+            // a selectable label senses click and drag, and being smaller
+            // and painted later it takes the hit from the surface it sits
+            // on; inside a row, a card or a tile the text is not a
+            // selection, the surface is the target (C2, A11)
+            ui.style_mut().interaction.selectable_labels = false;
+            let response = ui.response();
+            let fill = match surface.hover {
+                Some(_) if response.is_pointer_button_down_on() =>
+                    theme::PRESSED_FILL,
+                Some(hover) if response.hovered()
+                    || (surface.selected && surface.selected_fill) => hover,
+                _ => surface.fill,
+            };
+            let outline = match surface.stroke {
+                Some(color) => Stroke::new(stroke::HAIRLINE, color),
+                None => Stroke::NONE,
+            };
+            let inner = egui::Frame::new()
+                .fill(fill)
+                .stroke(outline)
+                .corner_radius(surface.radius)
+                .inner_margin(surface.padding)
+                .show(ui, add)
+                .inner;
+            let rect = ui.min_rect();
+            if surface.selected {
+                ui.painter().rect_stroke(
+                    rect, surface.radius,
+                    Stroke::new(stroke::SELECTED, surface.ring),
+                    StrokeKind::Inside);
+            }
+            // the focus ring sits outside, a hairline clear of the surface
+            if response.has_focus() {
+                ui.painter().rect_stroke(
+                    rect.expand(stroke::HAIRLINE + stroke::FOCUS),
+                    surface.radius, Stroke::new(stroke::FOCUS, theme::TEXT),
+                    StrokeKind::Outside);
+            }
+            inner
+        });
+    egui::InnerResponse::new(scope.inner, scope.response)
+}
+
+/// A button that says why it cannot act: disabled, with the reason on
+/// hover, rather than live-looking and swallowing the click (D11, D23, A11).
+pub fn button(ui: &mut Ui, button: egui::Button<'_>, reason: Option<&str>)
+              -> bool {
+    let Some(reason) = reason else {
+        return ui.add(button).clicked();
+    };
+    ui.add_enabled(false, button).on_disabled_hover_text(reason);
+    false
+}
+
 /// The tone of a banner (C3).
 #[derive(Clone, Copy)]
 pub enum Tone {
@@ -33,15 +183,20 @@ pub enum Tone {
     Neutral,
 }
 
+/// A tone's text and background colour (C3).
+pub fn banner_colors(tone: Tone) -> (egui::Color32, egui::Color32) {
+    match tone {
+        Tone::Warn => (theme::WARN, theme::WARN_BG),
+        Tone::Danger => (theme::DANGER, theme::DANGER_BG),
+        Tone::Neutral => (theme::TEXT_DIM, theme::CARD),
+    }
+}
+
 /// The one banner (C3): full width, text wrapping top-down, an optional
 /// title above it. The caller gives it an id scope of its own (E3).
 pub fn banner(ui: &mut Ui, tone: Tone, title: Option<&str>, text: &str)
               -> egui::Response {
-    let (color, fill) = match tone {
-        Tone::Warn => (theme::WARN, theme::WARN_BG),
-        Tone::Danger => (theme::DANGER, theme::DANGER_BG),
-        Tone::Neutral => (theme::TEXT_DIM, theme::CARD),
-    };
+    let (color, fill) = banner_colors(tone);
     egui::Frame::new()
         .fill(fill)
         .corner_radius(radius::CONTROL)
@@ -64,7 +219,9 @@ pub fn fit(content: Vec2, bounds: Vec2) -> Vec2 {
 }
 
 /// iOS-style pill switch, green when on. Returns true when toggled.
-pub fn toggle_switch(ui: &mut Ui, on: &mut bool) -> bool {
+/// `pending`: the command was sent and the printer has not agreed yet, so
+/// the knob sits where it was asked to and the track is half lit (C18).
+pub fn toggle_switch(ui: &mut Ui, on: &mut bool, pending: bool) -> bool {
     let (rect, mut response) =
         ui.allocate_exact_size(size::TOGGLE, Sense::click());
     if response.clicked() {
@@ -76,6 +233,10 @@ pub fn toggle_switch(ui: &mut Ui, on: &mut bool) -> bool {
         theme::ACCENT
     } else {
         theme::TRACK_OFF
+    };
+    let track = match pending {
+        true => track.gamma_multiply(0.5),
+        false => track,
     };
     painter.rect_filled(rect, radius::pill(rect.height()), track);
     // the knob's centre sits half the track's height in from its end
@@ -204,7 +365,7 @@ pub fn jog_wheel(ui: &mut Ui) -> Option<JogAction> {
                  font::icon_large(), theme::ACCENT);
 
     if hover.is_some() {
-        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if response.clicked() {
         response.interact_pointer_pos()
@@ -314,9 +475,7 @@ pub fn plate_map(ui: &mut Ui, objects: &[(i64, String)],
     if let Some(id) = hover_id
         && !locked.contains(&id)
     {
-        ui.output_mut(|o| {
-            o.cursor_icon = egui::CursorIcon::PointingHand;
-        });
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         if response.clicked() {
             clicked = Some(id);
         }

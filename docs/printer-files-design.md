@@ -1214,7 +1214,8 @@ There is no trust, accept or continue action. Close is the default: focused, and
 **Behaviour:**
 - **Sorts:** timelapses newest first by the start time in the file name, grouped by month. Recordings newest first by name. Files newest first by LIST mtime, with name and size as options. Times are shown as printer clock, never converted.
 - **Per-tile state overlay** instead of blocking dialogs: waiting / queued (reason) / % / failed + Retry / done + Play / Open / Folder.
-- **Actions are always visible** on the selected tile and in the detail pane, not only on hover.
+- **Actions are always visible** on the selected tile and in the detail pane, not only on hover. An action the view would refuse — "Save to PC" or "Download & play" for a file already on its way — is disabled and says why on hover, never a click that starts nothing.
+- **A row, a tile and a chip are each one widget** (`widgets::clickable`): hover, pressed and keyboard focus land on the whole surface, its selection is a painted ring, and the text on it is not selectable, so the surface takes the click. Only "⟳ retry" inside a tile takes its own.
 - **Thumbnails:** timelapse thumbnails load for visible tiles (prefetch limits, section 4). 3mf previews load automatically only for files of 1 MB or less (256 KB while printing); larger files show "preview: 6.9 MB · ~35 s [Load]". Plain `.gcode` gets a `G` icon and a "Read header" action. `.bbl` files are hidden. Recordings have no thumbnails in the MVP (name, size, time).
 - **Every action shows its time cost up front:** download ETA from the rolling rate, "connecting…" with seconds elapsed, and "~N s" on head reads.
 - **Loading:** skeleton tiles plus a "listing /cache…" caption. **Empty:** the reasons from 5.5. **Error:** a card with the 5.10 text + Retry; never an endless spinner.
