@@ -900,6 +900,15 @@ impl App {
                 p.line_segment(segment(tool_icon::TRASH_LINE_RIGHT), inner);
             }
         }
+        // an icon button has no text, so its name is the one on its
+        // tooltip (A9)
+        let enabled = reason.is_none();
+        let named = |response: egui::Response| {
+            response.widget_info(|| egui::WidgetInfo::labeled(
+                egui::WidgetType::Button, enabled, tip));
+            response
+        };
+        let response = named(response);
         // the cursor changes only where the click acts (A11, E23)
         match reason {
             Some(reason) => {
@@ -944,6 +953,7 @@ impl App {
                     // focus land on it and the drag starts on it (C2, C4)
                     ui::widgets::clickable_sense(
                         ui, ("chip", printer.cfg.serial.as_str()),
+                        &format!("{} — {word}", printer.cfg.name),
                         ui::widgets::Surface::card()
                             .radius(radius::CONTROL)
                             .padding(pad::CHIP)
@@ -1500,19 +1510,32 @@ impl eframe::App for App {
                     .layout(egui::Layout::left_to_right(egui::Align::Min)));
                 chips_ui.set_clip_rect(chips.intersect(ui.clip_rect()));
                 self.chips_bar(&mut chips_ui, ctx);
+                // the tools sit at the right end, laid out left to right
+                // inside it, so the keyboard walks them in the order the
+                // eye reads them (A8)
+                let tools = egui::Rect::from_min_max(
+                    egui::pos2((bar.max.x - tools_w).max(bar.min.x),
+                               bar.min.y),
+                    bar.max);
                 let mut tools_ui = ui.new_child(egui::UiBuilder::new()
-                    .max_rect(bar)
-                    .layout(egui::Layout::right_to_left(egui::Align::Center)));
+                    .max_rect(tools)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)));
                 {
                     let ui = &mut tools_ui;
                         // with no printers there is nothing to edit or
                         // remove, and the buttons say so (D11)
                         let none = self.printers.is_empty()
                             .then_some("No printers yet");
-                        if Self::tool_button(ui, ToolIcon::Trash,
-                                             "Remove current printer", none)
+                        if Self::tool_button(ui, ToolIcon::Edit,
+                                             "Edit current printer", none)
                         {
-                            self.dialog = Dialog::ConfirmRemove;
+                            self.dialog = Dialog::AddPrinter(
+                                dialogs::AddPrinterDlg {
+                                    draft: self.printers[self.selected]
+                                        .cfg.clone(),
+                                    editing: Some(self.selected),
+                                    error: String::new(),
+                                });
                         }
                         if Self::tool_button(ui, ToolIcon::Add,
                                              "Add printer", None)
@@ -1524,16 +1547,10 @@ impl eframe::App for App {
                                     error: String::new(),
                                 });
                         }
-                        if Self::tool_button(ui, ToolIcon::Edit,
-                                             "Edit current printer", none)
+                        if Self::tool_button(ui, ToolIcon::Trash,
+                                             "Remove current printer", none)
                         {
-                            self.dialog = Dialog::AddPrinter(
-                                dialogs::AddPrinterDlg {
-                                    draft: self.printers[self.selected]
-                                        .cfg.clone(),
-                                    editing: Some(self.selected),
-                                    error: String::new(),
-                                });
+                            self.dialog = Dialog::ConfirmRemove;
                         }
                 }
             });
