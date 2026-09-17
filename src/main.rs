@@ -139,9 +139,11 @@ impl PrinterUi {
         // a background printer drops its prefetch and closes its session
         self.ftp.send(Cmd::SetBackground(!active));
         if active && self.camera.is_none() {
+            // the serial is what the camera's certificate check binds to
+            // (issue #2): without it nothing connects
             self.camera = Some(camera::Camera::start(
-                self.cfg.ip.clone(), self.cfg.access_code.clone(),
-                ctx.clone()));
+                self.cfg.ip.clone(), self.cfg.serial.clone(),
+                self.cfg.access_code.clone(), ctx.clone()));
         } else if !active && let Some(cam) = self.camera.take() {
             cam.stop();
             self.cam_texture = None;

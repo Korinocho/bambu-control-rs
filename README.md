@@ -35,8 +35,8 @@ verify printers, and is not covered by this project's license.
 - The printer's **IP address**, **serial number** and **LAN access code**
   (printer screen: Settings → Network).
 
-Ports used on the printer: `8883` (MQTT over TLS), `990` (implicit FTPS) and the camera
-port.
+Ports used on the printer: `8883` (MQTT over TLS), `990` (implicit FTPS) and `6000`
+(camera).
 
 ## Build
 
@@ -82,9 +82,17 @@ Each connection to the printer is treated separately.
   certificate's key. Anything else is refused before the access code is sent, and the app
   offers no way to trust a refused printer. Certificate expiry is deliberately not
   checked, because Bambu's CA expires in 2032 and the printers' certificates in 2035.
-- **MQTT, port 8883, and the camera, port 6000:** **not verified yet.** Both accept any
-  certificate, so the access code is sent to whatever answers at the printer's address.
-  Tracked as issues #1 and #2; until they land, treat these two as LAN-only.
+- **Camera, port 6000:** verified, by the same embedded `BBL CA`, the same configured
+  serial and the same handshake signature check as FTPS above. The camera's first bytes
+  after the handshake carry the access code, so a certificate that is refused leaves them
+  unsent, and the tests assert that nothing above the handshake ever reaches a printer
+  whose certificate was refused.
+- **MQTT, port 8883:** verified, by the same embedded `BBL CA`, the same configured
+  serial and the same handshake signature check as the two above. The app runs the MQTT
+  connection itself over that verified stream, so the `CONNECT` packet carrying the
+  access code is written only to a printer whose certificate was accepted, and a
+  subscription is believed only once the printer acknowledges it for the identifier the
+  app sent.
 - The LAN access code is stored in plain text in `config.toml`.
 - Outbound connections: your printer on the LAN, plus Bambu Lab servers for HMS error
   descriptions and firmware version information.
