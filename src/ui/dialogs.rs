@@ -28,7 +28,8 @@ pub enum Dialog {
     Hms,
     Maintenance(MaintenanceDlg),
     ConfirmStop,
-    ConfirmRemove,
+    /// the printer at this index, asked for from its Edit dialog (O13)
+    ConfirmRemove(usize),
 }
 
 /// The part of a dialog being laid out (C15).
@@ -146,6 +147,9 @@ pub struct AddPrinterDlg {
 pub enum AddResult {
     None,
     Save(PrinterCfg, Option<usize>),
+    /// the printer being edited is to be removed, which its own
+    /// confirmation asks about (decision O13)
+    Remove(usize),
 }
 
 /// One form field. A required one the Save refused is outlined in
@@ -174,7 +178,7 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                 else { "Add printer" };
     let close = modal(ctx, "add-printer", size::MODAL_M, Some(title),
                       |ui, part| {
-        let mut done = false;
+        let mut done;
         if part == Part::Body {
             // the three fields a Save refuses are outlined only after it
             // refused one: a form nobody filled in yet is not an error
@@ -204,10 +208,24 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
             }
             return false;
         }
-        ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
-                done = true;
-            }
+        // Remove sits at the other end of the row from Save, and only
+        // while a printer is being edited: it used to be the third icon
+        // in the top bar, one pixel from Add (decision O13, C16)
+        let (cancelled, removed) = egui::Sides::new().show(ui,
+            |ui| ui.button("Cancel").clicked(),
+            |ui| {
+                let index = dlg.editing?;
+                let danger = egui::Button::new(
+                    RichText::new("Remove printer").color(theme::DANGER))
+                    .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER));
+                ui.add(danger).clicked().then_some(index)
+            });
+        if let Some(index) = removed {
+            result = AddResult::Remove(index);
+        }
+        done = cancelled || removed.is_some();
+        ui.add_space(space::S);
+        {
             if accent_button(ui, "Save") {
                 let d = &mut dlg.draft;
                 for field in [&mut d.name, &mut d.ip, &mut d.serial,
@@ -229,7 +247,7 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                     done = true;
                 }
             }
-        });
+        }
         done
     });
     (result, close)

@@ -696,14 +696,14 @@ const MATRIX: [&str; 13] = [
 ];
 
 /// States the stages look at beyond the matrix, at the two smaller sizes.
-const EXTRAS: [&str; 25] = [
+const EXTRAS: [&str; 26] = [
     "chips-six", "panel-firmware", "files-loading", "files-empty",
     "files-error", "files-refusal", "files-folders", "files-gcode",
     "dlg-add", "dlg-temp", "dlg-speed", "dlg-fans", "dlg-confirm-stop",
     "dlg-confirm-remove", "dlg-hms", "no-printers", "dlg-skip-many",
     "dlg-skip-confirm", "files-failed-four", "files-long-name",
     "files-printing", "files-open-error", "files-companion",
-    "panel-light-unconfirmed", "dlg-temp-invalid",
+    "panel-light-unconfirmed", "dlg-temp-invalid", "dlg-edit",
 ];
 
 fn files_scene(app: &mut App, tab: Tab) -> &mut PrinterUi {
@@ -846,6 +846,17 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
         }
         "dlg-maintenance" => app.dialog = Dialog::Maintenance(
             dialogs::MaintenanceDlg::new("stainless_steel", 0.4)),
+        "dlg-edit" => app.dialog = Dialog::AddPrinter(
+            dialogs::AddPrinterDlg {
+                draft: config::PrinterCfg {
+                    name: "Garage P1S".to_string(),
+                    ip: "192.0.2.44".to_string(),
+                    serial: "01P00A000000001".to_string(),
+                    access_code: "12345678".to_string(),
+                },
+                editing: Some(0),
+                error: String::new(),
+            }),
         "dlg-add" => app.dialog = Dialog::AddPrinter(
             dialogs::AddPrinterDlg {
                 draft: config::PrinterCfg {
@@ -874,7 +885,7 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
             app.selected = 1;
             app.dialog = Dialog::ConfirmStop;
         }
-        "dlg-confirm-remove" => app.dialog = Dialog::ConfirmRemove,
+        "dlg-confirm-remove" => app.dialog = Dialog::ConfirmRemove(0),
         "dlg-hms" => {
             app.selected = 1;
             app.printers[1].client.state.lock().unwrap().insert(
@@ -1202,6 +1213,155 @@ fn a_context_shot_twice_is_refused() {
     shoot(&ctx, [8, 8], 1.0, Vec::new(), draw);
 }
 
+/// O13: Remove printer lives in the Edit dialog, at the other end of the
+/// row from Save, and nowhere else. The top bar holds Edit and Add.
+#[test]
+fn remove_printer_lives_in_the_edit_dialog() {
+    use egui::accesskit::Action;
+
+    /// The names of everything clickable, and every piece of text.
+    fn shown(app: &mut App, ctx: &egui::Context) -> (Vec<String>,
+                                                     Vec<String>) {
+        let mut frame = eframe::Frame::_new_kittest();
+        let points = vec2(1080.0, 780.0);
+        let mut full = None;
+        for step in 0..3 {
+            full = Some(ctx.run_ui(
+                raw_input(points, f64::from(step), Vec::new()),
+                |ui| app.ui(ui, &mut frame)));
+        }
+        let full = full.expect("three frames");
+        let update = full.platform_output.accesskit_update.clone()
+            .expect("an AccessKit tree");
+        let named = update.nodes.iter()
+            .filter(|(_, node)| node.supports_action(Action::Click))
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        let mut texts = Vec::new();
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) =>
+                    found.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) =>
+                    shapes.iter().for_each(|shape| walk(shape, found)),
+                _ => {}
+            }
+        }
+        for clipped in &full.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        (named, texts)
+    }
+
+    let ctx = context(1.0);
+    ctx.enable_accesskit();
+    let dir = TempDir::new("remove-printer");
+    let mut app = app(&ctx, &PRINTERS, &dir);
+    // the panel: two tools, and no way to remove a printer from here
+    let (named, _) = shown(&mut app, &ctx);
+    assert!(named.iter().any(|name| name == "Edit current printer"),
+            "{named:?}");
+    assert!(named.iter().any(|name| name == "Add printer"), "{named:?}");
+    assert!(!named.iter().any(|name| name.contains("Remove")),
+            "the bar still offers a removal: {named:?}");
+
+    // Add printer: a form with no printer to remove
+    app.dialog = Dialog::AddPrinter(dialogs::AddPrinterDlg {
+        draft: config::PrinterCfg::default(),
+        editing: None,
+        error: String::new(),
+    });
+    let (_, texts) = shown(&mut app, &ctx);
+    assert!(texts.iter().any(|text| text == "Add printer"), "{texts:?}");
+    assert!(!texts.iter().any(|text| text == "Remove printer"),
+            "Add offers a removal: {texts:?}");
+
+    // Edit printer: Remove is there, and the row keeps Save away from it
+    app.dialog = Dialog::AddPrinter(dialogs::AddPrinterDlg {
+        draft: app.printers[0].cfg.clone(),
+        editing: Some(0),
+        error: String::new(),
+    });
+    let (_, texts) = shown(&mut app, &ctx);
+    for wanted in ["Edit printer", "Remove printer", "Save", "Cancel"] {
+        assert!(texts.iter().any(|text| text == wanted),
+                "{wanted} is missing: {texts:?}");
+    }
+}
+
+/// O13 and 5.4: the removal still goes through its confirmation, and the
+/// printer is gone only once that is answered.
+#[test]
+fn removing_a_printer_asks_first() {
+    /// Where `label` was painted, if it was.
+    fn spot(full: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::Shape, label: &str,
+                found: &mut Option<egui::Pos2>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label =>
+                    *found = Some(text.pos
+                                  + text.galley.rect.size() * 0.5),
+                egui::Shape::Vec(shapes) =>
+                    shapes.iter().for_each(|shape| walk(shape, label,
+                                                        found)),
+                _ => {}
+            }
+        }
+        let mut found = None;
+        for clipped in &full.shapes {
+            walk(&clipped.shape, label, &mut found);
+        }
+        found
+    }
+
+    let ctx = context(1.0);
+    let dir = TempDir::new("remove-asks");
+    let mut app = app(&ctx, &PRINTERS, &dir);
+    let mut frame = eframe::Frame::_new_kittest();
+    let points = vec2(1080.0, 780.0);
+    let before = app.printers.len();
+    assert!(before >= 2, "{before} printers");
+    app.dialog = Dialog::AddPrinter(dialogs::AddPrinterDlg {
+        draft: app.printers[0].cfg.clone(),
+        editing: Some(0),
+        error: String::new(),
+    });
+    // a click is a press and a release inside egui's click window
+    // (`max_click_duration`, 0.6 s), so the frames are 50 ms apart
+    let mut clock = 0.0;
+    let mut run = |app: &mut App, events: Vec<egui::Event>| {
+        clock += 0.05;
+        ctx.run_ui(raw_input(points, clock, events),
+                   |ui| app.ui(ui, &mut frame))
+    };
+    let mut click = |app: &mut App, label: &str| {
+        // a modal's first frame is egui's invisible sizing pass, so the
+        // label has a place only from the second one on
+        run(app, Vec::new());
+        let at = spot(&run(app, Vec::new()), label)
+            .unwrap_or_else(|| panic!("{label} was not painted"));
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at, button: egui::PointerButton::Primary, pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let moved = egui::Event::PointerMoved(at);
+        run(app, vec![moved.clone()]);
+        run(app, vec![moved.clone(), button(true)]);
+        run(app, vec![moved, button(false)]);
+    };
+
+    click(&mut app, "Remove printer");
+    assert_eq!(app.printers.len(), before,
+               "the printer went without a question");
+    assert!(matches!(app.dialog, Dialog::ConfirmRemove(0)),
+            "no confirmation after Remove printer");
+    // the question names the printer and the danger button answers it
+    click(&mut app, "Remove");
+    assert_eq!(app.printers.len(), before - 1,
+               "the confirmation did not remove it");
+    assert!(matches!(app.dialog, Dialog::None), "the dialog stayed open");
+}
+
 /// O11: a dialog is a card over the canvas. With the old `BG` fill its
 /// only edge was the outline, and on the canvas that read as flat.
 #[test]
@@ -1256,6 +1416,9 @@ fn a_dialog_is_filled_like_a_card() {
 /// A8: the tool buttons take the keyboard in the order they are painted,
 /// left to right. They sit at the right end of the bar, and laying them
 /// out right to left would walk them backwards.
+///
+/// There are two of them since decision O13 moved Remove into the Edit
+/// dialog; the bar holds Edit and Add.
 #[test]
 fn tab_walks_the_tool_buttons_left_to_right() {
     let ctx = context(1.0);
@@ -1282,7 +1445,7 @@ fn tab_walks_the_tool_buttons_left_to_right() {
             walked.push(response.rect);
         }
     }
-    assert_eq!(walked.len(), 3, "the three tool buttons: {walked:?}");
+    assert_eq!(walked.len(), 2, "Edit and Add: {walked:?}");
     assert!(walked.windows(2).all(|pair| pair[0].min.x < pair[1].min.x),
             "Tab walks the tools backwards: {walked:?}");
 }
