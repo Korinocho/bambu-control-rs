@@ -1,11 +1,12 @@
 //! Per-printer panel: camera + job card on the left, control cards +
 //! AMS on the right. Port of `ui/panel.py`.
 
-use egui::{RichText, Sense, Stroke, Ui, Vec2};
+use egui::{RichText, Sense, Stroke, Ui, Vec2, vec2};
 use serde_json::{Map, Value};
 
 use crate::mqtt::speed_name;
 use crate::theme::{self, font, pad, radius, size, space, stroke};
+use crate::ui::widgets;
 
 pub const IDLE_STATES: &[&str] = &["IDLE", "FINISH", "FAILED", ""];
 
@@ -89,19 +90,43 @@ pub(crate) fn card_frame(ui: &mut Ui, add: impl FnOnce(&mut Ui))
     theme::card_frame().show(ui, |ui| add(ui)).response
 }
 
+/// A control card's title row: the title on the left and, on a card that
+/// opens something, the chevron on the right. Every card has the same row,
+/// so two cards side by side start their values at the same height (C5).
+fn card_title(ui: &mut Ui, title: &str, chevron: bool) {
+    egui::Sides::new()
+        .height(theme::row_height(ui, &font::title()))
+        .show(ui,
+            |ui| {
+                ui.label(RichText::new(title).color(theme::TEXT_DIM)
+                    .font(font::label()));
+            },
+            |ui| {
+                if chevron {
+                    ui.label(RichText::new("›").font(font::title())
+                        .color(theme::TEXT_DIM));
+                }
+            });
+}
+
+/// A card's value row, `CONTROL_H` tall whatever it holds (C5).
+fn value_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(vec2(width, size::CONTROL_H),
+        egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_size(vec2(width, size::CONTROL_H));
+        add(ui);
+    });
+}
+
 fn clickable_card(ui: &mut Ui, title: &str, value: &str) -> bool {
     let response = card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(title).color(theme::TEXT_DIM)
-                .font(font::label()));
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("›").font(font::title())
-                        .color(theme::TEXT_DIM).strong());
-                });
+        card_title(ui, title, true);
+        value_row(ui, |ui| {
+            ui.add(egui::Label::new(RichText::new(value)
+                .font(font::title())).truncate());
         });
-        ui.label(RichText::new(value).font(font::title()));
     });
     let response = response.interact(Sense::click());
     if response.hovered() {
@@ -114,16 +139,23 @@ fn temp_card(ui: &mut Ui, title: &str, current: Option<f64>,
              target: Option<f64>) -> bool {
     let response = card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(RichText::new(title).color(theme::TEXT_DIM)
-            .font(font::label()));
-        ui.horizontal(|ui| {
+        card_title(ui, title, true);
+        let metric = font::metric();
+        let width = ui.available_width();
+        let height = theme::row_height(ui, &metric);
+        ui.allocate_ui_with_layout(vec2(width, height),
+            egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_size(vec2(width, height));
             let cur = current.map(|v| format!("{v:.0}"))
-                .unwrap_or_else(|| "--".into());
+                .unwrap_or_else(|| "—".into());
             let tgt = target.map(|v| format!("/ {v:.0}°C"))
-                .unwrap_or_else(|| "/ --°C".into());
-            ui.label(RichText::new(cur).font(font::metric()));
-            ui.label(RichText::new(tgt).font(font::caption())
-                .color(theme::TEXT_DIM));
+                .unwrap_or_else(|| "/ —°C".into());
+            // the reading changes every report: a slot keeps the target
+            // from shifting with it (C6)
+            widgets::slot(ui, "888", RichText::new(cur), &metric,
+                          egui::Align::Min);
+            ui.add(egui::Label::new(RichText::new(tgt)
+                .font(font::caption()).color(theme::TEXT_DIM)).truncate());
         });
     });
     let response = response.interact(Sense::click());
@@ -266,28 +298,33 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
     let paused = gcode_state == "PAUSE";
 
     ui.horizontal_top(|ui| {
-        let left_w = (ui.available_width() * size::LEFT_COLUMN).floor();
+        // the right column keeps what its cards need, the left the rest
+        // of its share (C5)
+        let width = ui.available_width();
+        let left_max = (width - size::RIGHT_COLUMN_MIN - space::M)
+            .max(size::LIST_MIN_W);
+        let left_w = (width * size::LEFT_COLUMN).floor()
+            .clamp(size::LIST_MIN_W, left_max);
         // ------------------------------------------------ left column
         ui.allocate_ui_with_layout(
             egui::vec2(left_w, 0.0),
             egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_width(left_w);
 
-        // camera
-        let cam_h = (ui.available_width() * 9.0 / 16.0)
-            .min(size::CAMERA_MAX_H);
-        let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), cam_h), Sense::hover());
+        // camera: the well is the picture's own shape, 16:9 until the first
+        // frame, fitted inside the column and centred in it (C8)
+        let aspect = view.cam_texture.map_or(size::VIDEO_ASPECT,
+                                             |tex| tex.size_vec2());
+        let column = ui.available_width();
+        let well = widgets::fit(aspect, vec2(column, size::CAMERA_MAX_H));
+        let (row, _) = ui.allocate_exact_size(vec2(column, well.y),
+                                              Sense::hover());
+        let rect = egui::Rect::from_center_size(row.center(), well);
         ui.painter().rect_filled(rect, radius::CARD, theme::MEDIA_WELL);
         if let Some(tex) = view.cam_texture {
-            let size = tex.size_vec2();
-            let scale =
-                (rect.width() / size.x).min(rect.height() / size.y);
-            let img_rect = egui::Rect::from_center_size(
-                rect.center(), size * scale);
-            egui::Image::new((tex.id(), size))
+            egui::Image::new((tex.id(), tex.size_vec2()))
                 .corner_radius(radius::CARD)
-                .paint_at(ui, img_rect);
+                .paint_at(ui, rect);
         } else {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                               &view.cam_status,
@@ -319,53 +356,62 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     } else {
                         job
                     };
-                    ui.label(RichText::new(
+                    // a long name truncates instead of widening the column
+                    ui.add(egui::Label::new(RichText::new(
                         if job.is_empty() { "—" } else { job })
-                        .font(font::body_strong()));
-                    ui.horizontal(|ui| {
-                        let display = if gcode_state.is_empty() {
-                            "—"
-                        } else {
-                            &gcode_state
-                        };
-                        ui.label(RichText::new(display)
-                            .font(font::body_strong())
-                            .color(theme::state_color(&gcode_state)));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                let (ok, detail) = &view.connected;
-                                ui.label(RichText::new(detail).color(
-                                    if *ok { theme::ACCENT }
-                                    else { theme::DANGER }));
-                            });
-                    });
+                        .font(font::body_strong())).truncate());
+                    let display = if gcode_state.is_empty() {
+                        "—"
+                    } else {
+                        &gcode_state
+                    };
+                    // the state and the connection never overlap: the
+                    // connection detail gives way (C8)
+                    egui::Sides::new().shrink_right().truncate().show(ui,
+                        |ui| {
+                            ui.label(RichText::new(display)
+                                .font(font::body_strong())
+                                .color(theme::state_color(&gcode_state)));
+                        },
+                        |ui| {
+                            let (ok, detail) = &view.connected;
+                            ui.add(egui::Label::new(RichText::new(detail)
+                                .color(if *ok { theme::ACCENT }
+                                       else { theme::DANGER }))
+                                .truncate());
+                        });
                 });
             });
 
+            // each reading has a slot of its own, so a digit that changes
+            // never moves the rest of the row (C6)
             let pct = s_i64(state, "mc_percent").unwrap_or(0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{pct}%"))
-                    .font(font::metric()));
-                let mins = s_i64(state, "mc_remaining_time").unwrap_or(0);
-                if mins > 0 {
-                    ui.label(RichText::new(format!(
-                        "~{}h {:02}m left", mins / 60, mins % 60))
-                        .color(theme::TEXT_DIM));
-                }
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let (Some(layer), Some(total)) = (
-                            s_i64(state, "layer_num"),
-                            s_i64(state, "total_layer_num"),
-                        ) && total > 0
-                        {
-                            ui.label(RichText::new(format!(
-                                "layer {layer}/{total}"))
-                                .color(theme::TEXT_DIM));
-                        }
-                    });
-            });
+            let caption = font::caption();
+            egui::Sides::new().show(ui,
+                |ui| {
+                    widgets::slot(ui, "100%", RichText::new(format!("{pct}%")),
+                                  &font::metric(), egui::Align::Min);
+                    let mins = s_i64(state, "mc_remaining_time").unwrap_or(0);
+                    let eta = match mins > 0 {
+                        true => format!("~{}h {:02}m left", mins / 60,
+                                        mins % 60),
+                        false => String::new(),
+                    };
+                    widgets::slot(ui, "~99h 59m left",
+                                  RichText::new(eta).color(theme::TEXT_DIM),
+                                  &caption, egui::Align::Min);
+                },
+                |ui| {
+                    let layer = match (s_i64(state, "layer_num"),
+                                       s_i64(state, "total_layer_num")) {
+                        (Some(layer), Some(total)) if total > 0 =>
+                            format!("layer {layer}/{total}"),
+                        _ => String::new(),
+                    };
+                    widgets::slot(ui, "layer 9999/9999",
+                                  RichText::new(layer).color(theme::TEXT_DIM),
+                                  &caption, egui::Align::Max);
+                });
             let bar = egui::ProgressBar::new(pct as f32 / 100.0)
                 .desired_height(size::PROGRESS_H)
                 .fill(theme::ACCENT);
@@ -386,8 +432,9 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 if let Some(p) = view.fetch_progress
                     && p < 100
                 {
-                    ui.label(RichText::new(format!("{p}%"))
-                        .color(theme::TEXT_DIM).font(font::caption()));
+                    widgets::slot(ui, "100%", RichText::new(format!("{p}%"))
+                        .color(theme::TEXT_DIM), &font::caption(),
+                        egui::Align::Min);
                 }
                 let pause_label =
                     if paused { "▶ Resume" } else { "⏸ Pause" };
@@ -507,20 +554,19 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 // light card with toggle
                 card_frame(&mut cards[1], |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new("LIGHT").color(theme::TEXT_DIM)
-                        .font(font::label()));
-                    ui.horizontal(|ui| {
-                        let mut on = view.light_shown_on;
-                        ui.label(RichText::new(
-                            if on { "On" } else { "Off" })
-                            .font(font::title()));
-                        ui.with_layout(egui::Layout::right_to_left(
-                            egui::Align::Center), |ui| {
-                            if super::widgets::toggle_switch(ui, &mut on) {
+                    card_title(ui, "LIGHT", false);
+                    let mut on = view.light_shown_on;
+                    let word = if on { "On" } else { "Off" };
+                    egui::Sides::new().height(size::CONTROL_H).show(ui,
+                        |ui| {
+                            ui.label(RichText::new(word)
+                                .font(font::title()));
+                        },
+                        |ui| {
+                            if widgets::toggle_switch(ui, &mut on) {
                                 actions.push(PanelAction::SetLight(on));
                             }
                         });
-                    });
                 });
             });
             ui.columns(2, |cards| {
@@ -569,4 +615,114 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
         });
     });
     actions
+}
+
+/// The panel against a hand-built view, rendered through `Context::run_ui`
+/// like the files view's tests (E40): what is asserted is what it painted.
+#[cfg(test)]
+mod tests {
+    use egui::{Pos2, Rect, Vec2};
+    use serde_json::json;
+
+    use super::*;
+
+    /// Every piece of text painted, and every filled rect, with its fill.
+    struct Painted {
+        texts: Vec<(String, Rect)>,
+        rects: Vec<(Rect, egui::Color32)>,
+    }
+
+    fn render(width: f32, state: &Map<String, Value>) -> Painted {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx);
+        let view = PanelView {
+            state,
+            connected: (true, "online".to_string()),
+            cam_texture: None,
+            cam_status: "camera paused".to_string(),
+            plate_texture: None,
+            fetch_progress: None,
+            object_count: 0,
+            fw_current: "01.08.02.00".to_string(),
+            fw_latest: String::new(),
+            show_humidity: false,
+            model: "Bambu Lab A1".to_string(),
+            light_shown_on: true,
+            files_summary: "Timelapses · Recordings · Print files".to_string(),
+        };
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO,
+                                                  Vec2::new(width, 900.0))),
+            ..Default::default()
+        };
+        // the second frame, once egui has sized everything
+        let _ = ctx.run_ui(input(), |ui| { show(ui, &view); });
+        let full = ctx.run_ui(input(), |ui| { show(ui, &view); });
+        let mut painted = Painted { texts: Vec::new(), rects: Vec::new() };
+        fn walk(shape: &egui::Shape, painted: &mut Painted) {
+            match shape {
+                egui::Shape::Text(text) => painted.texts.push((
+                    text.galley.text().to_string(),
+                    Rect::from_min_size(text.pos, text.galley.rect.size()))),
+                egui::Shape::Rect(rect) =>
+                    painted.rects.push((rect.rect, rect.fill)),
+                egui::Shape::Vec(shapes) =>
+                    shapes.iter().for_each(|shape| walk(shape, painted)),
+                _ => {}
+            }
+        }
+        for clipped in &full.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    fn idle() -> Map<String, Value> {
+        let Value::Object(state) = json!({
+            "gcode_state": "IDLE", "spd_lvl": 2,
+            "nozzle_temper": 27.8, "nozzle_target_temper": 0,
+            "bed_temper": 26.1, "bed_target_temper": 0,
+            "lights_report": [{ "node": "chamber_light", "mode": "on" }],
+        }) else {
+            unreachable!("an object");
+        };
+        state
+    }
+
+    impl Painted {
+        fn text(&self, label: &str) -> Rect {
+            self.texts.iter().find(|(text, _)| text == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{label:?} was not painted"))
+        }
+
+        /// The card behind a title: the smallest CARD rect around it.
+        fn card(&self, label: &str) -> Rect {
+            let title = self.text(label);
+            self.rects.iter()
+                .filter(|(rect, fill)| *fill == theme::CARD
+                        && rect.contains_rect(title))
+                .map(|(rect, _)| *rect)
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .unwrap_or_else(|| panic!("no card around {label:?}"))
+        }
+    }
+
+    /// C5, D24: the two cards of a row start their titles on one line and
+    /// end at one height, at 700 px as at a wide window.
+    #[test]
+    fn cards_in_a_row_line_up() {
+        for width in [700.0, 1200.0] {
+            let painted = render(width, &idle());
+            for (left, right) in [("NOZZLE", "BED"), ("SPEED", "LIGHT"),
+                                  ("FANS", "MOVEMENT")] {
+                assert_eq!(painted.text(left).min.y, painted.text(right).min.y,
+                           "{width}: {left} and {right} titles");
+                let (a, b) = (painted.card(left), painted.card(right));
+                assert_eq!((a.min.y, a.max.y), (b.min.y, b.max.y),
+                           "{width}: {left} {a:?} and {right} {b:?}");
+            }
+        }
+    }
 }

@@ -31,9 +31,25 @@ pub enum Dialog {
     ConfirmRemove,
 }
 
-fn modal(ctx: &egui::Context, id: &str, width: f32,
-         add: impl FnOnce(&mut egui::Ui) -> bool) -> bool {
+/// The part of a dialog being laid out (C15).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// what the dialog shows; it scrolls when the window is too short
+    Body,
+    /// the action row or Close, always on screen below the body
+    Footer,
+}
+
+/// The one dialog shell (C15): a centred title, a body that scrolls, and a
+/// footer that never leaves the window. `content` is called once per part
+/// and returns whether the dialog asked to close.
+fn modal(ctx: &egui::Context, id: &str, width: f32, title: Option<&str>,
+         mut content: impl FnMut(&mut egui::Ui, Part) -> bool) -> bool {
     let mut close = false;
+    // the footer's height as last laid out: it holds wrapped text in some
+    // steps, and the body's cap must leave room for it. The first frame of
+    // a modal is egui's invisible sizing pass, so the guess is never seen.
+    let footer_id = egui::Id::new(id).with("footer-height");
     let response = egui::Modal::new(egui::Id::new(id))
         .frame(egui::Frame::new()
             .fill(theme::BG)
@@ -42,16 +58,40 @@ fn modal(ctx: &egui::Context, id: &str, width: f32,
             .inner_margin(pad::MODAL))
         .show(ctx, |ui| {
             ui.set_width(width);
-            close = add(ui);
+            let gap = ui.spacing().item_spacing.y;
+            let header_h = match title {
+                Some(title) => {
+                    let title_font = font::title();
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(title)
+                            .font(title_font.clone()));
+                    });
+                    ui.add_space(space::L);
+                    theme::row_height(ui, &title_font) + gap + space::L
+                }
+                None => 0.0,
+            };
+            let footer_h = ui.data(|d| d.get_temp::<f32>(footer_id))
+                .unwrap_or(size::BUTTON_H);
+            let screen = ui.ctx().content_rect().height();
+            let body_max = (screen - pad::MODAL.sum().y - header_h
+                            - footer_h - 2.0 * space::L)
+                .max(size::CONTROL_H);
+            egui::ScrollArea::vertical()
+                .id_salt(id)
+                .max_height(body_max)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    close |= content(ui, Part::Body);
+                });
+            // the action row sits space::L below the body
+            ui.add_space(space::L - gap);
+            let footer = ui.scope(|ui| content(ui, Part::Footer));
+            close |= footer.inner;
+            let height = footer.response.rect.height();
+            ui.data_mut(|d| d.insert_temp(footer_id, height));
         });
     close || response.should_close()
-}
-
-fn header(ui: &mut egui::Ui, text: &str) {
-    ui.vertical_centered(|ui| {
-        ui.label(RichText::new(text).font(font::title()));
-    });
-    ui.add_space(space::L);
 }
 
 fn wide_button(ui: &mut egui::Ui, text: &str) -> bool {
@@ -93,33 +133,36 @@ pub enum AddResult {
 pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                         -> (AddResult, bool) {
     let mut result = AddResult::None;
-    let close = modal(ctx, "add-printer", size::MODAL_M, |ui| {
+    let title = if dlg.editing.is_some() { "Edit printer" }
+                else { "Add printer" };
+    let close = modal(ctx, "add-printer", size::MODAL_M, Some(title),
+                      |ui, part| {
         let mut done = false;
-        header(ui, if dlg.editing.is_some() { "Edit printer" }
-                   else { "Add printer" });
-        egui::Grid::new("printer-form").num_columns(2)
-            .spacing([space::L, space::M]).show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut dlg.draft.name);
-                ui.end_row();
-                ui.label("IP address");
-                ui.text_edit_singleline(&mut dlg.draft.ip);
-                ui.end_row();
-                ui.label("Serial");
-                ui.text_edit_singleline(&mut dlg.draft.serial);
-                ui.end_row();
-                ui.label("Access code");
-                ui.text_edit_singleline(&mut dlg.draft.access_code);
-                ui.end_row();
-            });
-        ui.add_space(space::XS);
-        ui.label(RichText::new(
-            "Printer must be in LAN mode with Developer Mode ON.")
-            .color(theme::TEXT_DIM).font(font::caption()));
-        if !dlg.error.is_empty() {
-            ui.label(RichText::new(&dlg.error).color(theme::DANGER));
+        if part == Part::Body {
+            egui::Grid::new("printer-form").num_columns(2)
+                .spacing([space::L, space::M]).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut dlg.draft.name);
+                    ui.end_row();
+                    ui.label("IP address");
+                    ui.text_edit_singleline(&mut dlg.draft.ip);
+                    ui.end_row();
+                    ui.label("Serial");
+                    ui.text_edit_singleline(&mut dlg.draft.serial);
+                    ui.end_row();
+                    ui.label("Access code");
+                    ui.text_edit_singleline(&mut dlg.draft.access_code);
+                    ui.end_row();
+                });
+            ui.add_space(space::XS);
+            ui.label(RichText::new(
+                "Printer must be in LAN mode with Developer Mode ON.")
+                .color(theme::TEXT_DIM).font(font::caption()));
+            if !dlg.error.is_empty() {
+                ui.label(RichText::new(&dlg.error).color(theme::DANGER));
+            }
+            return false;
         }
-        ui.add_space(space::M);
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 done = true;
@@ -168,28 +211,29 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
          "The bed keeps the material adhered to the plate during the print.",
          &[0, 35, 45, 65, 80], 110)
     };
-    modal(ctx, "temp", size::MODAL_M, |ui| {
+    modal(ctx, "temp", size::MODAL_M, Some(title), |ui, part| {
         let mut done = false;
-        header(ui, title);
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut dlg.value)
-                .font(font::metric())
-                .desired_width(ui.available_width() - 40.0)
-                .horizontal_align(egui::Align::Center));
-            ui.label(RichText::new("°C").color(theme::TEXT_DIM));
-        });
-        ui.add_space(space::XS);
-        ui.label(RichText::new(desc).color(theme::TEXT_DIM)
-            .font(font::caption()));
-        ui.add_space(space::S);
-        ui.horizontal(|ui| {
-            for t in presets {
-                if ui.button(format!("{t}°C")).clicked() {
-                    dlg.value = t.to_string();
+        if part == Part::Body {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut dlg.value)
+                    .font(font::metric())
+                    .desired_width(ui.available_width() - 40.0)
+                    .horizontal_align(egui::Align::Center));
+                ui.label(RichText::new("°C").color(theme::TEXT_DIM));
+            });
+            ui.add_space(space::XS);
+            ui.label(RichText::new(desc).color(theme::TEXT_DIM)
+                .font(font::caption()));
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                for t in presets {
+                    if ui.button(format!("{t}°C")).clicked() {
+                        dlg.value = t.to_string();
+                    }
                 }
-            }
-        });
-        ui.add_space(space::L);
+            });
+            return false;
+        }
         if accent_button(ui, "Set temperature") {
             match dlg.value.trim().replace(',', ".").parse::<f64>() {
                 Ok(temp) if (0.0..=max as f64).contains(&temp) => {
@@ -210,9 +254,11 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
 // ---------------------------------------------------------------- speed
 pub fn show_speed(ctx: &egui::Context, current: i64,
                   client: &PrinterClient) -> bool {
-    modal(ctx, "speed", size::MODAL_S, |ui| {
+    modal(ctx, "speed", size::MODAL_S, Some("Print speed"), |ui, part| {
         let mut done = false;
-        header(ui, "Print speed");
+        if part == Part::Footer {
+            return false;
+        }
         for (level, name, pct) in [(4, "Ludicrous", "166%"),
                                    (3, "Sport", "124%"),
                                    (2, "Standard", "100%"),
@@ -246,8 +292,10 @@ pub fn show_speed(ctx: &egui::Context, current: i64,
 pub fn show_fans(ctx: &egui::Context,
                  state: &serde_json::Map<String, serde_json::Value>,
                  client: &PrinterClient) -> bool {
-    modal(ctx, "fans", size::MODAL_M, |ui| {
-        header(ui, "Fans");
+    modal(ctx, "fans", size::MODAL_M, Some("Fans"), |ui, part| {
+        if part == Part::Footer {
+            return wide_button(ui, "Close");
+        }
         let pct = |key: &str| -> Option<i64> {
             crate::ui::panel::s_i64(state, key).map(|v| v * 100 / 15)
         };
@@ -303,15 +351,16 @@ pub fn show_fans(ctx: &egui::Context,
         if shown == 0 {
             ui.label("No fan telemetry from this printer.");
         }
-        ui.add_space(space::XS);
-        wide_button(ui, "Close")
+        false
     })
 }
 
 // ----------------------------------------------------------------- move
 pub fn show_move(ctx: &egui::Context, client: &PrinterClient) -> bool {
-    modal(ctx, "move", size::MODAL_L, |ui| {
-        header(ui, "Movement");
+    modal(ctx, "move", size::MODAL_L, Some("Movement"), |ui, part| {
+        if part == Part::Footer {
+            return wide_button(ui, "Close");
+        }
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Toolhead").color(theme::TEXT_DIM)
@@ -355,8 +404,7 @@ pub fn show_move(ctx: &egui::Context, client: &PrinterClient) -> bool {
             "Extruder needs a hot nozzle. Jog only while idle — the \
              wheel: inner ring 1 mm, outer 10 mm.")
             .color(theme::TEXT_DIM).font(font::caption()));
-        ui.add_space(space::S);
-        wide_button(ui, "Close")
+        false
     })
 }
 
@@ -426,8 +474,11 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
         }
     }
 
-    let close = modal(ctx, "info", size::MODAL_M, |ui| {
-        header(ui, &view.cfg.name);
+    let close = modal(ctx, "info", size::MODAL_M, Some(&view.cfg.name),
+                      |ui, part| {
+        if part == Part::Footer {
+            return wide_button(ui, "Close");
+        }
         let fw_current = if view.fw_current.is_empty() {
             "—".to_string()
         } else {
@@ -532,7 +583,6 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
             "Firmware updates are not possible over LAN — use the \
              printer screen (cloud) or SD card package.")
             .color(theme::TEXT_DIM).font(font::caption()));
-        ui.add_space(space::M);
 
         // toast bubble
         if let Some(until) = dlg.toast_until {
@@ -559,8 +609,7 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
                 dlg.toast_until = None;
             }
         }
-
-        wide_button(ui, "Close")
+        false
     });
     (close, latest_update)
 }
@@ -576,9 +625,42 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
                  client: &PrinterClient) -> bool {
     let locked: HashSet<i64> =
         bundle.skipped.union(live_skipped).copied().collect();
-    modal(ctx, "skip", size::MODAL_L, |ui| {
+    modal(ctx, "skip", size::MODAL_L, Some("Skip objects"), |ui, part| {
         let mut done = false;
-        header(ui, "Skip objects");
+        if part == Part::Footer {
+            // the question and its answer stay on screen together, below
+            // however long the list is (D02)
+            if dlg.confirm {
+                ui.label(RichText::new(format!(
+                    "Skip {} object(s)? Skipped objects cannot be resumed \
+                     for this print.", dlg.selected.len()))
+                    .color(theme::WARN).font(font::body_strong()));
+                ui.horizontal(|ui| {
+                    if ui.button("No").clicked() {
+                        dlg.confirm = false;
+                    }
+                    if accent_button(ui, "Yes, skip") {
+                        let ids: Vec<i64> =
+                            dlg.selected.iter().copied().collect();
+                        client.skip_objects(&ids);
+                        done = true;
+                    }
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        done = true;
+                    }
+                    if ui.add_enabled(!dlg.selected.is_empty(),
+                                      egui::Button::new("Skip selected"))
+                        .clicked()
+                    {
+                        dlg.confirm = true;
+                    }
+                });
+            }
+            return done;
+        }
         if !bundle.bboxes.is_empty() {
             ui.vertical_centered(|ui| {
                 if let Some(id) = widgets::plate_map(
@@ -620,37 +702,6 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
         ui.label(RichText::new(format!("{} selected",
                                        dlg.selected.len()))
             .color(theme::TEXT_DIM));
-        ui.add_space(space::S);
-
-        if dlg.confirm {
-            ui.label(RichText::new(format!(
-                "Skip {} object(s)? Skipped objects cannot be resumed \
-                 for this print.", dlg.selected.len()))
-                .color(theme::WARN).font(font::body_strong()));
-            ui.horizontal(|ui| {
-                if ui.button("No").clicked() {
-                    dlg.confirm = false;
-                }
-                if accent_button(ui, "Yes, skip") {
-                    let ids: Vec<i64> =
-                        dlg.selected.iter().copied().collect();
-                    client.skip_objects(&ids);
-                    done = true;
-                }
-            });
-        } else {
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    done = true;
-                }
-                if ui.add_enabled(!dlg.selected.is_empty(),
-                                  egui::Button::new("Skip selected"))
-                    .clicked()
-                {
-                    dlg.confirm = true;
-                }
-            });
-        }
         done
     })
 }
@@ -660,8 +711,11 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
 /// same style as Device information.
 pub fn show_hms(ctx: &egui::Context, printer_name: &str,
                 errors: &[(String, String)]) -> bool {
-    modal(ctx, "hms", size::MODAL_L, |ui| {
-        header(ui, &format!("{printer_name} — printer errors"));
+    let title = format!("{printer_name} — printer errors");
+    modal(ctx, "hms", size::MODAL_L, Some(&title), |ui, part| {
+        if part == Part::Footer {
+            return wide_button(ui, "Close");
+        }
         if errors.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("No active errors ✓")
@@ -694,8 +748,7 @@ pub fn show_hms(ctx: &egui::Context, printer_name: &str,
                 ui.add_space(space::S);
             }
         });
-        ui.add_space(space::S);
-        wide_button(ui, "Close")
+        false
     })
 }
 
@@ -741,9 +794,11 @@ impl MaintenanceDlg {
 pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
                         has_ams: bool,
                         client: &PrinterClient) -> bool {
-    modal(ctx, "maintenance", size::MODAL_L, |ui| {
-        let mut done = false;
-        header(ui, "Maintenance (screen menu)");
+    modal(ctx, "maintenance", size::MODAL_L,
+          Some("Maintenance (screen menu)"), |ui, part| {
+        if part == Part::Footer {
+            return wide_button(ui, "Close");
+        }
 
         // ---- calibration
         ui.label(RichText::new("CALIBRATION").color(theme::TEXT_DIM)
@@ -841,11 +896,7 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
             ui.label(RichText::new(&dlg.status)
                 .color(theme::ACCENT).font(font::body_strong()));
         }
-        ui.add_space(space::M);
-        if wide_button(ui, "Close") {
-            done = true;
-        }
-        done
+        false
     })
 }
 
@@ -853,10 +904,12 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
 pub fn show_confirm(ctx: &egui::Context, id: &str, text: &str,
                     yes_label: &str) -> (bool, bool) {
     let mut confirmed = false;
-    let close = modal(ctx, id, size::MODAL_S, |ui| {
+    let close = modal(ctx, id, size::MODAL_S, None, |ui, part| {
         let mut done = false;
-        ui.label(RichText::new(text).font(font::body_strong()));
-        ui.add_space(space::L);
+        if part == Part::Body {
+            ui.label(RichText::new(text).font(font::body_strong()));
+            return false;
+        }
         ui.horizontal(|ui| {
             if ui.button("No").clicked() {
                 done = true;
