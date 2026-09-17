@@ -334,6 +334,13 @@ pub fn parse_list_line(dir: &str, line: &str, rule: DateRule, printer_year: i32)
 - `FtpError::Reply` caps the text at 160 **characters**, not bytes: `String::truncate` inside a multi-byte character panics, and a release build aborts on a panic (5.1, rule 6).
 - The five LIST patterns are compiled once (`LazyLock`), not per line: a damaged card's listing is thousands of lines.
 
+**Stage 3, part 1 (`ftp.rs`) as built.** `retr_to` and `retr_head` landed as sketched, with these points fixed:
+- `TRANSFER_CHUNK` is 64 KB, and it is also how often a transfer can report progress and see a cancel. Progress is the byte count returned by the socket read, never an estimate.
+- **A file that grew past its SIZE is cut off**, like `retr_small` does, and reported as `TooLarge { size, max }` rather than written out: bytes on the card may not decide how much disk a download takes. Short is `Truncated { got, want }`, and the caller deletes its `.part`.
+- **Any Err poisons the session**, `Truncated` included. There is no resume and an early close kills the control connection (3.1), so a transfer that ended badly never reuses its session. `retr_head` consumes `self` by type for the same reason and sends neither `finalize` nor `QUIT`.
+- **`FtpError::DiskFull { need, free }` was added.** Section 5.10 lists "not enough disk space: needs X, Y free" as a condition, but the enum of 5.2 had no variant for it and `Done { result }` carries an `FtpError`. Its text is 1024-based, like the Windows shell.
+- **A disk-full raised while the bytes are being written carries no figures of its own.** `local_write_failure` knows neither the file it is writing nor the volume under it, so it reports `DiskFull { need: 0, free: 0 }` and the transfer lane fills both in (5.4). The card must never read "not enough disk space: needs 0 B, 0 B free", which is exactly the one a user cannot act on.
+
 ### 5.3 TLS: CA-anchored verifier, serial binding, resumption
 
 Implementation spec for the MVP. Gate G2 approved rustls with conditions; the owner then replaced certificate pinning with this CA-anchored design and approved it (section 10.3). Every rule below is testable, and the required tests (T1-T27) are listed at the end of this section. The spikes (section 11) are evidence, not templates: section 11 lists where they deviate from this spec.
@@ -774,6 +781,29 @@ The worker takes the printer's `PrinterCfg` and builds its `ftp::FtpEndpoint` (I
 - **Every failed listing is an error card.** `BrowserState::listed` keeps the failure in `error` for anything but a 550, and `timelapse_notice` says nothing when the directory failed, so an offline printer reads as "printer offline" + Retry and never as "No timelapses on this printer".
 - **One thumbnail request in flight.** Since the queue keeps one prefetch, the view asks for the next tile only once none is outstanding; a tile that failed is asked for again only through its own Retry. Otherwise every extra request came back `Cancelled` and was issued again on the next frame.
 
+**Stage 3, part 1 (the transfer lane) as built.** The lane, the disk cache and the 3mf/G-code split; the player and the whole UI are part 2. Interim choices and differences:
+- **Two lanes, two sessions, counted once.** `Status::open_sessions` is the sum over both lanes and `max_open_sessions` its high-water mark, so neither lane can overwrite the other's view; the same holds for `Status::handshakes`, which sums a per-lane count. `has_ended()` means *every* lane thread has ended, so section 4 rule 3's replacement still waits for the whole worker. The tests and the live check assert at most 2.
+- **The transfer lane starts lazily and closes its session as soon as its queue empties**, so a printer is back to one session between downloads. Prefetches never reach it.
+- **`Cmd::SetPrinting` updates the status inside `send`**, not only on the browse lane. The printing gate belongs to the transfer lane, and it must not depend on the browse lane's thread having been started.
+- **The queued wording is emitted when the transfer is queued**, by the UI thread, not when its turn comes: a tile has to say why it is waiting straight away. While printing it is "waiting: printer is printing, one download at a time", otherwise "waiting: one download at a time" (5.10).
+- **What "explicit user action" means here.** Every `Cmd::Download` is user-started by construction — only the view sends one. The one automatic transfer is the running job's bundle, which section 4 already allows as that printer's one download. So the gate is enforced as: one transfer at a time, FIFO, with the queued wording on the rest. Open question 1 is still open.
+- **A `JobBundle` whose 3mf is over 1 MB is handed to the transfer lane** through an internal queue item, downloaded into the cache and read back from there. It runs under a reserved id (`u64::MAX`) that is outside the range the view hands out, so a `Cancel` from the view can never name it, and it counts as that printer's one download while it runs.
+- **Cancel** sets the transfer's flag *and* cancels its session, so a read already waiting fails within 100 ms instead of holding the lane for an IO timeout. The lane then deletes the `.part`, discards the session and reports `Done(Err(Cancelled))`. A transfer cancelled before its turn never starts and is still reported, so no tile waits for ever.
+- **The rolling rate** is measured over a 5 s window and falls back to the documented 200000 B/s until there is something to measure. Progress events are throttled to 100 ms, never one per chunk.
+- **Tests** got a `DataMode::Slow` in-process server, which paces a data connection so a transfer can be cancelled while it runs without a real slow printer.
+- **Live on the P1S, 2026-09-16, read-only and idle** (`live_transfer_lane_downloads_then_cancels_on_the_p1s`). Gate G3's file, 86,527,810 B, downloaded through the transfer lane in **623.8 s at 138,703 B/s (135 KiB/s)**, byte count equal to SIZE and the file on disk the same size. Progress was the real count off the socket throughout. The same download was then started again and cancelled after 5 s: **`Done(Err(Cancelled))` came back in 0.08 s**, the `.part` was deleted, nothing was committed, and the session was discarded — the next download (a thumbnail) ran on a fresh session. Over the whole run **5 sessions were opened and never more than 2 were open at once**; handshakes were 5 full control and 4 resumed data connections, **0 full data connections**, 0 failed. `stop()` ended both lanes. The cache kept only the 19,811 B thumbnail, under a hashed printer key, and no serial appeared in any path or message.
+- **Confirming "not printing" for a live download, without an MQTT publish.** The live rules allow a large download only while the printer is idle, and they forbid every MQTT publish. Measured on the P1S: the printer's reports are **deltas**, so `gcode_state` arrives only when it changes — 40 reports over 150 s and 25 over 90 s carried none at all, while the connection itself was fine. `pushall` would return a full snapshot, but it is a publish. So the live check establishes idleness from what the deltas do carry: a reported `gcode_state` decides outright, and otherwise **no** print-progress field (`layer_num`, `mc_percent`, `mc_remaining_time`, `total_layer_num`, `mc_print_stage`) may appear at all and both temperatures must be far below printing values. Anything unknown — no connection, no report — is a refusal, never a pass. This is also a side finding for section 13: `gcode_state` cannot be read passively from an idle printer.
+
+**Stage 3 review fixes (the transfer lane).** What the adversarial review of the stage changed, all of it inside the rules above:
+- **"Save to PC" served from the cache goes through the same discipline as a download.** It was a bare `fs::copy` onto the final name: no free-space check, no `.part`, and a short file left under the real name if the copy failed half way — which both the user and `Cache::get` read as a whole one. It now takes `destination()` like every other transfer: `require_space` first, the bytes into `<dest>.part`, the count compared with the cached file's own length, and the rename only after that; any failure deletes the `.part`.
+- **`has_ended()` is the live-lane counter itself**, not a flag stored beside it. The old flag could be latched to true by a lane that was ending while another was starting (a browse lane idle-quitting at the instant the user clicked Download), and that flag is the gate a replacement worker waits on — so the replacement could have opened a third session on a printer whose transfer lane still held one. The counter is shared with the successor, so `predecessor` is now `Arc<AtomicUsize>`.
+- **The per-transfer cancel flag reaches the session path.** It is checked at the top of `download()`, around every command in `with_session`, and again inside `open_session` once the new `SessionConns` are installed — because `FtpWorker::cancel` sets the flag and then cancels whatever records it finds, so a cancel that raced that install used to be seen only by `retr_to`, after a whole handshake (~0.9 s) and a SIZE had been spent on a transfer nobody was waiting for.
+- **A mid-transfer disk-full gets its real figures** from `disk_full_figures`: the SIZE the transfer already had, and a probe of the destination taken while the `.part` is still on disk, so the free figure is the one that failed.
+- **The confirmations count the worker's queue too** (`max` of the view's rows and `FtpWorker::active_transfers()`). A job bundle over 1 MB and a big "Load preview" run under reserved ids and have no row at all, so closing the app, removing the printer or editing its connection used to discard an automatic 86 MB download without asking.
+- **`BrowserState::cancel_transfer` answers a transfer that has not started, there and then.** The lane takes a queued `Cancel` only between jobs, so while a seven-minute RETR runs the row went on saying "waiting: one download at a time" for the rest of it and the ✕ read as a dead button. The worker's own `Done(Err(Cancelled))` writes the same phase later; the `.part` and the session are still the lane's to deal with, and a *running* transfer is never answered here.
+- **The plate picture is decoded on the lane thread** (5.1, rule 5) and reaches the UI as `browser::Picture`, which the view only uploads. The PNG bytes still go to the cache under `thumb`, and a cached one is decoded on the lane too.
+- **The cancelled-id set is pruned** whenever nothing is queued or running, instead of keeping every id ever cancelled after its transfer had already answered.
+
 **Routing and priority (browse lane):** `List` > `Details` for the user's selection > `JobBundle` > `GcodeHeader` > `Thumb`.
 - Thumbnails run LIFO within the latest `gen`, so visible tiles load first; stale generations are dropped.
 - A browse-lane item that is already transferring cannot be pre-empted without killing the session, so the browse lane only takes items of 1 MB or less (thumbnails, small 3mf, head reads). Larger items go to the transfer lane.
@@ -897,6 +927,18 @@ pub fn free_bytes(dir: &Path) -> io::Result<u64>;
 - **Config:** a `[files]` table in `config.toml` with `cache_cap_gb = 5`.
 - No LIST name seen on the printers contained Windows-illegal characters (4730 lines, longest 112 characters), but names are not under the app's control, so sanitising is required.
 
+**Stage 3, part 1 (`cache.rs`) as built.**
+- **The 5 % of the free-space rule is 5 % of the file**, not of the volume: `SIZE + max(64 MB, SIZE/20)`. That is what makes the section's own example right (a 28 MB file needs 92 MB), and 5 % of a modern volume would refuse every download. Above about 1.28 GB the percentage is the larger share.
+- **A volume that cannot be probed does not block the download.** `GetDiskFreeSpaceExW` failing means the check is skipped, not that the transfer is refused; the write itself still reports a full disk. Refusing on a failed probe would stop downloads that would have worked.
+- **LRU orders by the later of the last-access and last-write times.** Windows disables last-access updates by default, so access time alone is not an order at all; a stable, slightly conservative order is better than none.
+- **`.part` files are protected by the open set** while their download runs, so eviction and Clear cache cannot delete a transfer out from under itself. Stale ones are deleted at startup.
+- **`Kind` names the four areas** (`list`, `thumb`, `meta`, `file`) that the table above describes, and `Cache::at(root, cap)` is the seam the tests and the live check use so neither ever touches the user's real cache. `save_to_pc_path_in` does the same for the Downloads folder.
+- The `[files]` table is written **before** `printers` in `config.toml`: a plain table after an array of tables would be read as part of the last printer. A config written before the table loads with the 5 GB default.
+
+**Stage 3 review fixes (`cache.rs`).**
+- **The "Save to PC" folder is swept at startup as well.** 5.6's rule has no qualification — "stale `.part` files are deleted at startup" — but the sweep walked the cache root only, and a Save-to-PC transfer writes its `.part` into `Downloads\Bambu Control\<printer>`. A power loss or a hard kill during one left the whole file's bytes there for ever. `Cache::sweep_save_parts(base)` is the bounded walk for it, with the same open-file guard, and `cache::save_root()` is the folder `main` points it at, so the tests keep their own base.
+- **The usage total is memoised.** The files view asks for it on every frame it paints, and it repaints at 10 Hz while a transfer runs and at the frame rate while the player does; the answer is a `read_dir` plus a `metadata` per file over the whole cache — on the thread that paints, walking the directory the running transfer is writing into. `usage_bytes_cached(max_age)` walks at most once every 2 s, and `commit`, `evict_to`, `clear` and the sweeps forget the memo, so Clear cache and a finished download show at once rather than up to 2 s later.
+
 ### 5.7 `src/threemf.rs` and `src/gcode.rs` (new)
 
 `threemf.rs` replaces the parsing in `files.rs` and keeps the phase 0 rules (section 10.1): plate choice, object ids from `slice_info`, boxes from `pick_N.png` with name pairing as the fallback.
@@ -939,6 +981,13 @@ pub fn parse_header(head: &[u8]) -> Header;
 - **Plain `.gcode` header read (MVP):** "Read header (~2 s)" in the detail pane runs `retr_head(path, 8 KB)` on a fresh browse session (it consumes the session; the next command reconnects). Results are cached by key. It is never run automatically, and not while the printer is printing unless the user clicks it.
 - `JobBundle` becomes: find the job's 3mf with the phase 0 matcher (section 10.1), download through the worker, then `threemf::inspect` with the reported plate number. `JobBundle.error` is shown in the UI with Retry.
 
+**Stage 3, part 1 (`threemf.rs`, `gcode.rs`) as built.**
+- **The parsing moved to `threemf.rs`, with every phase 0 rule and test.** 5.9's row says `files.rs` keeps the slice_info/model_settings parsers; this section says `threemf.rs` replaces the parsing, and that is what was built. `files.rs` keeps `JobBundle` and the matcher (`pick_3mf`, `job_plate`), so `main.rs` and the skip dialog are untouched.
+- `read_3mf` still returns `files::JobBundle` and is what the worker calls; `inspect` and `plate_gcode` are for the detail pane of part 2.
+- **`inspect` reads only the head of the plate G-code** (8 KB) for layers and max Z, instead of inflating an entry that is tens of megabytes, and `plate_gcode` is bounded at 64 MB: a corrupt or hostile archive may not decide how much memory the process takes (5.1, rule 6).
+- `gcode::parse_header` **drops a cut last line** rather than parsing it, and reports `complete` only when `HEADER_BLOCK_END` was inside the bytes read, so a head read that stopped early is never shown as the whole truth.
+- **Every entry read whole is bounded too** (`ENTRY_MAX`, 8 MB), not only the plate G-code. The wire caps bound the *compressed* archive, so a 64 MB 3mf whose `slice_info.config` inflates to gigabytes would otherwise decide how much memory the process takes, and an allocation failure aborts a release build. An entry that reaches the cap is refused rather than returned half-read: a truncated `slice_info` parses into a plausible, wrong object list.
+
 ### 5.8 `src/avi.rs` + `src/player.rs` (new)
 
 ```rust
@@ -979,6 +1028,15 @@ impl MjpegPlayer {
 - It keeps only the index and reads frames from the file on demand; decoded RGBA is 3.7 MB per frame at 720p and 6.6 MB at A1 resolution.
 - 0 complete frames: "empty recording". A decode error on one frame skips that frame.
 - The player marks its file open in the cache while it runs, so eviction and Clear cache skip it.
+
+**Stage 3, part 2 (`avi.rs`, `player.rs`) as built.**
+- **`sniff` looks for `RIFF`…`AVI ` first and `ftyp` at offset 4 second,** walks the header tree inside the first 64 KB and takes the codec from the video stream's `strh` handler or its `strf` `biCompression`. `MJPG`, `MJPEG`, `MJPA`, `JPEG` and `DMB1` all read as MJPEG. A `LIST strl` is read as one unit, so an audio `strf` is never mistaken for the video's; without a video stream the answer is `AviOther`, never `AviMjpeg`.
+- **`index` trusts no size the file states.** Every declared length is clamped to the real file length; an incomplete last chunk is dropped; a chunk claiming more than `MAX_CHUNK` (8 MB) ends the walk rather than being indexed; `LIST 'rec '` is transparent, so its children are frames at the same level; the odd-length padding byte is skipped. `truncated` is set when the RIFF size promises more than the file holds, when a chunk runs past the end, or when the walk stops early. Zero complete frames is a valid index, not an error — the player turns it into "empty recording".
+- `AviIndex` gained `fps()`, `frame_us()` and `duration_s()` for the player's chrome. `frame_us()` falls back to 40 000 µs (25 fps) when `avih` reports none, so a zero header still plays instead of dividing by zero.
+- **`MjpegPlayer::open` keeps this section's signature, and the caller sets the speed.** A cached copy is named by its key hash, so `/ipcam` never appears in the local path and `default_speed` can only recognise a file saved under its own name. The view resolves the speed from the **remote** path and `main.rs` sends `PlayerCmd::Speed` immediately after opening. This is why section 7's 10x default survives a download into the cache.
+- `PlayerError::Local` was added for a file that cannot be read or walked; `NotPlayable` and `Empty` are as specified. `offers_os_player()` says which of them has somewhere else to go: a format this app cannot decode does, an empty recording does not.
+- **The decode thread keeps `pos` as the frame to draw** and advances it only while playing, so a `Seek` while paused shows that frame without starting playback; at the end it stops, and `Play` starts again from the beginning. It never joins: `stop()` sets the flag, the thread ends on its own and the file is marked closed in the cache.
+- **One frame that does not decode is counted, not fatal** (`skipped()`): the previous picture stays on screen and playback goes on. The player view says how many were skipped and whether the file was cut short.
 
 ### 5.9 Changes to existing files
 
@@ -1141,6 +1199,31 @@ There is no trust, accept or continue action. Close is the default: focused, and
 - **The grid/list toggle of the mock is not built:** Timelapses is a grid and Print files a list. It carries no lane of its own and is deferred with the rest of the mock's actions.
 - **The refusal card's Close is the accent button** (`dialogs::accent_button_response`), and it neither takes the focus nor answers Enter and Esc while a dialog it opened — Edit printer — is on screen.
 
+**Stage 3, part 2 (the actions, the transfer bar and the player) as built.** The stage 2 note above said "no action the stage cannot perform is shown"; this stage performs them, so they are shown. Differences from the sections above:
+- **The view opens no file and no window itself.** It returns `Action::{Play, ClosePlayer, Player, OpenExternally, Reveal, ClearCache}` and `main.rs` acts on them, so `opener` and the player live in one place and the view stays testable by rendering it and reading the text it painted.
+- **`Cmd::Details { remote, plate_hint }` and `Cmd::GcodeHeader { remote }` landed**, with the `Details`/`GcodeHeader` events 5.4 reserved. Routing follows 5.4: a 3mf of 1 MB or less is inspected on the browse session, and a larger one is a user-started download that moves to the transfer lane (it counts as that printer's one download, under a reserved id the view can never name). The browse queue runs List, then the user's selection, then the job bundle, then a header read, then prefetches.
+- **A header read consumes its session**, as 5.2 says `retr_head` must: the lane closes the session it holds, opens one of its own, hands it to `retr_head` and counts its connections afterwards through `Handshakes::of`, which became public for exactly this. The next command reconnects, and the read never leaves a second session open.
+- **Answers are cached by key** (5.7): `ThreeMfInfo` and `gcode::Header` as JSON under `meta`, the plate picture under `thumb`. Asking again for an unchanged file touches no printer; a file that changed on the card has a different key.
+- **`DetailState::Ready` is boxed.** A 3mf's facts and its plate picture are 288 bytes against the variant next to it, which `clippy::large_enum_variant` refuses.
+- **The 3mf preview follows section 4's caps**: it loads on its own at 1 MB or less (256 KB while printing), and above that shows "preview: 6.9 MB · ~35 s" with a **Load preview** button, because it is a download and the user should decide to spend the time.
+- **The transfer bar** shows one row per transfer still running or failed, with the real byte count off the socket, the measured rate and the ETA from the rolling rate; its **✕** cancels a running transfer and dismisses a failed one. Successes leave the bar and stay on the tile and in the detail pane. The grid above it is given the height the bar and the cache line do not need, so the two never overlap.
+- **Per-tile and per-row states** are the same note in both places: connecting…, the queued wording of 5.10, `↓ 42%`, `✓ ready`, or a short failure. A tile that is transferring shows it instead of its date.
+- **The chip badge** is `↓ 42%` from the running transfer, so the previous printer's downloads stay visible on its chip while another printer is on screen.
+- **The confirmations are `App` fields, not `Dialog` variants**: closing the app (through `ViewportCommand::CancelClose`) and a connection edit both ask with `dialogs::show_confirm`, and removal reuses its existing dialog with the same wording added. All three name how many downloads would be discarded (`active_transfer_note`).
+- **The player's Back is "‹ Back to the list"**, named apart from the view's own Back, which leaves the files view altogether.
+- **The detail pane clones its selection first** (`Selected`), so it can then borrow the browser state mutably to start a download or a preview. "Save to PC" on a file already in the cache copies it instead of downloading again (5.6).
+- **Not verified in the running app.** The screenshots this stage asked for were not taken: the owner's release build was running and holds the single-instance mutex of section 4 rule 6, so the debug build is refused a second instance by design. The guard was not disabled and the owner's process was not stopped. Everything below the view is covered by tests, and the transfer lane's live behaviour was measured in part 1 (5.4).
+
+**Stage 3 review fixes (the view).** From the UX and spec review of the stage:
+- **A file already in the disk cache is not offered as a download.** The pane knew only the transfers this session started, so on a fresh start a cached timelapse read "Download ~6 min" for something already on disk. `View::cached` is the lookup — the worker's own key and extension, one `is_file()` for the selected entry per frame — and the pane prefers it to an ETA. It also keeps Play / Open in player / Show in folder on screen while a "Save to PC" copies that same file.
+- **A failed transfer offers "⟳ retry"** beside its ✕, as 5.10's row asks; it restarts at 0, because there is no resume, and keeps the destination the failed one had. `TransferUi` carries the whole `RemoteEntry` for it.
+- **"connecting…" carries the seconds** (`connecting 3 s`), from a `started` on the row.
+- **The queued reason is truncated on a tile** and shown in full in the bar and on hover: 50 characters inside a 156 px tile wrapped to three lines, and since the virtualiser reserves what a row kind really paints, every tile row in the grid became that tall for as long as the transfer waited.
+- **The player reserves the footer's height**, so a transfer running while a video plays cannot push Clear cache or that transfer's ✕ off the bottom.
+- **The "can't play this format in the app" card has a ✕.** It is a warning, not a mode: it used to sit above the grid for the rest of the visit, on every tab.
+- **Texture ids are named by the hashed printer key**, not the serial (section 12): egui lists them in its own inspection UI.
+- **The cache usage line reads a memoised total** (5.6), so the view no longer walks the whole cache directory on the UI thread once per frame.
+
 ---
 
 ## 7. Timelapse and recording playback
@@ -1153,11 +1236,21 @@ There is no trust, accept or continue action. Close is the default: focused, and
 | **C2. In-app H.264, Media Foundation** (windows 0.62 `IMFSourceReader`) | MP4 | `windows` feature (crate already locked) | 4-6 d | not spiked | Handles High profile, B-frames and demux; unsafe COM; missing on Windows N editions without the Media Feature Pack |
 | D. ffmpeg-based crates | - | heavy | - | egui-video needs egui 0.29; video-rs needs FFmpeg DLLs | Rejected |
 
+**What may be handed to the OS player, and what that buys** (stage 3 security review, F2). "Open in player" ends in `opener::open`, which is `ShellExecute`: Windows picks the program by the file's **extension** and runs whatever it finds. Names under `Downloads\Bambu Control\<printer>` keep the printer's own name, sanitised, and the card chooses that name; F3 showed a name can even be made to read as something else. So the button is offered only when **both** agree that the file is media:
+- its **header**, read from the file on disk (`player::openable_by_shell` over `avi::sniff`): `RIFF`/`AVI ` or `ftyp`;
+- its **extension** on disk, matching that header: `.avi` for an AVI, `.mp4` or `.m4v` for an MP4.
+
+It fails closed: a file that cannot be opened or read, one shorter than a container header, one with no extension, or one whose header is not a container this app knows, is never offered. A header check alone would pass a genuine AVI named `invoice.exe`; an extension check alone would pass an executable named `movie.avi`. The rule is about the file, not about which screen shows it: the detail pane, the player chrome and the "can't play this format" card all ask the same question, and `main.rs` answers it once per path so nothing reads the disk while painting.
+
+**What this does not buy.** It stops the app from handing an executable to the shell. It does not make media parsing safe: an AVI opened in the system player is decoded by Windows' codecs, which this project does not control, and the same is true of any MP4 it passes on. That risk is accepted — it is the risk of the "Open in player" route itself — and the whitelist is not a claim about it.
+
 **Recommendation:**
 - **A1/A1 mini and P1P/P1S:** A is the primary route in the MVP; B ("Open in player", "Show in folder") is always offered, and is the automatic fallback when the header sniff does not find RIFF/AVI + MJPG.
 - **`/ipcam` recordings** use A. The header fps is nominal (real capture ~1.3-1.8 fps on A1), so recordings default to a 10x speed selector.
 - **X1 / H2 / P2S / X2D:** B only, once FTPS works. Revisit C2 after a real sample confirms profile and B-frames; C1 only if the sample has no B-frames.
 - **Optional, unverified:** "Export seekable copy" (append a rebuilt `idx1`, fix the RIFF size). Test with Windows' player before offering it.
+
+**Stage 3, part 2 as built.** Option A is built (`avi.rs` + `player.rs`, 5.8) and option B is always offered beside it: **Open in player** and **Show in folder** appear wherever a local copy exists, and they are the whole answer when the sniff is not MJPEG — "can't play this format in the app", with the file handed to the OS. The speed selector offers 1x, 2x, 4x, 10x and 20x, and `/ipcam` recordings start at **10x** because their real capture rate is ~1.3-1.8 fps while the header claims far more. The remote path decides that default, not the local one: a cached copy is named by its key hash (5.8).
 
 ---
 
@@ -1580,6 +1673,20 @@ Before the `rumqttc` change, the lock compiled both ring and aws-lc-rs, and `Cli
 
 ---
 
+**Stage 3 security review: where each finding landed.** The review ran against the finished stage 3 tree and produced five findings. They are not in a commit of their own: F1, F3 and F5 are inside files that this stage created, so giving them one would have meant committing a knowingly weaker version first, which is a state that never existed and a broken bisect. Each label is written literally in its commit message, so `git log --grep=F3` finds it, and in the code at the line it guards.
+
+| Finding | Severity | What it hardens | Landed in |
+|---|---|---|---|
+| F1 | major | `avi::index` had no cap on the frame count and runs on the UI thread: 64 MB of a corrupt `movi` measured 8.4 million frames, a 131 MB table and 11.5 s of frozen UI. `MAX_FRAMES` stops the walk at 500,000 (`avi.rs`) | `3b3922b` |
+| F2 | minor | "Open in player" reaches `ShellExecute`, which picks its program by extension and ignores the content. `player::openable_by_shell` requires the header **and** the extension to agree that the file is media, and fails closed; all three surfaces ask it (`player.rs`, `ui/files_view.rs`, `main.rs`) | `3b3922b` |
+| F3 | nit | `sanitize_component` replaced only Cc characters, so `photo<U+202E>gnp.exe` was written verbatim and reads as "photoexe.png" in Explorer. `is_spoofing` covers the bidirectional overrides and zero-width marks (`cache.rs`) | `3b3922b` |
+| F4 | nit | A committed cache file is unprotected between the rename and the player's `mark_open`; another worker's `reserve()` can evict it, so "Download & play" reports success and the player then fails. Deliberately not fixed: marking it open in `transfer_file` would leak 3mf previews and `JobBundle`, which never reach the player. The fix belongs in the `Dest::Cache{open_after:true}` hand-off | not fixed — [issue #3](https://github.com/Korinocho/bambu-control-rs/issues/3) |
+| F5 | nit | The `" (2)"` collision suffix could push a name past `COMPONENT_MAX`; the stem is cut to 112 characters first (`cache.rs`) | `3b3922b` |
+
+Two things the review left standing, both recorded rather than fixed: F5's cap can still be exceeded by a name that is almost entirely extension (124 characters, well inside Windows' 255), and the whitelist of F2 is about what may be handed to the shell, not about the safety of media parsing — see section 7.
+
+---
+
 ## 13. Side findings
 
 1. **Serial prefix swap** in `MODEL_PREFIXES` (now `config.rs:63-71`): `01P` and `01S` were swapped (01P = P1S, 01S = P1P; the owner's P1S reports prefix 01P). **Fixed (`8d0227b`).**
@@ -1672,4 +1779,4 @@ All live work was read-only and used at most 2-3 sockets per printer. No secrets
   - Third-party certificate chains, verified with `openssl verify -partial_chain` against those files: ha-bambulab issues #1596 and #1705, Bambuddy issues #1638 and #2780, bambino issue #142.
 
 **A.5 Not verified anywhere**
-A1 timelapse video format; A1 mini and P1P behaviour; the per-printer session ceiling; the handshake kinds while Studio uploads and the app browses (the upload itself passed as G4 on 2026-09-16; the kinds were not recorded, 10.3); two concurrent sessions of one printer on the real printers (each with its own resumption store since stage 1b); Schannel's handshake-signature check with certificate validation disabled (plan B); the X1/H2 session-reuse requirement; the certificate generation of H2D, H2S, H2D Pro, A2L, X1, X1E, A1 mini and P1P; whether a replaced board keeps its serial with a new `BBL CA` leaf; how hard key extraction from a printer is; DELE; AVBL/STAT; `project_file` URL scheme; port-6000 framing; X1/H2/P2S FTPS behaviour; effect of transfers on print quality.
+A1 timelapse video format; A1 mini and P1P behaviour; the per-printer session ceiling; the browse lane's "one session per printer" on all three printers at once (stage 3 verified it on the P1S only: the live rules need a printer confirmed idle, and the subscribe-only probe covers the P1S, so `live_browse_uses_one_session_per_printer` was not run — re-run it when all three are free); the handshake kinds while Studio uploads and the app browses (the upload itself passed as G4 on 2026-09-16; the kinds were not recorded, 10.3); two concurrent sessions of one printer on the real printers (each with its own resumption store since stage 1b); Schannel's handshake-signature check with certificate validation disabled (plan B); the X1/H2 session-reuse requirement; the certificate generation of H2D, H2S, H2D Pro, A2L, X1, X1E, A1 mini and P1P; whether a replaced board keeps its serial with a new `BBL CA` leaf; how hard key extraction from a printer is; DELE; AVBL/STAT; `project_file` URL scheme; port-6000 framing; X1/H2/P2S FTPS behaviour; effect of transfers on print quality.

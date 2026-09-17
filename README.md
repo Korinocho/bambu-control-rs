@@ -57,6 +57,21 @@ That file is in `.gitignore` and must never be committed or shared, and release 
 must not be built straight out of `target/release/`, because the config sits next to the
 executable there.
 
+### Where files go
+
+| What | Where |
+|---|---|
+| Timelapses and recordings you play, and the app's own listings and thumbnails | `%LOCALAPPDATA%\Bambu Control\cache` |
+| **Save to PC** | `Downloads\Bambu Control\<printer name>` |
+
+The cache has a size cap, 5 GB by default, set with `cache_cap_gb` under `[files]` in
+`config.toml`. When it is full the least recently used files go first, except a file the
+player has open. **Clear cache** in the files view empties it, again skipping anything
+open. Files you saved with "Save to PC" are yours: nothing in the app ever deletes them.
+
+Downloads have no resume — the printers answer `502` to `REST` — so a cancelled or
+interrupted download leaves nothing behind, and starting it again starts from zero.
+
 ## Security notes
 
 Each connection to the printer is treated separately.
