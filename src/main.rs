@@ -31,7 +31,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, CornerRadius, RichText, Sense, Stroke, StrokeKind};
+use egui::{Color32, RichText, Sense, Stroke, StrokeKind};
+
+use theme::{font, pad, radius, size, stroke};
 
 use browser::{BrowserState, Cmd, Event, FtpWorker};
 use config::{Config, PrinterCfg, model_from_serial};
@@ -327,6 +329,37 @@ enum ToolIcon {
     Add,
     Trash,
 }
+
+/// The tool buttons' glyphs, in points from the button's centre: geometry
+/// private to that one painter. Segments are [x0, y0, x1, y1].
+mod tool_icon {
+    use egui::CornerRadius;
+
+    pub const STROKE: f32 = 1.7;
+    pub const PENCIL_STROKE: f32 = 2.4;
+    pub const THIN_STROKE: f32 = 1.2;
+    pub const PLUS_H: [f32; 4] = [-6.0, 0.0, 6.0, 0.0];
+    pub const PLUS_V: [f32; 4] = [0.0, -6.0, 0.0, 6.0];
+    pub const PENCIL_BODY: [f32; 4] = [-4.5, 5.5, 4.0, -3.0];
+    pub const PENCIL_TIP: [[f32; 2]; 4] =
+        [[4.9, -6.4], [6.4, -4.9], [3.2, -2.2], [2.2, -3.2]];
+    pub const TRASH_LID: [f32; 4] = [-7.0, -5.0, 7.0, -5.0];
+    pub const TRASH_HANDLE: [f32; 4] = [-2.5, -7.5, 2.5, -7.5];
+    pub const TRASH_BODY: [f32; 4] = [-5.0, -3.0, 5.0, 7.0];
+    pub const TRASH_BODY_RADIUS: CornerRadius = CornerRadius::same(2);
+    pub const TRASH_LINE_LEFT: [f32; 4] = [-1.7, -1.0, -1.7, 5.0];
+    pub const TRASH_LINE_RIGHT: [f32; 4] = [1.7, -1.0, 1.7, 5.0];
+}
+
+/// The chip drag feedback: how far the insertion marker sits outside the
+/// chips, and where the ghost trails the pointer.
+const MARKER_GAP: f32 = 4.0;
+const MARKER_OVERHANG: f32 = 3.0;
+const GHOST_OFFSET: egui::Vec2 = egui::vec2(14.0, 10.0);
+
+/// How long a light command waits for telemetry to agree before the switch
+/// goes back to what the printer reports.
+const LIGHT_PENDING: Duration = Duration::from_secs(6);
 
 struct App {
     cfg: Config,
@@ -660,51 +693,44 @@ impl App {
     fn tool_button(ui: &mut egui::Ui, icon: ToolIcon,
                    tip: &str) -> bool {
         let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(36.0, 30.0), Sense::click());
+            size::ICON_BUTTON, Sense::click());
         let visuals = ui.style().interact(&response);
-        ui.painter().rect(rect, CornerRadius::same(10),
+        ui.painter().rect(rect, radius::CONTROL,
                           visuals.bg_fill, visuals.bg_stroke,
                           StrokeKind::Inside);
         let c = rect.center();
-        let s = Stroke::new(1.7, theme::TEXT);
+        let at = |[x, y]: [f32; 2]| c + egui::Vec2::new(x, y);
+        let segment = |[x0, y0, x1, y1]: [f32; 4]| [at([x0, y0]), at([x1, y1])];
+        let s = Stroke::new(tool_icon::STROKE, theme::TEXT);
         let p = ui.painter();
         match icon {
             ToolIcon::Add => {
-                p.line_segment([c + egui::vec2(-6.0, 0.0),
-                                c + egui::vec2(6.0, 0.0)], s);
-                p.line_segment([c + egui::vec2(0.0, -6.0),
-                                c + egui::vec2(0.0, 6.0)], s);
+                p.line_segment(segment(tool_icon::PLUS_H), s);
+                p.line_segment(segment(tool_icon::PLUS_V), s);
             }
             ToolIcon::Edit => {
                 // pencil: body + tip
-                let body = Stroke::new(2.4, theme::TEXT);
-                p.line_segment([c + egui::vec2(-4.5, 5.5),
-                                c + egui::vec2(4.0, -3.0)], body);
+                let body = Stroke::new(tool_icon::PENCIL_STROKE, theme::TEXT);
+                p.line_segment(segment(tool_icon::PENCIL_BODY), body);
                 p.add(egui::Shape::convex_polygon(
-                    vec![c + egui::vec2(4.9, -6.4),
-                         c + egui::vec2(6.4, -4.9),
-                         c + egui::vec2(3.2, -2.2),
-                         c + egui::vec2(2.2, -3.2)],
+                    tool_icon::PENCIL_TIP.iter().map(|point| at(*point))
+                        .collect(),
                     theme::TEXT, Stroke::NONE));
             }
             ToolIcon::Trash => {
                 // lid + handle
-                p.line_segment([c + egui::vec2(-7.0, -5.0),
-                                c + egui::vec2(7.0, -5.0)], s);
-                p.line_segment([c + egui::vec2(-2.5, -7.5),
-                                c + egui::vec2(2.5, -7.5)], s);
+                p.line_segment(segment(tool_icon::TRASH_LID), s);
+                p.line_segment(segment(tool_icon::TRASH_HANDLE), s);
                 // body
-                let body = egui::Rect::from_min_max(
-                    c + egui::vec2(-5.0, -3.0), c + egui::vec2(5.0, 7.0));
-                p.rect(body, CornerRadius::same(2),
+                let [x0, y0, x1, y1] = tool_icon::TRASH_BODY;
+                let body = egui::Rect::from_min_max(at([x0, y0]),
+                                                    at([x1, y1]));
+                p.rect(body, tool_icon::TRASH_BODY_RADIUS,
                        Color32::TRANSPARENT, s, StrokeKind::Inside);
                 // inner lines
-                p.line_segment([c + egui::vec2(-1.7, -1.0),
-                                c + egui::vec2(-1.7, 5.0)],
-                               Stroke::new(1.2, theme::TEXT));
-                p.line_segment([c + egui::vec2(1.7, -1.0),
-                                c + egui::vec2(1.7, 5.0)],
-                               Stroke::new(1.2, theme::TEXT));
+                let inner = Stroke::new(tool_icon::THIN_STROKE, theme::TEXT);
+                p.line_segment(segment(tool_icon::TRASH_LINE_LEFT), inner);
+                p.line_segment(segment(tool_icon::TRASH_LINE_RIGHT), inner);
             }
         }
         if response.hovered() {
@@ -742,19 +768,20 @@ impl App {
                     egui::Frame::new()
                         .fill(theme::CARD)
                         .stroke(if selected {
-                            Stroke::new(2.0, Color32::WHITE)
+                            Stroke::new(stroke::SELECTED,
+                                        theme::CHIP_SELECTED)
                         } else {
-                            Stroke::new(1.0, theme::BORDER)
+                            Stroke::new(stroke::HAIRLINE, theme::BORDER)
                         })
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .corner_radius(radius::CONTROL)
+                        .inner_margin(pad::CHIP)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // baseline-aligned status dot
                                 ui.label(RichText::new("●")
-                                    .size(10.0).color(color));
+                                    .font(font::caption()).color(color));
                                 ui.label(RichText::new(&printer.cfg.name)
-                                    .font(theme::bold(14.0)));
+                                    .font(font::body_strong()));
                                 let mut parts = Vec::new();
                                 if !gcode_state.is_empty() {
                                     let mut s = gcode_state.to_lowercase();
@@ -773,7 +800,7 @@ impl App {
                                     ui.label(RichText::new(
                                         parts.join("  "))
                                         .color(color)
-                                        .font(theme::bold(11.0)));
+                                        .font(font::label()));
                                 }
                                 // the download badge of section 6: the
                                 // previous printer's transfers keep running
@@ -784,7 +811,7 @@ impl App {
                                     ui.label(RichText::new(
                                         format!("↓ {pct}%"))
                                         .color(theme::ACCENT)
-                                        .font(theme::bold(11.0)));
+                                        .font(font::label()));
                                 }
                             });
                         })
@@ -826,33 +853,35 @@ impl App {
                 let moves = slot != src && slot != src + 1;
                 if moves {
                     let x = if slot == 0 {
-                        chip_rects[0].left() - 4.0
+                        chip_rects[0].left() - MARKER_GAP
                     } else if slot >= chip_rects.len() {
-                        chip_rects.last().unwrap().right() + 4.0
+                        chip_rects.last().unwrap().right() + MARKER_GAP
                     } else {
                         (chip_rects[slot - 1].right()
                          + chip_rects[slot].left()) / 2.0
                     };
-                    let top = chip_rects[0].top() - 3.0;
-                    let bottom = chip_rects[0].bottom() + 3.0;
+                    let top = chip_rects[0].top() - MARKER_OVERHANG;
+                    let bottom = chip_rects[0].bottom() + MARKER_OVERHANG;
                     ui.painter().line_segment(
                         [egui::pos2(x, top), egui::pos2(x, bottom)],
-                        Stroke::new(3.0, theme::ACCENT));
+                        Stroke::new(stroke::HEAVY, theme::ACCENT));
                 }
                 // ghost tile following the cursor
                 let name = self.printers[src].cfg.name.clone();
                 egui::Area::new(egui::Id::new("chip-ghost"))
                     .order(egui::Order::Tooltip)
-                    .fixed_pos(pos + egui::vec2(14.0, 10.0))
+                    .fixed_pos(pos + GHOST_OFFSET)
                     .interactable(false)
                     .show(ctx, |ui| {
                         egui::Frame::new()
                             .fill(theme::CARD_HOVER)
-                            .stroke(Stroke::new(1.5, Color32::WHITE))
-                            .corner_radius(CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(12, 6))
+                            .stroke(Stroke::new(stroke::MEDIUM,
+                                                theme::CHIP_SELECTED))
+                            .corner_radius(radius::CONTROL)
+                            .inner_margin(pad::CHIP)
                             .show(ui, |ui| {
-                                ui.label(RichText::new(name).font(theme::bold(14.0)));
+                                ui.label(RichText::new(name)
+                                    .font(font::body_strong()));
                             });
                     });
                 if ctx.input(|i| i.pointer.any_released()) {
@@ -1261,7 +1290,7 @@ impl eframe::App for App {
         egui::Panel::top("bar")
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(theme::BG)
-                .inner_margin(egui::Margin::symmetric(10, 8)))
+                .inner_margin(pad::BAR))
             .show(root, |ui| {
                 ui.horizontal(|ui| {
                     self.chips_bar(ui, ctx);
@@ -1301,7 +1330,7 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG)
-                .inner_margin(10))
+                .inner_margin(pad::PAGE))
             .show(root, |ui| {
                 if let Some(error) = &self.config_error {
                     ui.label(RichText::new(error).color(theme::DANGER));
@@ -1319,7 +1348,7 @@ impl eframe::App for App {
                     ui.centered_and_justified(|ui| {
                         ui.label(RichText::new(
                             "Add a printer to get started")
-                            .color(theme::TEXT_DIM).size(15.0));
+                            .color(theme::TEXT_DIM).font(font::title()));
                     });
                     return;
                 }
@@ -1333,7 +1362,7 @@ impl eframe::App for App {
                     panel::light_on(&state).unwrap_or(false);
                 if let Some((desired, ts)) = printer.light_pending {
                     if shown_on == desired
-                        || ts.elapsed().as_secs() > 6
+                        || ts.elapsed().as_secs() > LIGHT_PENDING.as_secs()
                     {
                         printer.light_pending = None;
                     } else {
@@ -1416,8 +1445,8 @@ fn main() -> eframe::Result {
         };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 780.0])
-            .with_min_inner_size([700.0, 480.0])
+            .with_inner_size(size::WINDOW)
+            .with_min_inner_size(size::WINDOW_MIN)
             .with_title("Bambu Control")
             .with_icon(load_icon()),
         ..Default::default()

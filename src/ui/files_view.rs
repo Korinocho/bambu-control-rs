@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDateTime, NaiveTime};
-use egui::{Color32, CornerRadius, Modifiers, RichText, Sense, Stroke, Ui,
-           vec2};
+use egui::{Color32, Modifiers, RichText, Sense, Stroke, Ui, vec2};
 
 use crate::avi::AviIndex;
 use crate::browser::{BrowserState, Cmd, ConnState, Dest, DetailState,
@@ -23,7 +22,7 @@ use crate::browser::{BrowserState, Cmd, ConnState, Dest, DetailState,
 use crate::config;
 use crate::ftp::{FtpError, RemoteEntry, ServerProfile};
 use crate::player::{self, PlayerCmd};
-use crate::theme;
+use crate::theme::{self, font, pad, radius, size, space, stroke};
 use crate::tls;
 use crate::ui::dialogs::accent_button_response;
 use crate::ui::panel::card_frame;
@@ -46,16 +45,13 @@ const AUTO_PREVIEW_MAX: u64 = 1024 * 1024;
 /// The same while the printer is printing (design doc 4).
 const AUTO_PREVIEW_PRINTING: u64 = 256 * 1024;
 
-const TILE_W: f32 = 168.0;
-const TILE_IMAGE_H: f32 = 94.0;
 /// picture, then the date and size lines, plus the frame's margins and the
 /// spacing between the three: a shorter row would clip the size line
-const TILE_H: f32 = TILE_IMAGE_H + 62.0;
+const TILE_H: f32 = size::TILE_IMAGE_H + 62.0;
 const ROW_H: f32 = 34.0;
 const COMPANION_H: f32 = 26.0;
 const NOTE_H: f32 = 22.0;
 const HEADING_H: f32 = 24.0;
-const DETAIL_W: f32 = 268.0;
 /// The player's own controls row, under the picture: the play button, the
 /// seek slider, the clock and the speed selector, with the spacing around
 /// them. Everything below it — the transfer bar and the cache line — is
@@ -311,7 +307,7 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     let mut out = Outcome::default();
     files.frame += 1;
     header(ui, state, files, view, &mut out);
-    ui.add_space(6.0);
+    ui.add_space(space::S);
 
     // H2C / P2S / X2D: the answer comes from the model name, and nothing is
     // listed or connected (5.3, Models)
@@ -337,7 +333,7 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     if view.printing {
         ui.label(RichText::new(
             "printing: transfers share the printer's Wi-Fi")
-            .color(theme::TEXT_DIM).size(11.0));
+            .color(theme::TEXT_DIM).font(font::caption()));
     }
     if let Some(error) = state.error.clone() {
         error_card(ui, &error, view.serial, &mut out);
@@ -345,7 +341,7 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     // the player takes over the grid area; Back returns to the grid
     // (section 6)
     if let Some(player) = &view.player {
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
         // the transfer bar and the cache line sit below the picture here
         // too, so the picture is given what is left of the height rather
         // than a fixed margin: a transfer running while a video played used
@@ -358,13 +354,13 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     // the file could not be played here: the OS player is the way out
     // (5.10, section 7 option B)
     if let Some(note) = view.player_error {
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
         player_error_card(ui, view, note, view.player_error_path,
                           &mut out);
     }
-    ui.add_space(4.0);
+    ui.add_space(space::XS);
     controls(ui, files);
-    ui.add_space(6.0);
+    ui.add_space(space::S);
 
     if files.tab == Tab::Recordings {
         out.cmds.extend(state.open_recordings());
@@ -380,11 +376,12 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     let damaged = !damaged.is_empty();
 
     let total = ui.available_width();
-    let list_w = (total - DETAIL_W - 10.0).max(240.0);
     // tiles per grid row: a month's tiles wrap instead of running off the
     // edge, and the rows stay short enough to virtualise
     let gap = ui.spacing().item_spacing.x;
-    let columns = (((list_w + gap) / (TILE_W + gap)).floor() as usize).max(1);
+    let list_w = (total - size::DETAIL_W - gap).max(size::LIST_MIN_W);
+    let columns =
+        (((list_w + gap) / (size::TILE_W + gap)).floor() as usize).max(1);
     // only orphan thumbnails, or a damaged card: say why above the tiles
     // that are left (5.5)
     if files.tab == Tab::Timelapses && !state.timelapses.is_empty()
@@ -392,7 +389,7 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         && let Some(notice) = state.timelapse_notice()
     {
         banner(ui, theme::TEXT_DIM, theme::CARD, notice);
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
     }
     let rows = build_rows(state, files, columns, view.serial, damaged);
     // the transfer bar and the cache line sit below the grid, so the list
@@ -451,8 +448,8 @@ fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
     for transfer in &rows {
         egui::Frame::new()
             .fill(theme::CARD)
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(egui::Margin::symmetric(10, 4))
+            .corner_radius(radius::CONTROL)
+            .inner_margin(pad::ROW)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
@@ -465,14 +462,14 @@ fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                         .color(match failed {
                             true => theme::DANGER,
                             false => theme::ACCENT,
-                        }).size(12.0));
+                        }).font(font::caption()));
                     ui.add(egui::Label::new(RichText::new(transfer.name())
-                        .size(12.0)).truncate());
+                        .font(font::body())).truncate());
                     ui.label(RichText::new(transfer_line(transfer, view))
                         .color(match failed {
                             true => theme::DANGER,
                             false => theme::TEXT_DIM,
-                        }).size(11.0));
+                        }).font(font::caption()));
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -497,8 +494,8 @@ fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                             }
                             if let Some(done) = transfer.fraction() {
                                 ui.add(egui::ProgressBar::new(done)
-                                    .desired_width(160.0)
-                                    .desired_height(8.0)
+                                    .desired_width(size::TRANSFER_BAR_W)
+                                    .desired_height(size::PROGRESS_H)
                                     .fill(theme::ACCENT));
                             }
                         });
@@ -512,7 +509,7 @@ fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
         ui.label(RichText::new(format!(
             "cache {} / {}", human_bytes(view.cache_usage),
             human_bytes(view.cache_cap)))
-            .color(theme::TEXT_DIM).size(11.0));
+            .color(theme::TEXT_DIM).font(font::caption()));
         // it skips what the player has open (5.6)
         if ui.button("Clear cache").clicked() {
             out.actions.push(Action::ClearCache);
@@ -594,7 +591,7 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
             out.actions.push(Action::ClosePlayer);
         }
         ui.add(egui::Label::new(RichText::new(player.title)
-            .font(theme::bold(13.0))).truncate());
+            .font(font::body_strong())).truncate());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
             let mut facts = format!("{}x{}", player.index.width,
@@ -605,7 +602,7 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
             }
             facts.push_str(&format!("  ·  {frames} frames"));
             ui.label(RichText::new(facts).color(theme::TEXT_DIM)
-                .size(11.0));
+                .font(font::caption()));
         });
     });
     // the cut last chunk of 5.8, said plainly rather than shown as a
@@ -613,32 +610,32 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
     if player.index.truncated {
         ui.label(RichText::new(
             "this recording was cut short; the last frame was dropped")
-            .color(theme::WARN).size(11.0));
+            .color(theme::WARN).font(font::caption()));
     }
     if player.skipped > 0 {
         ui.label(RichText::new(format!(
             "{} frame(s) could not be decoded and were skipped",
-            player.skipped)).color(theme::TEXT_DIM).size(11.0));
+            player.skipped)).color(theme::TEXT_DIM).font(font::caption()));
     }
     let width = ui.available_width();
     let height = (ui.available_height() - PLAYER_CONTROLS_H - reserved)
         .max(160.0);
     let (rect, _) = ui.allocate_exact_size(vec2(width, height),
                                            Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(12), Color32::BLACK);
+    ui.painter().rect_filled(rect, radius::CARD, theme::MEDIA_WELL);
     match player.texture {
         Some(handle) => {
             let size = handle.size_vec2();
             let scale = (rect.width() / size.x).min(rect.height() / size.y);
             egui::Image::new((handle.id(), size))
-                .corner_radius(CornerRadius::same(8))
+                .corner_radius(radius::CARD)
                 .paint_at(ui, egui::Rect::from_center_size(rect.center(),
                                                            size * scale));
         }
         None => {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                               "decoding…",
-                              egui::FontId::proportional(12.0),
+                              font::caption(),
                               theme::TEXT_DIM);
         }
     }
@@ -664,10 +661,10 @@ fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
         ui.label(RichText::new(format!(
             "{} / {}", clock_text(player.pos as f32 * per_frame),
             clock_text(player.index.duration_s())))
-            .color(theme::TEXT_DIM).size(11.0));
+            .color(theme::TEXT_DIM).font(font::caption()));
         // Display on an f32 drops the trailing ".0", so these read 1x, 10x
         egui::ComboBox::from_id_salt("player-speed")
-            .width(72.0)
+            .width(size::SPEED_COMBO_W)
             .selected_text(format!("{}x", player.speed))
             .show_ui(ui, |ui| {
                 for speed in player::SPEEDS {
@@ -717,13 +714,13 @@ fn player_error_card(ui: &mut Ui, view: &View<'_>, note: &str,
                      path: Option<&Path>, out: &mut Outcome) {
     egui::Frame::new()
         .fill(theme::WARN_BG)
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(10)
+        .corner_radius(radius::CONTROL)
+        .inner_margin(pad::BANNER)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.add(egui::Label::new(RichText::new(note)
-                    .color(theme::WARN).size(12.0)).wrap());
+                    .color(theme::WARN).font(font::caption())).wrap());
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
@@ -805,8 +802,8 @@ fn header(ui: &mut Ui, state: &BrowserState, files: &mut FilesUi,
             out.actions.push(Action::Back);
         }
         ui.label(RichText::new(format!("{} / FILES", view.name))
-            .font(theme::bold(16.0)));
-        ui.add_space(10.0);
+            .font(font::title()));
+        ui.add_space(space::L);
         // /ipcam is listed when its tab opens (5.5), so until then the
         // Recordings tab shows no number rather than a false zero
         let recordings = match state.recordings_listed() {
@@ -852,9 +849,10 @@ fn status_line(ui: &mut Ui, state: &BrowserState, view: &View<'_>,
         false => parts.join("  ·  "),
     };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(summary).color(theme::TEXT_DIM).size(11.5));
+        ui.label(RichText::new(summary).color(theme::TEXT_DIM)
+            .font(font::caption()));
         ui.label(RichText::new("(printer clock)").color(theme::TEXT_DIM)
-            .size(11.5));
+            .font(font::caption()));
         if ui.button("Refresh").clicked() {
             out.actions.push(Action::Refresh);
         }
@@ -871,7 +869,7 @@ fn status_line(ui: &mut Ui, state: &BrowserState, view: &View<'_>,
                 ConnState::Stopped(_) => theme::DANGER,
                 _ => theme::TEXT_DIM,
             };
-            ui.label(RichText::new(line).color(color).size(11.5));
+            ui.label(RichText::new(line).color(color).font(font::caption()));
         });
     });
 }
@@ -880,7 +878,7 @@ fn controls(ui: &mut Ui, files: &mut FilesUi) {
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut files.filter)
             .hint_text("filter…")
-            .desired_width(180.0));
+            .desired_width(size::FILTER_W));
         egui::ComboBox::from_id_salt("files-sort")
             .selected_text(format!("Sort: {}", files.sort.label()))
             .show_ui(ui, |ui| {
@@ -889,7 +887,7 @@ fn controls(ui: &mut Ui, files: &mut FilesUi) {
                 }
             });
         if files.tab == Tab::Files {
-            ui.add_space(6.0);
+            ui.add_space(space::S);
             for shown in [Shown::All, Shown::Sent, Shown::Cache,
                           Shown::BuiltIn, Shown::Folders] {
                 ui.selectable_value(&mut files.shown, shown, shown.label());
@@ -901,12 +899,12 @@ fn controls(ui: &mut Ui, files: &mut FilesUi) {
 fn banner(ui: &mut Ui, color: Color32, background: Color32, text: &str) {
     egui::Frame::new()
         .fill(background)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(8)
+        .corner_radius(radius::CONTROL)
+        .inner_margin(pad::BANNER)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(RichText::new(text).color(color)
-                .size(12.0)).wrap());
+                .font(font::caption())).wrap());
         });
 }
 
@@ -916,15 +914,16 @@ fn error_card(ui: &mut Ui, error: &FtpError, serial: &str,
               out: &mut Outcome) {
     egui::Frame::new()
         .fill(theme::DANGER_BG)
-        .stroke(Stroke::new(1.0, theme::DANGER))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(12)
+        .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER))
+        .corner_radius(radius::CARD)
+        .inner_margin(pad::CARD)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(RichText::new(error.text(serial))
-                .color(theme::DANGER).size(12.5)).wrap());
-            ui.add_space(6.0);
-            if accent_button_response(ui, "Retry", vec2(96.0, 28.0))
+                .color(theme::DANGER).font(font::body())).wrap());
+            ui.add_space(space::S);
+            if accent_button_response(ui, "Retry",
+                                      vec2(0.0, size::BUTTON_H))
                 .clicked()
             {
                 out.actions.push(Action::Retry);
@@ -945,23 +944,25 @@ fn refusal_card(ui: &mut Ui, files: &mut FilesUi, title: &str, body: &str,
     });
     egui::Frame::new()
         .fill(theme::DANGER_BG)
-        .stroke(Stroke::new(1.0, theme::DANGER))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(16)
+        .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER))
+        .corner_radius(radius::CARD)
+        .inner_margin(pad::CARD)
         .show(ui, |ui| {
-            ui.set_width(ui.available_width().min(640.0));
+            ui.set_width(ui.available_width().min(size::REFUSAL_MAX_W));
             ui.label(RichText::new(title).color(theme::DANGER)
-                .font(theme::bold(15.0)));
-            ui.add_space(8.0);
-            ui.add(egui::Label::new(RichText::new(body).size(13.0)).wrap());
-            ui.add_space(14.0);
+                .font(font::title()));
+            ui.add_space(space::M);
+            ui.add(egui::Label::new(RichText::new(body).font(font::body()))
+                .wrap());
+            ui.add_space(space::XL);
             ui.horizontal(|ui| {
                 if ui.button("Edit printer").clicked() {
                     out.actions.push(Action::EditPrinter);
                 }
                 // the default action, and the only other one
                 let response =
-                    accent_button_response(ui, "Close", vec2(96.0, 30.0));
+                    accent_button_response(ui, "Close",
+                                           vec2(0.0, size::BUTTON_H));
                 // a dialog over the view owns the keyboard: the card never
                 // takes the focus back from it
                 if !blocked && !response.has_focus() {
@@ -1301,7 +1302,7 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         card_frame(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(egui::Label::new(RichText::new(empty)
-                .color(theme::TEXT_DIM).size(12.5)).wrap());
+                .color(theme::TEXT_DIM).font(font::body())).wrap());
         });
         return;
     }
@@ -1318,7 +1319,7 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         match &rows.rows[index] {
             Row::Heading(text) => {
                 ui.label(RichText::new(text).color(theme::TEXT_DIM)
-                    .font(theme::bold(11.5)));
+                    .font(font::label()));
             }
             Row::Tiles(tiles) => {
                 // top-aligned, so tiles of a row start on the same line
@@ -1328,7 +1329,7 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                         // inherits it, so each tile gets a top-down Ui of
                         // its own: picture first, then its two lines
                         ui.allocate_ui_with_layout(
-                            vec2(TILE_W, TILE_H),
+                            vec2(size::TILE_W, TILE_H),
                             egui::Layout::top_down(egui::Align::Min),
                             |ui| timelapse_tile(ui, state, files, view,
                                 *tile,
@@ -1372,7 +1373,7 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             }
             Row::Note(text) => {
                 ui.label(RichText::new(text).color(theme::TEXT_DIM)
-                    .size(11.5));
+                    .font(font::caption()));
             }
             Row::Skeleton => skeleton_row(ui),
         }
@@ -1467,7 +1468,7 @@ fn skeletons(ui: &mut Ui, tab: Tab) {
         Tab::Timelapses => "listing /timelapse…",
         Tab::Recordings => "listing /ipcam…",
         Tab::Files => "listing /cache…",
-    }).color(theme::TEXT_DIM).size(11.5));
+    }).color(theme::TEXT_DIM).font(font::caption()));
     for _ in 0..6 {
         skeleton_row(ui);
     }
@@ -1475,8 +1476,9 @@ fn skeletons(ui: &mut Ui, tab: Tab) {
 
 fn skeleton_row(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(
-        vec2(ui.available_width().min(420.0), 20.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(6), theme::CARD_HOVER);
+        vec2(ui.available_width().min(size::SKELETON_MAX_W), 20.0),
+        Sense::hover());
+    ui.painter().rect_filled(rect, radius::CONTROL, theme::CARD_HOVER);
 }
 
 /// What a tile needs from the frame around it: which tiles were painted
@@ -1509,17 +1511,18 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
 
     let shown = egui::Frame::new()
         .fill(theme::CARD)
-        .stroke(Stroke::new(if selected { 2.0 } else { 1.0 },
+        .stroke(Stroke::new(if selected { stroke::SELECTED }
+                            else { stroke::HAIRLINE },
                             if selected { theme::ACCENT }
                             else { theme::BORDER }))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(6)
+        .corner_radius(radius::CARD)
+        .inner_margin(pad::TILE)
         .show(ui, |ui| {
-            ui.set_width(TILE_W - 12.0);
+            let inner = size::TILE_W - pad::TILE.sum().x;
+            ui.set_width(inner);
             let (rect, _) = ui.allocate_exact_size(
-                vec2(TILE_W - 12.0, TILE_IMAGE_H), Sense::hover());
-            ui.painter().rect_filled(rect, CornerRadius::same(10),
-                                     Color32::BLACK);
+                vec2(inner, size::TILE_IMAGE_H), Sense::hover());
+            ui.painter().rect_filled(rect, radius::MEDIA, theme::MEDIA_WELL);
             let texture = match &thumb {
                 Some(entry) => {
                     tile.seen.insert(entry.path.clone());
@@ -1536,7 +1539,7 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     let scale = (rect.width() / size.x)
                         .min(rect.height() / size.y);
                     egui::Image::new((handle.id(), size))
-                        .corner_radius(CornerRadius::same(8))
+                        .corner_radius(radius::MEDIA)
                         .paint_at(ui, egui::Rect::from_center_size(
                             rect.center(), size * scale));
                 }
@@ -1544,7 +1547,7 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     ui.painter().text(rect.center(),
                         egui::Align2::CENTER_CENTER,
                         tile_caption(state, thumb.as_ref()),
-                        egui::FontId::proportional(11.0), theme::TEXT_DIM);
+                        font::caption(), theme::TEXT_DIM);
                 }
             }
             // where the retry sits, for the click below: the tile's own
@@ -1559,20 +1562,20 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 // because the virtualiser reserves what a row kind paints.
                 // The transfer bar below carries the reason in full.
                 ui.add(egui::Label::new(RichText::new(text).color(*color)
-                    .size(11.0)).truncate())
+                    .font(font::caption())).truncate())
                     .on_hover_text(text.as_str());
             } else if orphan {
                 ui.label(RichText::new("⚠ no video").color(theme::WARN)
-                    .size(11.0));
+                    .font(font::caption()));
             } else if failed {
                 retry_at = Some(ui.add(egui::Label::new(
                     RichText::new("⟳ retry").color(theme::ACCENT)
-                        .size(11.0))).rect);
+                        .font(font::caption()))).rect);
             } else {
                 ui.label(RichText::new(when_text(started))
-                    .color(theme::TEXT_DIM).size(11.0));
+                    .color(theme::TEXT_DIM).font(font::caption()));
             }
-            ui.label(RichText::new(human_bytes(size)).size(11.5));
+            ui.label(RichText::new(human_bytes(size)).font(font::caption()));
             retry_at
         });
     let retry_at = shown.inner;
@@ -1683,10 +1686,10 @@ fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
     let selected = files.selected.as_deref() == Some(entry.path.as_str());
     let response = egui::Frame::new()
         .fill(if selected { theme::CARD_HOVER } else { theme::CARD })
-        .stroke(Stroke::new(1.0, if selected { theme::ACCENT }
+        .stroke(Stroke::new(stroke::HAIRLINE, if selected { theme::ACCENT }
                                  else { theme::BORDER }))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(10, 4))
+        .corner_radius(radius::CONTROL)
+        .inner_margin(pad::ROW)
         .show(ui, |ui| {
             ui.set_width(ui.available_width() - indent);
             ui.horizontal(|ui| {
@@ -1694,25 +1697,25 @@ fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
                     ui.add_space(indent);
                 }
                 ui.label(RichText::new(icon).color(theme::TEXT_DIM)
-                    .font(theme::bold(10.5)));
+                    .font(font::label()));
                 let name = match entry.unreadable {
                     true => RichText::new(&entry.name)
                         .color(theme::TEXT_DIM).italics(),
-                    false => RichText::new(&entry.name).size(12.5),
+                    false => RichText::new(&entry.name).font(font::body()),
                 };
                 ui.add(egui::Label::new(name).truncate());
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(when_text(entry.mtime))
-                            .color(theme::TEXT_DIM).size(11.0));
+                            .color(theme::TEXT_DIM).font(font::caption()));
                         if !entry.is_dir {
                             ui.label(RichText::new(human_bytes(entry.size))
-                                .color(theme::TEXT_DIM).size(11.0));
+                                .color(theme::TEXT_DIM).font(font::caption()));
                         }
                         // the per-row transfer state of section 6
                         if let Some((text, color)) = &note {
                             ui.label(RichText::new(text).color(*color)
-                                .size(11.0));
+                                .font(font::caption()));
                         }
                     });
             });
@@ -1736,12 +1739,12 @@ fn file_row(ui: &mut Ui, files: &mut FilesUi, item: &FileItem,
             .map(|plate| format!(" (plate {plate})"))
             .unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.add_space(22.0);
+            ui.add_space(space::XL);
             let text = format!("↳ printer's extracted copy: {}  {}{plate}",
                                item.remote.name,
                                human_bytes(item.remote.size));
             let response = ui.add(egui::Label::new(RichText::new(text)
-                .color(theme::TEXT_DIM).size(11.5))
+                .color(theme::TEXT_DIM).font(font::caption()))
                 .sense(Sense::click()));
             if response.clicked() {
                 files.selected = Some(item.remote.path.clone());
@@ -1759,7 +1762,7 @@ fn folder_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
         (true, false) => "▸ DIR",
         (false, _) => "FILE",
     };
-    entry_row(ui, files, entry, icon, 14.0 * depth as f32, None)
+    entry_row(ui, files, entry, icon, space::XL * depth as f32, None)
 }
 
 fn kind_icon(kind: FileKind) -> &'static str {
@@ -1870,17 +1873,17 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new("DETAILS").color(theme::TEXT_DIM)
-            .font(theme::bold(11.5)));
-        ui.add_space(6.0);
+            .font(font::label()));
+        ui.add_space(space::S);
         match picked {
             Selected::None => {
                 ui.label(RichText::new("Select a file to see its details.")
-                    .color(theme::TEXT_DIM).size(12.0));
+                    .color(theme::TEXT_DIM).font(font::caption()));
             }
             Selected::Timelapse { stem, video, thumb, started, ended } => {
                 ui.add(egui::Label::new(RichText::new(stem)
-                    .font(theme::bold(13.0))).wrap());
-                ui.add_space(4.0);
+                    .font(font::body_strong())).wrap());
+                ui.add_space(space::XS);
                 fact(ui, "PRINT", &format!("{} → {}", when_text(started),
                                            when_text(ended)));
                 match &video {
@@ -1902,8 +1905,8 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             }
             Selected::Recording(entry) => {
                 ui.add(egui::Label::new(RichText::new(&entry.name)
-                    .font(theme::bold(13.0))).wrap());
-                ui.add_space(4.0);
+                    .font(font::body_strong())).wrap());
+                ui.add_space(space::XS);
                 fact(ui, "SIZE", &human_bytes(entry.size));
                 fact(ui, "TIME", &when_text(entry.mtime));
                 clock_note(ui, view);
@@ -1912,8 +1915,8 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             }
             Selected::File(item) => {
                 ui.add(egui::Label::new(RichText::new(&item.remote.name)
-                    .font(theme::bold(13.0))).wrap());
-                ui.add_space(4.0);
+                    .font(font::body_strong())).wrap());
+                ui.add_space(space::XS);
                 fact(ui, "KIND", kind_label(item.kind));
                 fact(ui, "SIZE", &human_bytes(item.remote.size));
                 fact(ui, "TIME", &when_text(item.remote.mtime));
@@ -1929,15 +1932,15 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 } else if matches!(item.kind, FileKind::PlainGcode
                                    | FileKind::CacheGcode)
                 {
-                    ui.add_space(6.0);
+                    ui.add_space(space::S);
                     gcode_pane(ui, state, view, &item.remote, out);
                 }
                 file_actions(ui, state, view, &item.remote, false, out);
             }
             Selected::Entry(entry) => {
                 ui.add(egui::Label::new(RichText::new(&entry.name)
-                    .font(theme::bold(13.0))).wrap());
-                ui.add_space(4.0);
+                    .font(font::body_strong())).wrap());
+                ui.add_space(space::XS);
                 fact(ui, "PATH", &entry.path);
                 if !entry.is_dir {
                     fact(ui, "SIZE", &human_bytes(entry.size));
@@ -1958,7 +1961,7 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
 /// each with the time it will cost.
 fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                 remote: &RemoteEntry, playable: bool, out: &mut Outcome) {
-    ui.add_space(8.0);
+    ui.add_space(space::M);
     // The borrow ends here, so the buttons below can start a download. A
     // copy this session downloaded is the first answer; after it, a
     // complete key-matching copy already in the disk cache, so a file that
@@ -1970,7 +1973,8 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
     match &local {
         Some(path) => {
             if playable
-                && accent_button_response(ui, "Play", vec2(width, 30.0))
+                && accent_button_response(ui, "Play",
+                                          vec2(width, size::BUTTON_H))
                     .clicked()
             {
                 // the remote path decides the speed, not the cached name
@@ -1992,10 +1996,11 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
         None => {
             ui.label(RichText::new(format!(
                 "Download {}", download_eta(remote.size, state.rate_bps)))
-                .color(theme::TEXT_DIM).size(11.0));
+                .color(theme::TEXT_DIM).font(font::caption()));
             if playable
                 && accent_button_response(ui, "Download & play",
-                                          vec2(width, 30.0)).clicked()
+                                          vec2(width, size::BUTTON_H))
+                    .clicked()
                 && let Some(cmd) = state.download(
                     remote, Dest::Cache { open_after: true })
             {
@@ -2009,7 +2014,7 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
         }
     }
     if let Some((text, color)) = note_for(state, &remote.path, view.now) {
-        ui.label(RichText::new(text).color(color).size(11.0));
+        ui.label(RichText::new(text).color(color).font(font::caption()));
     }
 }
 
@@ -2022,7 +2027,7 @@ fn threemf_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         true => AUTO_PREVIEW_PRINTING,
         false => AUTO_PREVIEW_MAX,
     };
-    ui.add_space(6.0);
+    ui.add_space(space::S);
     let known = state.details.contains_key(&item.remote.path);
     if !known && item.remote.size <= cap {
         if let Some(cmd) = state.request_details(&item.remote,
@@ -2036,7 +2041,7 @@ fn threemf_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         ui.label(RichText::new(format!(
             "preview: {}  ·  {}", human_bytes(item.remote.size),
             download_eta(item.remote.size, state.rate_bps)))
-            .color(theme::TEXT_DIM).size(11.0));
+            .color(theme::TEXT_DIM).font(font::caption()));
         if ui.button("Load preview").clicked()
             && let Some(cmd) = state.request_details(&item.remote,
                                                      item.plate_hint)
@@ -2047,11 +2052,11 @@ fn threemf_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     match state.details.get(&item.remote.path).cloned() {
         Some(DetailState::Loading) => {
             ui.label(RichText::new("reading the 3mf…")
-                .color(theme::TEXT_DIM).size(11.0));
+                .color(theme::TEXT_DIM).font(font::caption()));
         }
         Some(DetailState::Failed(err)) => {
             ui.add(egui::Label::new(RichText::new(err.text(view.serial))
-                .color(theme::DANGER).size(11.0)).wrap());
+                .color(theme::DANGER).font(font::caption())).wrap());
             if ui.button("⟳ retry").clicked() {
                 state.forget_details(&item.remote.path);
             }
@@ -2085,7 +2090,7 @@ fn plate_picture(ui: &mut Ui, files: &mut FilesUi, path: &str,
         let scale = (ui.available_width() / size.x).min(1.0);
         ui.add(egui::Image::new((handle.id(), size))
             .fit_to_exact_size(size * scale)
-            .corner_radius(CornerRadius::same(8)));
+            .corner_radius(radius::MEDIA));
     }
 }
 
@@ -2128,7 +2133,7 @@ fn threemf_facts(ui: &mut Ui, three: &ThreeMf) {
     }
     for warning in &info.warnings {
         ui.add(egui::Label::new(RichText::new(warning)
-            .color(theme::WARN).size(11.0)).wrap());
+            .color(theme::WARN).font(font::caption())).wrap());
     }
 }
 
@@ -2146,11 +2151,11 @@ fn gcode_pane(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
         }
         Some(HeaderState::Loading) => {
             ui.label(RichText::new("reading the header…")
-                .color(theme::TEXT_DIM).size(11.0));
+                .color(theme::TEXT_DIM).font(font::caption()));
         }
         Some(HeaderState::Failed(err)) => {
             ui.add(egui::Label::new(RichText::new(err.text(view.serial))
-                .color(theme::DANGER).size(11.0)).wrap());
+                .color(theme::DANGER).font(font::caption())).wrap());
             if ui.button("⟳ retry").clicked() {
                 state.forget_header(&remote.path);
             }
@@ -2173,7 +2178,7 @@ fn gcode_pane(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
             if !header.complete {
                 ui.label(RichText::new(
                     "the header was cut short; this is what it carried")
-                    .color(theme::TEXT_DIM).size(10.5));
+                    .color(theme::TEXT_DIM).font(font::caption()));
             }
         }
     }
@@ -2182,8 +2187,9 @@ fn gcode_pane(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
 fn fact(ui: &mut Ui, label: &str, value: &str) {
     ui.horizontal_top(|ui| {
         ui.label(RichText::new(label).color(theme::TEXT_DIM)
-            .font(theme::bold(10.5)));
-        ui.add(egui::Label::new(RichText::new(value).size(12.0)).wrap());
+            .font(font::label()));
+        ui.add(egui::Label::new(RichText::new(value).font(font::caption()))
+            .wrap());
     });
 }
 
@@ -2192,8 +2198,8 @@ fn clock_note(ui: &mut Ui, view: &View<'_>) {
     if view.printing {
         note.push_str(", and it is printing");
     }
-    ui.add_space(6.0);
-    ui.label(RichText::new(note).color(theme::TEXT_DIM).size(10.5));
+    ui.add_space(space::S);
+    ui.label(RichText::new(note).color(theme::TEXT_DIM).font(font::caption()));
 }
 
 // --------------------------------------------------------------- helpers

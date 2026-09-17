@@ -1144,7 +1144,7 @@ impl MjpegPlayer {
 - A `FILES` card in the right column after MAINTENANCE: "7 timelapses · 27 files" from the cached listing, or "Timelapses · Recordings · Print files" when nothing is cached.
 - The printer chip shows `v 42%` while a download runs.
 
-**Layout:** a full-page view in the CentralPanel, not a Modal: a Modal blocks the printer chips, existing modals are only 300-430 px wide, and a nested `show_rows` inside the outer ScrollArea breaks virtualisation. Styling reuses `card_frame`, radius 14, `ACCENT`, `TEXT_DIM` 11-12 captions, `selectable_value` tabs and `accent_button`.
+**Layout:** a full-page view in the CentralPanel, not a Modal: a Modal blocks the printer chips, existing modals are only 320-440 px wide, and a nested `show_rows` inside the outer ScrollArea breaks virtualisation. Styling takes every value from the `theme` tokens (docs/gui-polish-guidelines.md, section 1): `theme::card_frame()`, radius 14, `ACCENT`, `TEXT_DIM` captions at 12 px (`font::caption`), `selectable_value` tabs and `accent_button`.
 
 ```
 +-----------------------------------------------------------------------------------+

@@ -4,14 +4,17 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, CornerRadius, RichText, Stroke};
+use egui::{Color32, RichText, Stroke};
 
 use crate::config::{self, PrinterCfg};
 use crate::files::JobBundle;
 use crate::firmware::is_newer;
 use crate::mqtt::PrinterClient;
-use crate::theme;
+use crate::theme::{self, font, pad, radius, size, space, stroke};
 use crate::ui::widgets;
+
+/// How long the "New firmware … available" toast stays up.
+const TOAST: Duration = Duration::from_millis(3500);
 
 pub enum Dialog {
     None,
@@ -34,12 +37,11 @@ fn modal(ctx: &egui::Context, id: &str, width: f32,
     let response = egui::Modal::new(egui::Id::new(id))
         .frame(egui::Frame::new()
             .fill(theme::BG)
-            .stroke(Stroke::new(1.0, theme::BORDER))
-            .corner_radius(CornerRadius::same(14))
-            .inner_margin(20))
+            .stroke(Stroke::new(stroke::HAIRLINE, theme::BORDER))
+            .corner_radius(radius::CARD)
+            .inner_margin(pad::MODAL))
         .show(ctx, |ui| {
             ui.set_width(width);
-            ui.spacing_mut().item_spacing.y = 10.0;
             close = add(ui);
         });
     close || response.should_close()
@@ -47,20 +49,21 @@ fn modal(ctx: &egui::Context, id: &str, width: f32,
 
 fn header(ui: &mut egui::Ui, text: &str) {
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new(text).font(theme::bold(16.5)));
+        ui.label(RichText::new(text).font(font::title()));
     });
-    ui.add_space(10.0);
+    ui.add_space(space::L);
 }
 
 fn wide_button(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(egui::Button::new(text)
-        .min_size(egui::vec2(ui.available_width(), 34.0)))
+        .min_size(egui::vec2(ui.available_width(), size::BUTTON_H)))
         .clicked()
 }
 
 pub(crate) fn accent_button(ui: &mut egui::Ui, text: &str) -> bool {
     accent_button_response(ui, text,
-                           egui::vec2(ui.available_width(), 34.0)).clicked()
+                           egui::vec2(ui.available_width(), size::BUTTON_H))
+        .clicked()
 }
 
 /// The same accent action at a given size, and with its response: the files
@@ -68,8 +71,8 @@ pub(crate) fn accent_button(ui: &mut egui::Ui, text: &str) -> bool {
 pub(crate) fn accent_button_response(ui: &mut egui::Ui, text: &str,
                                      min_size: egui::Vec2) -> egui::Response {
     let btn = egui::Button::new(
-        RichText::new(text).color(Color32::from_rgb(0x06, 0x13, 0x0a))
-            .font(theme::bold(13.5)))
+        RichText::new(text).color(theme::ON_ACCENT)
+            .font(font::button_strong()))
         .fill(theme::ACCENT)
         .min_size(min_size);
     ui.add(btn)
@@ -90,12 +93,12 @@ pub enum AddResult {
 pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                         -> (AddResult, bool) {
     let mut result = AddResult::None;
-    let close = modal(ctx, "add-printer", 340.0, |ui| {
+    let close = modal(ctx, "add-printer", size::MODAL_M, |ui| {
         let mut done = false;
         header(ui, if dlg.editing.is_some() { "Edit printer" }
                    else { "Add printer" });
         egui::Grid::new("printer-form").num_columns(2)
-            .spacing([12.0, 8.0]).show(ui, |ui| {
+            .spacing([space::L, space::M]).show(ui, |ui| {
                 ui.label("Name");
                 ui.text_edit_singleline(&mut dlg.draft.name);
                 ui.end_row();
@@ -109,14 +112,14 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
                 ui.text_edit_singleline(&mut dlg.draft.access_code);
                 ui.end_row();
             });
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
         ui.label(RichText::new(
             "Printer must be in LAN mode with Developer Mode ON.")
-            .color(theme::TEXT_DIM).size(11.0));
+            .color(theme::TEXT_DIM).font(font::caption()));
         if !dlg.error.is_empty() {
             ui.label(RichText::new(&dlg.error).color(theme::DANGER));
         }
-        ui.add_space(8.0);
+        ui.add_space(space::M);
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 done = true;
@@ -165,19 +168,20 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
          "The bed keeps the material adhered to the plate during the print.",
          &[0, 35, 45, 65, 80], 110)
     };
-    modal(ctx, "temp", 340.0, |ui| {
+    modal(ctx, "temp", size::MODAL_M, |ui| {
         let mut done = false;
         header(ui, title);
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut dlg.value)
-                .font(egui::FontId::proportional(22.0))
+                .font(font::metric())
                 .desired_width(ui.available_width() - 40.0)
                 .horizontal_align(egui::Align::Center));
             ui.label(RichText::new("°C").color(theme::TEXT_DIM));
         });
-        ui.add_space(4.0);
-        ui.label(RichText::new(desc).color(theme::TEXT_DIM).size(11.0));
-        ui.add_space(6.0);
+        ui.add_space(space::XS);
+        ui.label(RichText::new(desc).color(theme::TEXT_DIM)
+            .font(font::caption()));
+        ui.add_space(space::S);
         ui.horizontal(|ui| {
             for t in presets {
                 if ui.button(format!("{t}°C")).clicked() {
@@ -185,7 +189,7 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
                 }
             }
         });
-        ui.add_space(10.0);
+        ui.add_space(space::L);
         if accent_button(ui, "Set temperature") {
             match dlg.value.trim().replace(',', ".").parse::<f64>() {
                 Ok(temp) if (0.0..=max as f64).contains(&temp) => {
@@ -206,7 +210,7 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
 // ---------------------------------------------------------------- speed
 pub fn show_speed(ctx: &egui::Context, current: i64,
                   client: &PrinterClient) -> bool {
-    modal(ctx, "speed", 300.0, |ui| {
+    modal(ctx, "speed", size::MODAL_S, |ui| {
         let mut done = false;
         header(ui, "Print speed");
         for (level, name, pct) in [(4, "Ludicrous", "166%"),
@@ -215,22 +219,24 @@ pub fn show_speed(ctx: &egui::Context, current: i64,
                                    (1, "Silent", "50%")] {
             let text = format!("{name}  ({pct})");
             let text = if level == current {
-                RichText::new(text).color(theme::ACCENT).font(theme::bold(13.5))
+                RichText::new(text).color(theme::ACCENT)
+                    .font(font::button_strong())
             } else {
                 RichText::new(text)
             };
             if ui.add(egui::Button::new(text)
-                .min_size(egui::vec2(ui.available_width(), 40.0)))
+                .min_size(egui::vec2(ui.available_width(),
+                                     size::BUTTON_H_LARGE)))
                 .clicked()
             {
                 client.set_speed(level);
                 done = true;
             }
         }
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("Applies while printing.")
-                .color(theme::TEXT_DIM).size(11.0));
+                .color(theme::TEXT_DIM).font(font::caption()));
         });
         done
     })
@@ -240,7 +246,7 @@ pub fn show_speed(ctx: &egui::Context, current: i64,
 pub fn show_fans(ctx: &egui::Context,
                  state: &serde_json::Map<String, serde_json::Value>,
                  client: &PrinterClient) -> bool {
-    modal(ctx, "fans", 340.0, |ui| {
+    modal(ctx, "fans", size::MODAL_M, |ui| {
         header(ui, "Fans");
         let pct = |key: &str| -> Option<i64> {
             crate::ui::panel::s_i64(state, key).map(|v| v * 100 / 15)
@@ -253,13 +259,13 @@ pub fn show_fans(ctx: &egui::Context,
             let Some(value) = value else { continue };
             shown += 1;
             egui::Frame::new().fill(theme::CARD_HOVER)
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(10)
+                .corner_radius(radius::CONTROL)
+                .inner_margin(pad::CARD)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{label} ✤"))
-                            .font(theme::bold(13.5)));
+                            .font(font::body_strong()));
                         ui.with_layout(egui::Layout::right_to_left(
                             egui::Align::Center), |ui| {
                             let mut on = value > 0;
@@ -271,18 +277,20 @@ pub fn show_fans(ctx: &egui::Context,
                     });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{value}%"))
-                            .font(theme::bold(22.0)));
+                            .font(font::metric()));
                         ui.with_layout(egui::Layout::right_to_left(
                             egui::Align::Center), |ui| {
+                            let step = egui::vec2(size::STEP_BUTTON_W,
+                                                  size::BUTTON_H);
                             if ui.add(egui::Button::new("+")
-                                .min_size(egui::vec2(48.0, 34.0)))
+                                .min_size(step))
                                 .clicked()
                             {
                                 client.set_fan(
                                     index, (value + 10).min(100));
                             }
                             if ui.add(egui::Button::new("−")
-                                .min_size(egui::vec2(48.0, 34.0)))
+                                .min_size(step))
                                 .clicked()
                             {
                                 client.set_fan(index, (value - 10).max(0));
@@ -290,24 +298,24 @@ pub fn show_fans(ctx: &egui::Context,
                         });
                     });
                 });
-            ui.add_space(6.0);
+            ui.add_space(space::S);
         }
         if shown == 0 {
             ui.label("No fan telemetry from this printer.");
         }
-        ui.add_space(4.0);
+        ui.add_space(space::XS);
         wide_button(ui, "Close")
     })
 }
 
 // ----------------------------------------------------------------- move
 pub fn show_move(ctx: &egui::Context, client: &PrinterClient) -> bool {
-    modal(ctx, "move", 430.0, |ui| {
+    modal(ctx, "move", size::MODAL_L, |ui| {
         header(ui, "Movement");
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Toolhead").color(theme::TEXT_DIM)
-                    .font(theme::bold(12.0)));
+                    .font(font::label()));
                 if let Some(action) = widgets::jog_wheel(ui) {
                     match action {
                         widgets::JogAction::Home => client.home(),
@@ -317,21 +325,23 @@ pub fn show_move(ctx: &egui::Context, client: &PrinterClient) -> bool {
                     }
                 }
             });
-            ui.add_space(12.0);
+            ui.add_space(space::L);
             ui.vertical(|ui| {
                 ui.label(RichText::new("Bed (Z)").color(theme::TEXT_DIM)
-                    .font(theme::bold(12.0)));
+                    .font(font::label()));
                 for (label, dist) in [("⤒ 10", -10.0), ("⤒ 1", -1.0),
                                       ("⤓ 1", 1.0), ("⤓ 10", 10.0)] {
                     if ui.add(egui::Button::new(label)
-                        .min_size(egui::vec2(92.0, 40.0))).clicked()
+                        .min_size(egui::vec2(size::Z_BUTTON_W,
+                                             size::BUTTON_H_LARGE)))
+                        .clicked()
                     {
                         client.jog("Z", dist, 900);
                     }
                 }
             });
         });
-        ui.add_space(8.0);
+        ui.add_space(space::M);
         ui.horizontal(|ui| {
             if ui.button("Extrude 10 mm").clicked() {
                 client.extrude(10.0, 300);
@@ -340,12 +350,12 @@ pub fn show_move(ctx: &egui::Context, client: &PrinterClient) -> bool {
                 client.extrude(-10.0, 300);
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(space::S);
         ui.label(RichText::new(
             "Extruder needs a hot nozzle. Jog only while idle — the \
              wheel: inner ring 1 mm, outer 10 mm.")
-            .color(theme::TEXT_DIM).size(11.0));
-        ui.add_space(6.0);
+            .color(theme::TEXT_DIM).font(font::caption()));
+        ui.add_space(space::S);
         wide_button(ui, "Close")
     })
 }
@@ -369,7 +379,7 @@ impl InfoDlg {
             status: String::new(),
             status_color: theme::TEXT_DIM,
             toast_until: if update {
-                Some(Instant::now() + Duration::from_millis(3500))
+                Some(Instant::now() + TOAST)
             } else {
                 None
             },
@@ -407,8 +417,7 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
             dlg.status = "Update found".into();
             dlg.status_color = theme::WARN;
             dlg.toast_text = format!("New firmware {version} available");
-            dlg.toast_until =
-                Some(Instant::now() + Duration::from_millis(3500));
+            dlg.toast_until = Some(Instant::now() + TOAST);
             latest_update = Some(version);
         } else {
             dlg.status = "✓ Up to date".into();
@@ -417,7 +426,7 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
         }
     }
 
-    let close = modal(ctx, "info", 380.0, |ui| {
+    let close = modal(ctx, "info", size::MODAL_M, |ui| {
         header(ui, &view.cfg.name);
         let fw_current = if view.fw_current.is_empty() {
             "—".to_string()
@@ -425,7 +434,7 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
             view.fw_current.clone()
         };
         egui::Grid::new("info-grid").num_columns(2)
-            .spacing([24.0, 6.0]).show(ui, |ui| {
+            .spacing([space::XXL, space::S]).show(ui, |ui| {
                 let dim = |ui: &mut egui::Ui, t: &str| {
                     ui.label(RichText::new(t).color(theme::TEXT_DIM));
                 };
@@ -444,7 +453,7 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
                     if is_newer(&view.fw_latest, &view.fw_current) {
                         ui.label(RichText::new(format!(
                             "●  {} available", view.fw_latest))
-                            .color(theme::WARN).font(theme::bold(13.5)))
+                            .color(theme::WARN).font(font::body_strong()))
                             .on_hover_text(
                                 "Newer firmware released by Bambu Lab");
                     }
@@ -468,7 +477,8 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
                     }
                     if !dlg.status.is_empty() {
                         ui.label(RichText::new(&dlg.status)
-                            .color(dlg.status_color).font(theme::bold(13.5)));
+                            .color(dlg.status_color)
+                            .font(font::body_strong()));
                     }
                 });
                 ui.end_row();
@@ -486,13 +496,13 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
                 })
                 .collect();
             if !others.is_empty() {
-                ui.add_space(8.0);
+                ui.add_space(space::M);
                 ui.label(RichText::new("MODULES").color(theme::TEXT_DIM)
-                    .font(theme::bold(12.0)));
-                egui::ScrollArea::vertical().max_height(150.0)
+                    .font(font::label()));
+                egui::ScrollArea::vertical().max_height(size::MODULES_MAX_H)
                     .show(ui, |ui| {
                         egui::Grid::new("modules-grid").num_columns(2)
-                            .spacing([24.0, 4.0]).show(ui, |ui| {
+                            .spacing([space::XXL, space::XS]).show(ui, |ui| {
                                 for m in others {
                                     let name = m.get("name")
                                         .and_then(|v| v.as_str())
@@ -517,31 +527,31 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
             }
         }
 
-        ui.add_space(8.0);
+        ui.add_space(space::M);
         ui.label(RichText::new(
             "Firmware updates are not possible over LAN — use the \
              printer screen (cloud) or SD card package.")
-            .color(theme::TEXT_DIM).size(11.0));
-        ui.add_space(8.0);
+            .color(theme::TEXT_DIM).font(font::caption()));
+        ui.add_space(space::M);
 
         // toast bubble
         if let Some(until) = dlg.toast_until {
             if Instant::now() < until {
                 let rect = ui.min_rect();
-                let pos = egui::pos2(rect.center().x, rect.top() + 4.0);
+                let pos = egui::pos2(rect.center().x, rect.top() + space::XS);
                 egui::Area::new(egui::Id::new("fw-toast"))
                     .fixed_pos(pos)
                     .pivot(egui::Align2::CENTER_TOP)
                     .show(ctx, |ui| {
                         egui::Frame::new()
                             .fill(theme::WARN_BG)
-                            .stroke(Stroke::new(1.0, theme::WARN))
-                            .corner_radius(CornerRadius::same(12))
-                            .inner_margin(
-                                egui::Margin::symmetric(14, 8))
+                            .stroke(Stroke::new(stroke::HAIRLINE, theme::WARN))
+                            .corner_radius(radius::CONTROL)
+                            .inner_margin(pad::CHIP)
                             .show(ui, |ui| {
                                 ui.label(RichText::new(&dlg.toast_text)
-                                    .color(theme::WARN).font(theme::bold(13.5)));
+                                    .color(theme::WARN)
+                                    .font(font::body_strong()));
                             });
                     });
                 ctx.request_repaint_after(Duration::from_millis(200));
@@ -566,7 +576,7 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
                  client: &PrinterClient) -> bool {
     let locked: HashSet<i64> =
         bundle.skipped.union(live_skipped).copied().collect();
-    modal(ctx, "skip", 430.0, |ui| {
+    modal(ctx, "skip", size::MODAL_L, |ui| {
         let mut done = false;
         header(ui, "Skip objects");
         if !bundle.bboxes.is_empty() {
@@ -579,12 +589,13 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
                     dlg.selected.insert(id);
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(space::S);
         }
         ui.label(format!(
             "Objects on plate ({}) — click the map or the list",
             bundle.objects.len()));
-        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().max_height(size::SKIP_LIST_MAX_H)
+            .show(ui, |ui| {
             for (index, (id, label)) in bundle.objects.iter().enumerate() {
                 if locked.contains(id) {
                     ui.add_enabled(false, egui::Checkbox::new(
@@ -609,13 +620,13 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
         ui.label(RichText::new(format!("{} selected",
                                        dlg.selected.len()))
             .color(theme::TEXT_DIM));
-        ui.add_space(6.0);
+        ui.add_space(space::S);
 
         if dlg.confirm {
             ui.label(RichText::new(format!(
                 "Skip {} object(s)? Skipped objects cannot be resumed \
                  for this print.", dlg.selected.len()))
-                .color(theme::WARN).font(theme::bold(13.5)));
+                .color(theme::WARN).font(font::body_strong()));
             ui.horizontal(|ui| {
                 if ui.button("No").clicked() {
                     dlg.confirm = false;
@@ -649,39 +660,41 @@ pub fn show_skip(ctx: &egui::Context, dlg: &mut SkipDlg, bundle: &JobBundle,
 /// same style as Device information.
 pub fn show_hms(ctx: &egui::Context, printer_name: &str,
                 errors: &[(String, String)]) -> bool {
-    modal(ctx, "hms", 420.0, |ui| {
+    modal(ctx, "hms", size::MODAL_L, |ui| {
         header(ui, &format!("{printer_name} — printer errors"));
         if errors.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("No active errors ✓")
-                    .color(theme::ACCENT).font(theme::bold(14.0)));
+                    .color(theme::ACCENT).font(font::body_strong()));
             });
         }
-        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().max_height(size::HMS_LIST_MAX_H)
+            .show(ui, |ui| {
             for (code, intro) in errors {
                 egui::Frame::new()
                     .fill(theme::DANGER_BG)
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(10)
+                    .corner_radius(radius::CONTROL)
+                    .inner_margin(pad::CARD)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(code)
                             .color(theme::DANGER)
-                            .font(theme::bold(13.5)));
+                            .font(font::body_strong()));
                         if intro.is_empty() {
                             ui.label(RichText::new(
                                 "No description available for this code.")
-                                .color(theme::TEXT_DIM).size(12.0));
+                                .color(theme::TEXT_DIM)
+                                .font(font::caption()));
                         } else {
                             ui.add(egui::Label::new(
-                                RichText::new(intro).size(12.5))
+                                RichText::new(intro).font(font::body()))
                                 .wrap());
                         }
                     });
-                ui.add_space(6.0);
+                ui.add_space(space::S);
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(space::S);
         wide_button(ui, "Close")
     })
 }
@@ -728,13 +741,13 @@ impl MaintenanceDlg {
 pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
                         has_ams: bool,
                         client: &PrinterClient) -> bool {
-    modal(ctx, "maintenance", 400.0, |ui| {
+    modal(ctx, "maintenance", size::MODAL_L, |ui| {
         let mut done = false;
         header(ui, "Maintenance (screen menu)");
 
         // ---- calibration
         ui.label(RichText::new("CALIBRATION").color(theme::TEXT_DIM)
-            .font(theme::bold(12.0)));
+            .font(font::label()));
         ui.horizontal(|ui| {
             ui.checkbox(&mut dlg.cal_bed, "Bed leveling");
             ui.checkbox(&mut dlg.cal_vibration, "Vibration");
@@ -743,7 +756,7 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
         if dlg.cal_confirm {
             ui.label(RichText::new(
                 "The printer will move and heat. Clear the bed first!")
-                .color(theme::WARN).font(theme::bold(13.0)));
+                .color(theme::WARN).font(font::body_strong()));
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
                     dlg.cal_confirm = false;
@@ -767,7 +780,7 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
 
         // ---- filament
         ui.label(RichText::new("FILAMENT").color(theme::TEXT_DIM)
-            .font(theme::bold(12.0)));
+            .font(font::label()));
         ui.horizontal(|ui| {
             ui.label("Source:");
             ui.selectable_value(&mut dlg.fil_slot, None, "External");
@@ -795,7 +808,7 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
 
         // ---- nozzle
         ui.label(RichText::new("NOZZLE").color(theme::TEXT_DIM)
-            .font(theme::bold(12.0)));
+            .font(font::label()));
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("nozzle-type")
                 .selected_text(dlg.nozzle_type.replace('_', " "))
@@ -824,11 +837,11 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
         });
 
         if !dlg.status.is_empty() {
-            ui.add_space(4.0);
+            ui.add_space(space::XS);
             ui.label(RichText::new(&dlg.status)
-                .color(theme::ACCENT).font(theme::bold(12.5)));
+                .color(theme::ACCENT).font(font::body_strong()));
         }
-        ui.add_space(8.0);
+        ui.add_space(space::M);
         if wide_button(ui, "Close") {
             done = true;
         }
@@ -840,17 +853,17 @@ pub fn show_maintenance(ctx: &egui::Context, dlg: &mut MaintenanceDlg,
 pub fn show_confirm(ctx: &egui::Context, id: &str, text: &str,
                     yes_label: &str) -> (bool, bool) {
     let mut confirmed = false;
-    let close = modal(ctx, id, 320.0, |ui| {
+    let close = modal(ctx, id, size::MODAL_S, |ui| {
         let mut done = false;
-        ui.label(RichText::new(text).font(theme::bold(14.0)));
-        ui.add_space(10.0);
+        ui.label(RichText::new(text).font(font::body_strong()));
+        ui.add_space(space::L);
         ui.horizontal(|ui| {
             if ui.button("No").clicked() {
                 done = true;
             }
             let danger = egui::Button::new(
                 RichText::new(yes_label).color(theme::DANGER))
-                .stroke(Stroke::new(1.0, theme::DANGER));
+                .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER));
             if ui.add(danger).clicked() {
                 confirmed = true;
                 done = true;

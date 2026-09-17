@@ -3,17 +3,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use egui::{
-    Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind,
-    Ui, Vec2, pos2, vec2,
-};
+use egui::{Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
-use crate::theme;
+use crate::theme::{self, font, radius, size, stroke};
 
 /// iOS-style pill switch, green when on. Returns true when toggled.
 pub fn toggle_switch(ui: &mut Ui, on: &mut bool) -> bool {
     let (rect, mut response) =
-        ui.allocate_exact_size(vec2(46.0, 26.0), Sense::click());
+        ui.allocate_exact_size(size::TOGGLE, Sense::click());
     if response.clicked() {
         *on = !*on;
         response.mark_changed();
@@ -22,15 +19,18 @@ pub fn toggle_switch(ui: &mut Ui, on: &mut bool) -> bool {
     let track = if *on {
         theme::ACCENT
     } else {
-        Color32::from_rgb(0x3a, 0x40, 0x3d)
+        theme::TRACK_OFF
     };
-    painter.rect_filled(rect, CornerRadius::same(13), track);
+    painter.rect_filled(rect, radius::pill(rect.height()), track);
+    // the knob's centre sits half the track's height in from its end
+    let inset = rect.height() / 2.0;
     let x = if *on {
-        rect.right() - 13.0
+        rect.right() - inset
     } else {
-        rect.left() + 13.0
+        rect.left() + inset
     };
-    painter.circle_filled(pos2(x, rect.center().y), 11.0, Color32::WHITE);
+    painter.circle_filled(pos2(x, rect.center().y), size::TOGGLE_KNOB_R,
+                          theme::KNOB);
     response.changed()
 }
 
@@ -43,6 +43,12 @@ pub enum JogAction {
 const R_OUTER: f32 = 110.0;
 const R_INNER: f32 = 72.0;
 const R_HOME: f32 = 34.0;
+/// Where the axis letters sit, from the centre.
+const AXIS_LABEL_R: f32 = 102.0;
+/// The "+10" label, and "-10" mirrored through the centre.
+const TEN_LABEL: Vec2 = vec2(52.0, -70.0);
+/// The "+1" label, and "-1" mirrored through the centre.
+const ONE_LABEL: Vec2 = vec2(36.0, -39.0);
 
 fn jog_zone(center: Pos2, pos: Pos2) -> Option<JogAction> {
     let d = pos - center;
@@ -70,15 +76,13 @@ fn jog_zone(center: Pos2, pos: Pos2) -> Option<JogAction> {
 /// Circular XY pad: outer ring = 10 mm, inner = 1 mm, home center.
 pub fn jog_wheel(ui: &mut Ui) -> Option<JogAction> {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::splat(240.0), Sense::click());
+        ui.allocate_exact_size(Vec2::splat(size::JOG), Sense::click());
     let center = rect.center();
     let hover = response.hover_pos().and_then(|p| jog_zone(center, p));
     let painter = ui.painter();
 
-    painter.circle_filled(center, R_OUTER,
-                          Color32::from_rgb(0x1b, 0x1f, 0x1d));
-    painter.circle_filled(center, R_INNER,
-                          Color32::from_rgb(0x23, 0x28, 0x26));
+    painter.circle_filled(center, R_OUTER, theme::CARD);
+    painter.circle_filled(center, R_INNER, theme::CARD_HOVER);
 
     if let Some(JogAction::Jog(axis, dist)) = &hover {
         let start_deg: f32 = match (*axis, *dist > 0.0) {
@@ -114,33 +118,34 @@ pub fn jog_wheel(ui: &mut Ui) -> Option<JogAction> {
         let dir = vec2(rad.cos(), -rad.sin());
         painter.line_segment(
             [center + dir * R_HOME, center + dir * R_OUTER],
-            Stroke::new(3.0, theme::BG));
+            Stroke::new(stroke::HEAVY, theme::BG));
     }
 
-    painter.circle_filled(center, R_HOME,
-                          Color32::from_rgb(0x2c, 0x32, 0x2f));
+    painter.circle_filled(center, R_HOME, theme::HOVER_FILL);
 
     let dim = theme::TEXT_DIM;
-    let bold = FontId::proportional(14.0);
-    let small = FontId::proportional(11.0);
-    painter.text(center + vec2(0.0, -102.0), egui::Align2::CENTER_CENTER,
-                 "Y", bold.clone(), dim);
-    painter.text(center + vec2(0.0, 102.0), egui::Align2::CENTER_CENTER,
-                 "-Y", bold.clone(), dim);
-    painter.text(center + vec2(102.0, 0.0), egui::Align2::CENTER_CENTER,
-                 "X", bold.clone(), dim);
-    painter.text(center + vec2(-102.0, 0.0), egui::Align2::CENTER_CENTER,
-                 "-X", bold, dim);
-    painter.text(center + vec2(52.0, -70.0), egui::Align2::CENTER_CENTER,
-                 "+10", small.clone(), dim);
-    painter.text(center + vec2(36.0, -39.0), egui::Align2::CENTER_CENTER,
-                 "+1", small.clone(), dim);
-    painter.text(center + vec2(-36.0, 39.0), egui::Align2::CENTER_CENTER,
-                 "-1", small.clone(), dim);
-    painter.text(center + vec2(-52.0, 70.0), egui::Align2::CENTER_CENTER,
-                 "-10", small, dim);
+    let axis = font::body();
+    let step = font::caption();
+    let up = Vec2::Y * -AXIS_LABEL_R;
+    let right = Vec2::X * AXIS_LABEL_R;
+    painter.text(center + up, egui::Align2::CENTER_CENTER,
+                 "Y", axis.clone(), dim);
+    painter.text(center - up, egui::Align2::CENTER_CENTER,
+                 "-Y", axis.clone(), dim);
+    painter.text(center + right, egui::Align2::CENTER_CENTER,
+                 "X", axis.clone(), dim);
+    painter.text(center - right, egui::Align2::CENTER_CENTER,
+                 "-X", axis, dim);
+    painter.text(center + TEN_LABEL, egui::Align2::CENTER_CENTER,
+                 "+10", step.clone(), dim);
+    painter.text(center + ONE_LABEL, egui::Align2::CENTER_CENTER,
+                 "+1", step.clone(), dim);
+    painter.text(center - ONE_LABEL, egui::Align2::CENTER_CENTER,
+                 "-1", step.clone(), dim);
+    painter.text(center - TEN_LABEL, egui::Align2::CENTER_CENTER,
+                 "-10", step, dim);
     painter.text(center, egui::Align2::CENTER_CENTER, "⌂",
-                 FontId::proportional(20.0), theme::ACCENT);
+                 font::icon_large(), theme::ACCENT);
 
     if hover.is_some() {
         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
@@ -154,6 +159,13 @@ pub fn jog_wheel(ui: &mut Ui) -> Option<JogAction> {
 }
 
 // ----------------------------------------------------------- plate map
+
+/// The bed the boxes are measured on: 256 units, 1 mm on a 256 mm bed.
+const BED_UNITS: f32 = 256.0;
+/// The faint grid's step, in bed units.
+const GRID_UNITS: f32 = 32.0;
+/// A box smaller than this has no room for its number.
+const NUMBER_MIN: Vec2 = vec2(16.0, 12.0);
 /// Objects that have a box, with their position in the skip list (the map
 /// numbers them like the list), largest box first: a small object inside a
 /// bigger object's box is then drawn on top and gets the pointer.
@@ -174,18 +186,17 @@ fn boxed_objects<'a>(objects: &'a [(i64, String)],
 pub fn plate_map(ui: &mut Ui, objects: &[(i64, String)],
                  bboxes: &HashMap<i64, [f32; 4]>, locked: &HashSet<i64>,
                  selected: &HashSet<i64>) -> Option<i64> {
-    let size = 360.0;
+    let side = size::PLATE_MAP_MAX.min(ui.available_width());
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+        ui.allocate_exact_size(Vec2::splat(side), Sense::click());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(10),
-                        Color32::from_rgb(0x15, 0x18, 0x16));
+    painter.rect_filled(rect, radius::CONTROL, theme::PLATE_BG);
 
     let objs = boxed_objects(objects, bboxes);
     let bed = bboxes.values()
         .flat_map(|b| [b[2], b[3]])
-        .fold(256.0_f32, f32::max);
-    let scale = size / bed;
+        .fold(BED_UNITS, f32::max);
+    let scale = side / bed;
     let obj_rect = |bbox: &[f32; 4]| -> Rect {
         Rect::from_min_size(
             pos2(rect.left() + bbox[0] * scale,
@@ -194,15 +205,15 @@ pub fn plate_map(ui: &mut Ui, objects: &[(i64, String)],
     };
 
     // faint grid every 32 mm
-    let step = scale * 32.0;
-    let grid = Color32::from_rgba_unmultiplied(0x20, 0x24, 0x22, 0x60);
+    let step = scale * GRID_UNITS;
+    let grid = Stroke::new(stroke::HAIRLINE, theme::PLATE_GRID);
     let mut x = rect.left() + step;
     while x < rect.right() {
         painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())],
-                             Stroke::new(1.0, grid));
+                             grid);
         let y = rect.top() + (x - rect.left());
         painter.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)],
-                             Stroke::new(1.0, grid));
+                             grid);
         x += step;
     }
 
@@ -216,30 +227,28 @@ pub fn plate_map(ui: &mut Ui, objects: &[(i64, String)],
     let mut clicked = None;
     for &(index, (id, label)) in &objs {
         let r = obj_rect(&bboxes[id]);
-        let (fill, stroke) = if locked.contains(id) {
+        let (fill, outline) = if locked.contains(id) {
             (theme::DANGER.gamma_multiply(0.35),
-             Stroke::new(1.0, theme::DANGER))
+             Stroke::new(stroke::HAIRLINE, theme::DANGER))
         } else if selected.contains(id) {
             (theme::ACCENT,
-             Stroke::new(2.0, Color32::from_rgb(0x2c, 0xc9, 0x5a)))
+             Stroke::new(stroke::SELECTED, theme::ACCENT_BRIGHT))
         } else if hover_id == Some(*id) {
-            (Color32::from_rgb(0x3a, 0x40, 0x3d),
-             Stroke::new(2.0, Color32::from_rgb(0xe8, 0xeb, 0xe9)))
+            (theme::PLATE_OBJECT, Stroke::new(stroke::SELECTED, theme::TEXT))
         } else {
-            (Color32::from_rgb(0x3a, 0x40, 0x3d),
-             Stroke::new(1.0, theme::BORDER))
+            (theme::PLATE_OBJECT,
+             Stroke::new(stroke::HAIRLINE, theme::BORDER))
         };
-        painter.rect(r, CornerRadius::same(3), fill, stroke,
-                     StrokeKind::Inside);
-        if r.width() > 16.0 && r.height() > 12.0 {
+        painter.rect(r, radius::MARK, fill, outline, StrokeKind::Inside);
+        if r.width() > NUMBER_MIN.x && r.height() > NUMBER_MIN.y {
             let text_color = if selected.contains(id) {
-                Color32::from_rgb(0x06, 0x13, 0x0a)
+                theme::ON_ACCENT
             } else {
-                theme::TEXT_DIM
+                theme::TEXT
             };
             painter.text(r.center(), egui::Align2::CENTER_CENTER,
-                         format!("{}", index + 1),
-                         FontId::proportional(11.0), text_color);
+                         format!("{}", index + 1), font::caption(),
+                         text_color);
         }
         if hover_id == Some(*id) {
             response.clone().on_hover_text(label.clone());
