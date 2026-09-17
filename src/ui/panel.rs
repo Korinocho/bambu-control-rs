@@ -1,14 +1,11 @@
 //! Per-printer panel: camera + job card on the left, control cards +
 //! AMS on the right. Port of `ui/panel.py`.
 
-use egui::{
-    Color32, CornerRadius, FontId, RichText, Sense, Stroke, Ui,
-    vec2,
-};
+use egui::{RichText, Sense, Stroke, Ui, Vec2};
 use serde_json::{Map, Value};
 
 use crate::mqtt::speed_name;
-use crate::theme;
+use crate::theme::{self, font, pad, radius, size, space, stroke};
 
 pub const IDLE_STATES: &[&str] = &["IDLE", "FINISH", "FAILED", ""];
 
@@ -89,13 +86,7 @@ pub struct PanelView<'a> {
 
 pub(crate) fn card_frame(ui: &mut Ui, add: impl FnOnce(&mut Ui))
                          -> egui::Response {
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, theme::BORDER))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(egui::Margin::symmetric(14, 12))
-        .show(ui, |ui| add(ui))
-        .response
+    theme::card_frame().show(ui, |ui| add(ui)).response
 }
 
 fn clickable_card(ui: &mut Ui, title: &str, value: &str) -> bool {
@@ -103,14 +94,14 @@ fn clickable_card(ui: &mut Ui, title: &str, value: &str) -> bool {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(RichText::new(title).color(theme::TEXT_DIM)
-                .font(theme::bold(12.0)));
+                .font(font::label()));
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("›").size(16.0)
+                    ui.label(RichText::new("›").font(font::title())
                         .color(theme::TEXT_DIM).strong());
                 });
         });
-        ui.label(RichText::new(value).font(theme::bold(15.0)));
+        ui.label(RichText::new(value).font(font::title()));
     });
     let response = response.interact(Sense::click());
     if response.hovered() {
@@ -124,14 +115,14 @@ fn temp_card(ui: &mut Ui, title: &str, current: Option<f64>,
     let response = card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new(title).color(theme::TEXT_DIM)
-            .font(theme::bold(12.0)));
+            .font(font::label()));
         ui.horizontal(|ui| {
             let cur = current.map(|v| format!("{v:.0}"))
                 .unwrap_or_else(|| "--".into());
             let tgt = target.map(|v| format!("/ {v:.0}°C"))
                 .unwrap_or_else(|| "/ --°C".into());
-            ui.label(RichText::new(cur).font(theme::bold(26.0)));
-            ui.label(RichText::new(tgt).size(13.0)
+            ui.label(RichText::new(cur).font(font::metric()));
+            ui.label(RichText::new(tgt).font(font::caption())
                 .color(theme::TEXT_DIM));
         });
     });
@@ -156,7 +147,7 @@ fn has_rfid(tray: &Value) -> bool {
 fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
     card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = 3.0;
+        theme::tight_stack(ui);
         let ams_root = state.get("ams").cloned().unwrap_or(Value::Null);
         let units = ams_root.get("ams").and_then(|v| v.as_array())
             .cloned().unwrap_or_default();
@@ -167,7 +158,7 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("FILAMENT").color(theme::TEXT_DIM)
-                .font(theme::bold(12.0)));
+                .font(font::label()));
             if show_humidity {
                 let hums: Vec<String> = units.iter()
                     .map(|u| format!(
@@ -196,25 +187,26 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
                 let color = if color_hex.len() >= 6 {
                     let parse =
                         |i| u8::from_str_radix(&color_hex[i..i + 2], 16)
-                            .unwrap_or(0x44);
-                    Color32::from_rgb(parse(0), parse(2), parse(4))
+                            .unwrap_or(theme::SWATCH_UNKNOWN.r());
+                    theme::reported([parse(0), parse(2), parse(4)])
                 } else {
-                    Color32::from_rgb(0x44, 0x44, 0x44)
+                    theme::SWATCH_UNKNOWN
                 };
                 let (rect, _) = ui.allocate_exact_size(
-                    vec2(20.0, 20.0), Sense::hover());
+                    Vec2::splat(size::SWATCH), Sense::hover());
                 let ring = if active { theme::ACCENT } else { theme::BORDER };
-                ui.painter().circle(rect.center(), 9.0, color,
-                                    Stroke::new(1.5, ring));
-                ui.painter().circle_filled(rect.center(), 3.0, theme::CARD);
+                ui.painter().circle(rect.center(), size::SWATCH_RING_R, color,
+                                    Stroke::new(stroke::MEDIUM, ring));
+                ui.painter().circle_filled(rect.center(), size::SWATCH_HOLE_R,
+                                           theme::CARD);
                 let ftype = tray.get("tray_type")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .unwrap_or("empty");
                 let mut text = RichText::new(format!("{slot}   {ftype}"))
-                    .size(12.5);
+                    .font(font::body());
                 if active {
-                    text = text.color(theme::ACCENT).font(theme::bold(12.5));
+                    text = text.color(theme::ACCENT).font(font::body_strong());
                 }
                 ui.label(text);
                 let remain = tray.get("remain").and_then(|v| v.as_i64());
@@ -274,7 +266,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
     let paused = gcode_state == "PAUSE";
 
     ui.horizontal_top(|ui| {
-        let left_w = (ui.available_width() * 0.58).floor();
+        let left_w = (ui.available_width() * size::LEFT_COLUMN).floor();
         // ------------------------------------------------ left column
         ui.allocate_ui_with_layout(
             egui::vec2(left_w, 0.0),
@@ -282,11 +274,11 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             ui.set_width(left_w);
 
         // camera
-        let cam_h = (ui.available_width() * 9.0 / 16.0).min(420.0);
+        let cam_h = (ui.available_width() * 9.0 / 16.0)
+            .min(size::CAMERA_MAX_H);
         let (rect, _) = ui.allocate_exact_size(
-            vec2(ui.available_width(), cam_h), Sense::hover());
-        ui.painter().rect_filled(rect, CornerRadius::same(14),
-                                 Color32::BLACK);
+            Vec2::new(ui.available_width(), cam_h), Sense::hover());
+        ui.painter().rect_filled(rect, radius::CARD, theme::MEDIA_WELL);
         if let Some(tex) = view.cam_texture {
             let size = tex.size_vec2();
             let scale =
@@ -294,28 +286,29 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             let img_rect = egui::Rect::from_center_size(
                 rect.center(), size * scale);
             egui::Image::new((tex.id(), size))
-                .corner_radius(CornerRadius::same(10))
+                .corner_radius(radius::CARD)
                 .paint_at(ui, img_rect);
         } else {
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
                               &view.cam_status,
-                              FontId::proportional(13.0), theme::TEXT_DIM);
+                              font::body(), theme::TEXT_DIM);
         }
-        ui.add_space(10.0);
+        ui.add_space(space::M);
 
         // job card
         card_frame(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (thumb, _) = ui.allocate_exact_size(
-                    vec2(88.0, 88.0), Sense::hover());
+                    Vec2::splat(size::JOB_THUMB), Sense::hover());
                 ui.painter().rect_filled(
-                    thumb, CornerRadius::same(10), theme::CARD_HOVER);
+                    thumb, radius::MEDIA, theme::CARD_HOVER);
                 if let Some(tex) = view.plate_texture {
                     let size = tex.size_vec2();
                     let scale = (thumb.width() / size.x)
                         .min(thumb.height() / size.y);
                     egui::Image::new((tex.id(), size))
+                        .corner_radius(radius::MEDIA)
                         .paint_at(ui, egui::Rect::from_center_size(
                             thumb.center(), size * scale));
                 }
@@ -328,14 +321,15 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     };
                     ui.label(RichText::new(
                         if job.is_empty() { "—" } else { job })
-                        .font(theme::bold(13.0)));
+                        .font(font::body_strong()));
                     ui.horizontal(|ui| {
                         let display = if gcode_state.is_empty() {
                             "—"
                         } else {
                             &gcode_state
                         };
-                        ui.label(RichText::new(display).font(theme::bold(14.0))
+                        ui.label(RichText::new(display)
+                            .font(font::body_strong())
                             .color(theme::state_color(&gcode_state)));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -352,7 +346,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             let pct = s_i64(state, "mc_percent").unwrap_or(0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{pct}%"))
-                    .font(theme::bold(24.0)));
+                    .font(font::metric()));
                 let mins = s_i64(state, "mc_remaining_time").unwrap_or(0);
                 if mins > 0 {
                     ui.label(RichText::new(format!(
@@ -373,10 +367,10 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     });
             });
             let bar = egui::ProgressBar::new(pct as f32 / 100.0)
-                .desired_height(8.0)
+                .desired_height(size::PROGRESS_H)
                 .fill(theme::ACCENT);
             ui.add(bar);
-            ui.add_space(6.0);
+            ui.add_space(space::S);
 
             ui.horizontal(|ui| {
                 let can_act = running || paused;
@@ -393,7 +387,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     && p < 100
                 {
                     ui.label(RichText::new(format!("{p}%"))
-                        .color(theme::TEXT_DIM).size(10.0));
+                        .color(theme::TEXT_DIM).font(font::caption()));
                 }
                 let pause_label =
                     if paused { "▶ Resume" } else { "⏸ Pause" };
@@ -403,7 +397,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 }
                 let stop = egui::Button::new(
                     RichText::new("⏹ Stop").color(theme::DANGER))
-                    .stroke(Stroke::new(1.0, theme::DANGER));
+                    .stroke(Stroke::new(stroke::HAIRLINE, theme::DANGER));
                 if ui.add_enabled(can_act, stop).clicked() {
                     actions.push(PanelAction::AskStop);
                 }
@@ -416,7 +410,6 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             egui::vec2(ui.available_width(), 0.0),
             egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 6.0;
         {
             // HMS banner — looks the errors up in Bambu's public DB
             // and opens the matching wiki page on click
@@ -431,15 +424,15 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                     .collect();
                 let response = egui::Frame::new()
                     .fill(theme::DANGER_BG)
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(8)
+                    .corner_radius(radius::CONTROL)
+                    .inner_margin(pad::BANNER)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = 3.0;
+                        theme::tight_stack(ui);
                         ui.label(RichText::new(format!(
                             "⚠ {} printer error(s)", hms.len()))
                             .color(theme::DANGER)
-                            .font(theme::bold(14.0)));
+                            .font(font::body_strong()));
                         for ecode in &ecodes {
                             // description only; the code stays in the
                             // popup (fallback when no description)
@@ -448,7 +441,8 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                                     || crate::hms::dashed(ecode));
                             ui.add(egui::Label::new(
                                 RichText::new(line)
-                                    .color(theme::DANGER).size(12.0))
+                                    .color(theme::DANGER)
+                                    .font(font::caption()))
                                 .wrap());
                         }
                     })
@@ -461,21 +455,21 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 if response.clicked() {
                     actions.push(PanelAction::OpenHmsDialog);
                 }
-                ui.add_space(8.0);
+                ui.add_space(space::M);
             }
 
             // firmware banner
             if crate::firmware::is_newer(&view.fw_latest, &view.fw_current) {
                 let response = egui::Frame::new()
                     .fill(theme::WARN_BG)
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(8)
+                    .corner_radius(radius::CONTROL)
+                    .inner_margin(pad::BANNER)
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(format!(
                             "⬆ Firmware update available: {} → {}",
                             view.fw_current, view.fw_latest))
-                            .color(theme::WARN).font(theme::bold(14.0)));
+                            .color(theme::WARN).font(font::body_strong()));
                     })
                     .response.interact(Sense::click());
                 if response.hovered() {
@@ -486,12 +480,12 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 if response.clicked() {
                     actions.push(PanelAction::OpenInfo);
                 }
-                ui.add_space(8.0);
+                ui.add_space(space::M);
             }
 
             ui.label(RichText::new("DEVICE CONTROL").color(theme::TEXT_DIM)
-                .font(theme::bold(12.0)));
-            ui.add_space(4.0);
+                .font(font::label()));
+            ui.add_space(space::XS);
 
             ui.columns(2, |cards| {
                 if temp_card(&mut cards[0], "NOZZLE",
@@ -514,12 +508,12 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 card_frame(&mut cards[1], |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new("LIGHT").color(theme::TEXT_DIM)
-                        .font(theme::bold(12.0)));
+                        .font(font::label()));
                     ui.horizontal(|ui| {
                         let mut on = view.light_shown_on;
                         ui.label(RichText::new(
                             if on { "On" } else { "Off" })
-                            .font(theme::bold(15.0)));
+                            .font(font::title()));
                         ui.with_layout(egui::Layout::right_to_left(
                             egui::Align::Center), |ui| {
                             if super::widgets::toggle_switch(ui, &mut on) {

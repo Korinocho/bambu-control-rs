@@ -144,6 +144,130 @@ fn production_mqtt_sites_pass_the_port_constant() {
                 {literals} outside comments");
 }
 
+/// The literals docs/gui-polish-guidelines.md 1.11 keeps out of the UI code:
+/// every colour, font size, radius, margin, spacing, stroke and widget size
+/// is a `theme` token (T1, T2).
+const TOKEN_RULES: &[(&str, &str)] = &[
+    ("colour", r"Color32::from_(rgb|rgba_unmultiplied|rgba_premultiplied|gray|black_alpha|white_alpha)\("),
+    ("colour", r"Color32::(BLACK|WHITE)\b"),
+    ("font", r"\.size\(\s*[0-9]"),
+    ("font", r"FontId::(new|proportional|monospace)\("),
+    ("font", r"bold\(\s*[0-9]"),
+    ("radius", r"CornerRadius::same\(\s*[0-9]"),
+    ("radius", r"corner_radius\(\s*[0-9]"),
+    ("margin", r"Margin::(same|symmetric)\(\s*[0-9]"),
+    ("margin", r"inner_margin\(\s*[0-9]"),
+    ("spacing", r"add_space\(\s*[0-9]"),
+    ("spacing", r"item_spacing(\.[xy])?\s*="),
+    ("stroke", r"Stroke::new\(\s*[0-9]"),
+    ("size", r"vec2\(\s*[0-9.]+\s*,\s*[0-9]"),
+    ("size", r"desired_(width|height)\(\s*[0-9]"),
+    ("size", r"\.width\(\s*[0-9]"),
+    ("size", r"max_height\(\s*[0-9]"),
+];
+
+/// `src/ui/*.rs` and `src/main.rs`, each up to its unit-test module. The cut
+/// is `#[cfg(test)]` followed by `mod tests`, not the first `#[cfg(test)]`:
+/// main.rs declares the test-only `snapshots` module near its top.
+fn ui_production_sources() -> Vec<(PathBuf, String)> {
+    let ui = root().join("src").join("ui");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(ui)
+        .expect("readable src/ui")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "rs"))
+        .collect();
+    files.push(root().join("src").join("main.rs"));
+    files.sort();
+    files.into_iter()
+        .map(|file| {
+            let text = std::fs::read_to_string(&file).expect("utf-8 source");
+            let production = text.split("#[cfg(test)]\nmod tests")
+                .next().unwrap_or(&text).to_string();
+            (file, production)
+        })
+        .collect()
+}
+
+/// Every line matching a rule, skipping named consts and comments (1.11).
+fn token_hits(file: &Path, text: &str) -> Vec<String> {
+    let rules: Vec<(&str, regex_lite::Regex)> = TOKEN_RULES.iter()
+        .map(|(kind, pattern)| (*kind, regex_lite::Regex::new(pattern)
+            .expect("a valid pattern")))
+        .collect();
+    let mut found = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("const ") || trimmed.starts_with("pub const ")
+            || trimmed.starts_with("//")
+        {
+            continue;
+        }
+        for (kind, rule) in &rules {
+            if rule.is_match(line) {
+                found.push(format!("{}:{}: {kind}: {}", file.display(), i + 1,
+                                   line.trim()));
+            }
+        }
+    }
+    found
+}
+
+/// T2: the UI code takes every visual value from `theme` (1.11).
+#[test]
+fn ui_code_uses_theme_tokens_only() {
+    let sources = ui_production_sources();
+    // the scan read what it claims to: every UI file, with its code in it
+    for needle in ["main.rs", "panel.rs", "files_view.rs", "dialogs.rs",
+                   "widgets.rs"] {
+        let (_, text) = sources.iter()
+            .find(|(file, _)| file.ends_with(needle))
+            .unwrap_or_else(|| panic!("{needle} was not scanned"));
+        assert!(text.lines().count() > 100,
+                "{needle}: only {} lines scanned", text.lines().count());
+    }
+    let main = &sources.iter().find(|(f, _)| f.ends_with("main.rs"))
+        .expect("main.rs").1;
+    assert!(main.contains("fn chips_bar("), "main.rs was cut short");
+    let found: Vec<String> = sources.iter()
+        .flat_map(|(file, text)| token_hits(file, text))
+        .collect();
+    assert!(found.is_empty(), "literals outside theme.rs:\n{}",
+            found.join("\n"));
+}
+
+/// The control for the scan above: each rule finds the literal it names, and
+/// a named const or a comment is left alone.
+#[test]
+fn the_token_scan_finds_each_kind_of_literal() {
+    let sample = "\
+        let a = Color32::from_rgb(1, 2, 3);\n\
+        let b = Color32::WHITE;\n\
+        text.size(11.0);\n\
+        FontId::proportional(13.0);\n\
+        theme::bold(12.0);\n\
+        CornerRadius::same(10);\n\
+        frame.corner_radius(12);\n\
+        egui::Margin::symmetric(10, 4);\n\
+        frame.inner_margin(8);\n\
+        ui.add_space(6.0);\n\
+        ui.spacing_mut().item_spacing.y = 3.0;\n\
+        Stroke::new(1.0, theme::BORDER);\n\
+        egui::vec2(36.0, 30.0);\n\
+        edit.desired_width(180.0);\n\
+        combo.width(72.0);\n\
+        area.max_height(150.0);\n\
+        const NAMED: Vec2 = vec2(16.0, 12.0);\n\
+        // add_space(4.0) in prose\n\
+        ui.add_space(space::M);\n";
+    let found = token_hits(Path::new("sample.rs"), sample);
+    let lines: Vec<usize> = found.iter()
+        .map(|hit| hit.split(':').nth(1).expect("a line number").parse()
+            .expect("a number"))
+        .collect();
+    assert_eq!(lines, (1..=16).collect::<Vec<_>>(), "{found:#?}");
+}
+
 /// T24 (the CI grep, locally): no certificate checks disabled anywhere.
 ///
 /// Every path to a printer verifies now -- FTPS on 990, the camera on 6000
