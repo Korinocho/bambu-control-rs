@@ -14,14 +14,22 @@ publish = false
 [dependencies]
 eframe = "0.35.0"
 egui = "0.35.0"
-# native-tls is used ONLY by MQTT (rumqttc), until GitHub issue #1 moves it to
-# the printer certificate verifier. The camera stopped using it when issue #2
-# landed. Two sites remain, both in src/mqtt.rs: the #[cfg(test)] idle probe
-# and PrinterClient::start. FTPS does not use it; this is not a transition
-# step for FTPS. Issue #1 (option 2a, design doc 10.5) removes this line, and
-# tokio leaves the tree with it: tokio is here only under rumqttc.
-native-tls = "0.2.18"
-rumqttc = { version = "0.25.1", default-features = false, features = ["use-native-tls"] }
+# rumqttc is used ONLY as an MQTT packet codec (issue #1, option 2a, landed):
+# no TLS feature, so no TLS stack enters the tree, and native-tls left with 11
+# other crates when this changed. tokio DOES stay: rumqttc declares tokio,
+# tokio-stream and tokio-util as non-optional dependencies, so the async
+# runtime comes with the crate whatever the features -- an earlier version of
+# this comment claimed it would leave, and that was measured false. Its
+# `mqttbytes`
+# module is a plain `pub mod`, re-exported unconditionally (lib.rs:111, :141),
+# unlike every TLS item beside it, which is feature-gated. The connection loop
+# is ours and runs over AnchoredStream, so the printer certificate is verified
+# before CONNECT carries the access code (design doc 5.3).
+rumqttc = { version = "0.25.1", default-features = false }
+# bytes is a direct dependency because rumqttc does not re-export BytesMut
+# (mqttbytes/mod.rs re-exports only topic::*), and Packet::read/write take one.
+# It resolves to the 1.12.1 already in Cargo.lock: no new crate, no new version.
+bytes = "1"
 suppaftp = { version = "10.0.2", features = ["rustls-ring", "deprecated"] }
 # "tls12" is load-bearing: the printers negotiate only TLS 1.2. Without it no
 # printer handshake can succeed (design doc 5.3).

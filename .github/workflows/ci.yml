@@ -57,16 +57,19 @@ jobs:
             exit 1
           fi
 
-      # FTPS and the camera verify certificates; only MQTT still keeps the
-      # flags, until issue #1, and then this grep covers all of src
-      - name: No danger flags in verified code
+      # Every path to a printer verifies its certificate now: FTPS on 990,
+      # the camera on 6000 (issue #2) and MQTT on 8883 (issue #1). So this
+      # covers all of src, the end state 10.5 planned for when #1 landed.
+      # tests/source_rules.rs mirrors this list and must change with it: a
+      # mirror that has drifted passes for a file CI would fail on.
+      - name: No danger flags anywhere
         run: |
           set +e
-          git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src/tls.rs src/tls src/ftp.rs src/browser.rs src/files.rs src/camera.rs vendor/suppaftp/src
+          git grep -nE "danger_accept_invalid_(certs|hostnames)" -- src vendor/suppaftp/src
           rc=$?
           set -e
           if [ "$rc" -eq 0 ]; then
-            echo "::error::certificate checks disabled in FTPS or camera code (design doc 5.3)"
+            echo "::error::certificate checks disabled (design doc 5.3)"
             exit 1
           elif [ "$rc" -ne 1 ]; then
             echo "::error::git grep failed (exit $rc)"
