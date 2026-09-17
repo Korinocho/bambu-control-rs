@@ -676,7 +676,17 @@ fn transfer_row(ui: &mut Ui, view: &View<'_>, transfer: &TransferUi)
                 |ui| {
                     // the same button cancels a running transfer and
                     // dismisses a failed one
-                    if ui.button("✕").clicked() {
+                    // the same glyph cancels and dismisses, so its name
+                    // says which one it is here (A9, D39)
+                    let close = ui.button("✕");
+                    let what = match failed {
+                        true => "Dismiss",
+                        false => "Cancel the download of",
+                    };
+                    let name = format!("{what} {}", transfer.name());
+                    close.widget_info(|| egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button, true, &name));
+                    if close.clicked() {
                         asked = Some(match failed {
                             true => RowAction::Dismiss(transfer.id),
                             false => RowAction::Cancel(transfer.id),
@@ -690,10 +700,14 @@ fn transfer_row(ui: &mut Ui, view: &View<'_>, transfer: &TransferUi)
                             transfer.remote.clone(), transfer.dest));
                     }
                     if let Some(done) = transfer.fraction() {
-                        ui.add(egui::ProgressBar::new(done)
+                        let bar = ui.add(egui::ProgressBar::new(done)
                             .desired_width(size::TRANSFER_BAR_W)
                             .desired_height(size::PROGRESS_H)
                             .fill(theme::ACCENT));
+                        // how far along, not just that it is a bar (A10)
+                        crate::ui::panel::progress_value(
+                            &bar, f64::from(done) * 100.0,
+                            &format!("Downloading {}", transfer.name()));
                     }
                 });
         });
@@ -936,7 +950,11 @@ fn player_error_card(ui: &mut Ui, view: &View<'_>, note: &str,
                     |ui| {
                         // not a dead end: the card can be put away, and the
                         // file handed to the OS player (section 7, B)
-                        if ui.button("✕").clicked() {
+                        let close = ui.button("✕");
+                        close.widget_info(|| egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button, true,
+                            "Close this message"));
+                        if close.clicked() {
                             out.actions.push(Action::ClosePlayer);
                         }
                         if let Some(path) = path {
@@ -1135,10 +1153,20 @@ fn controls(ui: &mut Ui, files: &mut FilesUi, serial: &str) {
     // for them: a row wider than the page widens everything below it, and
     // the transfer bar's ✕ went past the right edge (A14)
     ui.horizontal_wrapped(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut files.filter)
+        let field = ui.add(egui::TextEdit::singleline(&mut files.filter)
             .id_salt(("files-filter", serial))
             .hint_text("filter…")
             .desired_width(size::FILTER_W));
+        // there is no label beside it to point at, so the field carries
+        // its own name for a screen reader; the hint stays the placeholder
+        // and nothing on screen changes (A15)
+        let typed = files.filter.clone();
+        field.widget_info(|| egui::WidgetInfo {
+            label: Some("Filter by name".to_owned()),
+            current_text_value: Some(typed.clone()),
+            hint_text: Some("filter…".to_owned()),
+            ..egui::WidgetInfo::new(egui::WidgetType::TextEdit)
+        });
         egui::ComboBox::from_id_salt(("files-sort", serial))
             .selected_text(format!("Sort: {}", files.sort.label()))
             .show_ui(ui, |ui| {
@@ -1834,7 +1862,7 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     // TILE_W wide whether or not it is selected (C10, E10). The tile is
     // itself the widget, so hover, pressed and focus land on it (C2, C10)
     let shown = widgets::clickable(
-        ui, ("tile", key.as_str()),
+        ui, ("tile", key.as_str()), &stem,
         widgets::Surface::card()
             .radius(radius::CARD)
             .padding(pad::TILE)
@@ -2035,7 +2063,7 @@ fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
         // the row is the widget: hover, pressed and focus land on it and
         // its selection is a ring over the same hairline (C2, C11, E24)
         widgets::clickable(
-            ui, ("row", entry.path.as_str()),
+            ui, ("row", entry.path.as_str()), &entry.name,
             widgets::Surface::card()
                 .radius(radius::CONTROL)
                 .padding(pad::ROW)
@@ -3285,6 +3313,115 @@ mod tests {
                             &view(P1S, Instant::now()));
         assert!(painted.has("listing /timelapse…"));
         assert!(!painted.has("No timelapses on this printer"));
+    }
+
+    /// A8: Tab walks the header in the order the eye reads it.
+    #[test]
+    fn tab_walks_the_header_in_its_visual_order() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let now = Instant::now();
+        let view = view(P1S, now);
+        // the first frame lays it out; then Tab from nothing focused
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &view);
+        let mut walked: Vec<(String, egui::Pos2)> = Vec::new();
+        for _ in 0..5 {
+            let painted = frame(&ctx, raw(vec![key(egui::Key::Tab)]),
+                                &mut state, &mut files, &view);
+            let Some(focused) = ctx.memory(|m| m.focused()) else { continue };
+            let Some(response) = ctx.read_response(focused) else { continue };
+            let name = painted.spots.iter()
+                .filter(|(_, at)| response.rect.contains(*at))
+                .map(|(text, _)| text.clone())
+                .next()
+                .unwrap_or_default();
+            walked.push((name, response.rect.min));
+        }
+        assert!(walked.len() >= 4, "Tab focused {} widgets", walked.len());
+        // the first four are the Back button and the three tabs, in the
+        // order they are painted, left to right on one line
+        // the counts come with the tab labels, so the names are matched
+        // by what they start with
+        let wanted = ["‹ Back", "Timelapses", "Recordings", "Print files"];
+        for (at, (name, _)) in walked.iter().take(4).enumerate() {
+            assert!(name.starts_with(wanted[at]),
+                    "{at}: {name:?} is not {:?} — {walked:?}", wanted[at]);
+        }
+        let tops: Vec<f32> = walked.iter().take(4)
+            .map(|(_, at)| at.y).collect();
+        // a selectable tab is one pixel taller than the Back button, so
+        // "one line" is a row height, not the same pixel
+        let row = Heights::of(&egui::Ui::new(
+            ctx.clone(), egui::Id::new("row-height"),
+            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                egui::Pos2::ZERO, vec2(100.0, 100.0))))).row;
+        assert!(tops.windows(2).all(|pair| (pair[0] - pair[1]).abs() < row),
+                "the header is not one line: {walked:?}");
+        let lefts: Vec<f32> = walked.iter().take(4)
+            .map(|(_, at)| at.x).collect();
+        assert!(lefts.windows(2).all(|pair| pair[0] < pair[1]),
+                "Tab does not walk left to right: {walked:?}");
+    }
+
+    /// A9, A10, D39: every node a screen reader can click has a name and a
+    /// role, and a progress bar says how far along it is.
+    #[test]
+    fn every_clickable_node_has_a_name_and_a_role() {
+        use egui::accesskit::{Action, Role};
+
+        let ctx = ctx();
+        ctx.enable_accesskit();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let video = state.timelapses[0].video.clone()
+            .expect("a timelapse with a video");
+        files.selected = Some(video.path.clone());
+        // a transfer running, so its bar and its row are in the tree
+        let id = match state.download(&video, Dest::SaveToPc) {
+            Some(Cmd::Download { id, .. }) => id,
+            other => panic!("no download: {other:?}"),
+        };
+        state.apply(Event::Progress { id, done: 1_000,
+                                      total: 4_000, bytes_per_s: 500.0 });
+        let now = Instant::now();
+        let view = view(P1S, now);
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &view);
+        let full = ctx.run_ui(raw(Vec::new()), |ui| {
+            show(ui, &mut state, &mut files, &view);
+        });
+        let update = full.platform_output.accesskit_update
+            .expect("an AccessKit tree");
+        let mut clickable = 0;
+        let mut bars = 0;
+        for (id, node) in &update.nodes {
+            if node.supports_action(Action::Click) {
+                clickable += 1;
+                // a Label carries its text in `value`, everything else in
+                // `label` (egui `fill_accesskit_node_from_widget_info`)
+                let name = node.label().or_else(|| node.value());
+                assert!(name.is_some_and(|name| !name.is_empty()),
+                        "a clickable node has no name: {id:?} {:?}",
+                        node.role());
+                assert_ne!(node.role(), Role::Unknown,
+                           "a clickable node has no role: {:?}",
+                           node.label());
+            }
+            if node.role() == Role::ProgressIndicator {
+                bars += 1;
+                assert!(node.numeric_value().is_some(),
+                        "a progress bar with no value: {:?}", node.label());
+            }
+        }
+        assert!(clickable >= 10, "only {clickable} clickable nodes");
+        assert!(bars >= 1, "no progress bar in the tree");
+        // the glyph buttons say what they do, not what they look like
+        let named: Vec<String> = update.nodes.iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        assert!(named.iter().any(|name|
+                    name.starts_with("Cancel the download of")),
+                "the ✕ of a running transfer is not named: {named:?}");
     }
 
     /// E31, D07, D08: work that runs on a thread says so on the control

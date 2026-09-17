@@ -21,7 +21,12 @@ pub fn slot(ui: &mut Ui, widest: &str, text: RichText, font: &FontId,
     };
     ui.allocate_ui_with_layout(vec2(width, height), layout, |ui| {
         ui.set_width(width);
-        ui.add(egui::Label::new(text.font(font.clone())).truncate());
+        // a slot with nothing in it is not content: an empty selectable
+        // label would be a nameless node a screen reader walks into (A9)
+        let empty = text.text().is_empty();
+        ui.add(egui::Label::new(text.font(font.clone()))
+            .selectable(!empty)
+            .truncate());
     }).response
 }
 
@@ -39,6 +44,10 @@ pub struct Surface {
     /// has none: its tone must not turn grey while the pointer is on it,
     /// so it shows the hover with the cursor and the focus ring alone.
     pub hover: Option<egui::Color32>,
+    /// whether this kind of surface can be selected at all: a row, a tile
+    /// and a chip can, a card and a banner cannot. It decides what the
+    /// surface tells a screen reader it is (A9).
+    pub selectable: bool,
     /// a selected surface keeps a ring, and (a row, not a tile) a fill
     pub selected: bool,
     pub selected_fill: bool,
@@ -55,6 +64,7 @@ impl Surface {
             fill: theme::CARD,
             stroke: Some(theme::BORDER),
             hover: Some(theme::CARD_HOVER),
+            selectable: false,
             selected: false,
             selected_fill: false,
             ring: theme::ACCENT,
@@ -70,6 +80,7 @@ impl Surface {
             fill: banner_colors(tone).1,
             stroke: None,
             hover: None,
+            selectable: false,
             selected: false,
             selected_fill: false,
             ring: theme::ACCENT,
@@ -86,8 +97,10 @@ impl Surface {
         self
     }
 
-    /// Selected: a ring, and for a row also the hover fill (C11).
+    /// Selected: a ring, and for a row also the hover fill (C11). A
+    /// surface that can be selected says so to a screen reader (A9).
     pub fn selected(mut self, selected: bool, fill: bool) -> Self {
+        self.selectable = true;
         self.selected = selected;
         self.selected_fill = fill;
         self
@@ -106,16 +119,19 @@ impl Surface {
 /// (E24). Hover, pressed and keyboard focus change only colours and painted
 /// rings, never a size (E10), and the cursor is set through the response.
 pub fn clickable<R>(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debug,
-                    surface: Surface, add: impl FnOnce(&mut Ui) -> R)
+                    name: &str, surface: Surface,
+                    add: impl FnOnce(&mut Ui) -> R)
                     -> egui::InnerResponse<R> {
-    clickable_sense(ui, id_salt, surface, Sense::click(), add)
+    clickable_sense(ui, id_salt, name, surface, Sense::click(), add)
 }
 
 /// The same surface with a sense of its own: a chip is dragged as well as
 /// clicked (C4), and nothing else needs more than a click.
+/// `name` is what the surface is called: a screen reader reads it, and a
+/// surface with a click and no name is a defect the A9 test fails on.
 pub fn clickable_sense<R>(ui: &mut Ui,
                           id_salt: impl std::hash::Hash + std::fmt::Debug,
-                          surface: Surface, sense: Sense,
+                          name: &str, surface: Surface, sense: Sense,
                           add: impl FnOnce(&mut Ui) -> R)
                           -> egui::InnerResponse<R> {
     let scope = ui.scope_builder(
@@ -161,6 +177,14 @@ pub fn clickable_sense<R>(ui: &mut Ui,
             }
             inner
         });
+    let enabled = scope.response.enabled();
+    scope.response.widget_info(|| match surface.selectable {
+        true => egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel, enabled, surface.selected,
+            name),
+        false => egui::WidgetInfo::labeled(egui::WidgetType::Button,
+                                           enabled, name),
+    });
     egui::InnerResponse::new(scope.inner, scope.response)
 }
 
@@ -221,13 +245,19 @@ pub fn fit(content: Vec2, bounds: Vec2) -> Vec2 {
 /// iOS-style pill switch, green when on. Returns true when toggled.
 /// `pending`: the command was sent and the printer has not agreed yet, so
 /// the knob sits where it was asked to and the track is half lit (C18).
-pub fn toggle_switch(ui: &mut Ui, on: &mut bool, pending: bool) -> bool {
+pub fn toggle_switch(ui: &mut Ui, label: &str, on: &mut bool,
+                     pending: bool) -> bool {
     let (rect, mut response) =
         ui.allocate_exact_size(size::TOGGLE, Sense::click());
     if response.clicked() {
         *on = !*on;
         response.mark_changed();
     }
+    // a painted switch is a checkbox to a screen reader, and it says
+    // which way it is (A9, A10)
+    let (enabled, shown) = (response.enabled(), *on);
+    response.widget_info(|| egui::WidgetInfo::selected(
+        egui::WidgetType::Checkbox, enabled, shown, label));
     let painter = ui.painter();
     let track = if *on {
         theme::ACCENT
@@ -367,6 +397,12 @@ pub fn jog_wheel(ui: &mut Ui) -> Option<JogAction> {
     if hover.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    // one painted wheel with zones inside it: a screen reader is told what
+    // the wheel is for, not one node per zone (A9)
+    let enabled = response.enabled();
+    response.widget_info(|| egui::WidgetInfo::labeled(
+        egui::WidgetType::Button, enabled,
+        "Move the toolhead: X, Y and home"));
     if response.clicked() {
         response.interact_pointer_pos()
             .and_then(|p| jog_zone(center, p))
@@ -480,6 +516,12 @@ pub fn plate_map(ui: &mut Ui, objects: &[(i64, String)],
             clicked = Some(id);
         }
     }
+    // the map is one widget with the objects painted in it (A9)
+    let enabled = response.enabled();
+    let count = objects.len();
+    response.widget_info(|| egui::WidgetInfo::labeled(
+        egui::WidgetType::Button, enabled,
+        format!("Plate map: {count} object(s); pick the ones to skip")));
     clicked
 }
 

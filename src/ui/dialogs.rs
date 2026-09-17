@@ -149,11 +149,14 @@ pub enum AddResult {
 /// One form field. A required one the Save refused is outlined in
 /// `DANGER`, so the error line's "required" names something the user can
 /// see (C16). The outline is a hairline painted inside, so nothing moves.
-fn form_field(ui: &mut egui::Ui, value: &mut String, salt: &str,
-              refused: bool) {
+fn form_field(ui: &mut egui::Ui, label: &str, value: &mut String,
+              salt: &str, refused: bool) {
     let empty = value.trim().is_empty();
+    // the label in the column beside it is this field's name (A15)
+    let named = ui.label(label);
     let response =
-        ui.add(egui::TextEdit::singleline(value).id_salt(salt));
+        ui.add(egui::TextEdit::singleline(value).id_salt(salt))
+            .labelled_by(named.id);
     if refused && empty {
         ui.painter().rect_stroke(
             response.rect, radius::CONTROL,
@@ -176,19 +179,16 @@ pub fn show_add_printer(ctx: &egui::Context, dlg: &mut AddPrinterDlg)
             let refused = !dlg.error.is_empty();
             egui::Grid::new("printer-form").num_columns(2)
                 .spacing([space::L, space::M]).show(ui, |ui| {
-                    ui.label("Name");
-                    form_field(ui, &mut dlg.draft.name, "printer-name",
-                               false);
+                    form_field(ui, "Name", &mut dlg.draft.name,
+                               "printer-name", false);
                     ui.end_row();
-                    ui.label("IP address");
-                    form_field(ui, &mut dlg.draft.ip, "printer-ip", refused);
+                    form_field(ui, "IP address", &mut dlg.draft.ip,
+                               "printer-ip", refused);
                     ui.end_row();
-                    ui.label("Serial");
-                    form_field(ui, &mut dlg.draft.serial, "printer-serial",
-                               refused);
+                    form_field(ui, "Serial", &mut dlg.draft.serial,
+                               "printer-serial", refused);
                     ui.end_row();
-                    ui.label("Access code");
-                    form_field(ui, &mut dlg.draft.access_code,
+                    form_field(ui, "Access code", &mut dlg.draft.access_code,
                                "printer-code", refused);
                     ui.end_row();
                 });
@@ -254,12 +254,15 @@ pub fn show_temp(ctx: &egui::Context, dlg: &mut TempDlg,
         let mut done = false;
         if part == Part::Body {
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut dlg.value)
+                let field = ui.add(egui::TextEdit::singleline(&mut dlg.value)
                     .id_salt("temperature")
                     .font(font::metric())
                     .desired_width(ui.available_width() - 40.0)
                     .horizontal_align(egui::Align::Center));
-                ui.label(RichText::new("°C").color(theme::TEXT_DIM));
+                // the unit beside the field names it (A15)
+                let unit = ui.label(RichText::new("°C")
+                    .color(theme::TEXT_DIM));
+                field.labelled_by(unit.id);
             });
             ui.add_space(space::XS);
             ui.label(RichText::new(desc).color(theme::TEXT_DIM)
@@ -362,7 +365,9 @@ pub fn show_fans(ctx: &egui::Context,
                         ui.with_layout(egui::Layout::right_to_left(
                             egui::Align::Center), |ui| {
                             let mut on = value > 0;
-                            if widgets::toggle_switch(ui, &mut on, false) {
+                            if widgets::toggle_switch(
+                                ui, &format!("{label} fan"), &mut on,
+                                false) {
                                 client.set_fan(
                                     index, if on { 100 } else { 0 });
                             }

@@ -117,6 +117,18 @@ fn card_title(ui: &mut Ui, title: &str, chevron: bool) {
             });
 }
 
+/// What a progress bar is at, in percent: egui gives its node a name and
+/// no value, so a screen reader would read a bar with no reading (A10).
+pub(crate) fn progress_value(bar: &egui::Response, percent: f64,
+                             label: &str) {
+    let enabled = bar.enabled();
+    bar.widget_info(|| egui::WidgetInfo {
+        value: Some(percent),
+        ..egui::WidgetInfo::labeled(egui::WidgetType::ProgressIndicator,
+                                    enabled, label)
+    });
+}
+
 /// A card's value row, `CONTROL_H` tall whatever it holds (C5).
 fn value_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     let width = ui.available_width();
@@ -137,7 +149,8 @@ fn clickable_card(ui: &mut Ui, title: &str, value: &str, dim: bool,
         false => theme::TEXT,
     };
     let card = |ui: &mut Ui| {
-        widgets::clickable(ui, title, widgets::Surface::card(), |ui| {
+        widgets::clickable(ui, title, &format!("{title}: {value}"),
+                           widgets::Surface::card(), |ui| {
             ui.set_width(ui.available_width());
             card_title(ui, title, true);
             value_row(ui, |ui| {
@@ -162,8 +175,13 @@ fn temp_card(ui: &mut Ui, title: &str, current: Option<f64>,
         true => theme::TEXT_DIM,
         false => theme::TEXT,
     };
-    let response = widgets::clickable(ui, title, widgets::Surface::card(),
-                                      |ui| {
+    let cur_text = current.map(|v| format!("{v:.0}"))
+        .unwrap_or_else(|| "—".into());
+    let tgt_text = target.map(|v| format!("{v:.0}"))
+        .unwrap_or_else(|| "—".into());
+    let name = format!("{title}: {cur_text} °C, target {tgt_text} °C");
+    let response = widgets::clickable(ui, title, &name,
+                                      widgets::Surface::card(), |ui| {
         ui.set_width(ui.available_width());
         card_title(ui, title, true);
         let metric = font::metric();
@@ -400,9 +418,13 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 ui.vertical(|ui| {
                     // nothing printing: the card says so, rather than
                     // showing a print stuck at zero (C8, D18)
-                    let name = match idle {
-                        true => "No print running",
-                        false => job,
+                    // a print whose name has not arrived yet reads "—",
+                    // like every other missing value: an empty line is
+                    // a nameless node to a screen reader (C6, A9)
+                    let name = match (idle, job.is_empty()) {
+                        (true, _) => "No print running",
+                        (false, true) => "—",
+                        (false, false) => job,
                     };
                     let name_color = match idle || dim {
                         true => theme::TEXT_DIM,
@@ -479,11 +501,15 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                         Sense::hover());
                 }
                 false => {
-                    ui.add(egui::ProgressBar::new(pct as f32 / 100.0)
+                    let bar = ui.add(egui::ProgressBar::new(
+                        pct as f32 / 100.0)
                         .desired_height(size::PROGRESS_H)
                         .fill(theme::ACCENT)
                         .text(RichText::new(format!("{pct}%"))
                             .font(font::caption())));
+                    // egui names a progress bar but never says how far
+                    // along it is (A10)
+                    progress_value(&bar, pct as f64, "Print progress");
                 }
             }
             ui.add_space(space::S);
@@ -553,7 +579,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                 // the banner is the widget, so hover, pressed and
                 // keyboard focus all land on it (C2, C3, E24)
                 let response = widgets::clickable(
-                    ui, "hms-banner",
+                    ui, "hms-banner", "Printer errors",
                     widgets::Surface::banner(widgets::Tone::Danger),
                     |ui| {
                         ui.set_width(ui.available_width());
@@ -581,7 +607,7 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             // firmware banner
             if crate::firmware::is_newer(&view.fw_latest, &view.fw_current) {
                 let response = widgets::clickable(
-                    ui, "firmware-banner",
+                    ui, "firmware-banner", "Firmware update available",
                     widgets::Surface::banner(widgets::Tone::Warn), |ui| {
                         ui.set_width(ui.available_width());
                         ui.add(egui::Label::new(RichText::new(format!(
@@ -642,8 +668,9 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                                 .font(font).color(color)).truncate());
                         },
                         |ui| {
-                            if widgets::toggle_switch(ui, &mut on,
-                                                      view.light_pending) {
+                            if widgets::toggle_switch(
+                                ui, "Chamber light", &mut on,
+                                view.light_pending) {
                                 actions.push(PanelAction::SetLight(on));
                             }
                         });
@@ -868,6 +895,79 @@ mod tests {
         state.insert("gcode_state".to_string(), json!("RUNNING"));
         state.insert("mc_percent".to_string(), json!(42));
         state
+    }
+
+    /// A9, A10, D39: the panel's own painted widgets carry a name and a
+    /// role, the light switch says which way it is, and the job bar says
+    /// how far along the print is.
+    #[test]
+    fn the_panels_painted_widgets_carry_their_semantics() {
+        use egui::accesskit::{Action, Role, Toggled};
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx);
+        ctx.enable_accesskit();
+        let state = printing();
+        let view = PanelView {
+            state: &state,
+            connected: (true, "online".to_string()),
+            cam_texture: None,
+            cam_status: "camera paused".to_string(),
+            plate_texture: None,
+            fetch_progress: None,
+            object_count: 3,
+            fw_current: "01.08.02.00".to_string(),
+            fw_latest: String::new(),
+            show_humidity: false,
+            model: "Bambu Lab A1".to_string(),
+            hms: &[],
+            light_shown_on: true,
+            light_pending: false,
+            light_unconfirmed: false,
+            files_summary: "Timelapses · Recordings · Print files"
+                .to_string(),
+        };
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO,
+                                                  Vec2::new(1200.0, 900.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |ui| { show(ui, &view); });
+        let full = ctx.run_ui(input(), |ui| { show(ui, &view); });
+        let update = full.platform_output.accesskit_update
+            .expect("an AccessKit tree");
+        let mut cards = 0;
+        let mut toggles = 0;
+        let mut bars = 0;
+        for (id, node) in &update.nodes {
+            if node.supports_action(Action::Click) {
+                let name = node.label().or_else(|| node.value());
+                assert!(name.is_some_and(|name| !name.is_empty()),
+                        "a clickable node has no name: {id:?} {:?}",
+                        node.role());
+                assert_ne!(node.role(), Role::Unknown,
+                           "a clickable node has no role: {:?}",
+                           node.label());
+            }
+            match node.role() {
+                Role::Button => cards += 1,
+                Role::CheckBox => {
+                    toggles += 1;
+                    assert_eq!(node.toggled(), Some(Toggled::True),
+                               "the light switch does not say it is on");
+                }
+                Role::ProgressIndicator => {
+                    bars += 1;
+                    assert_eq!(node.numeric_value(), Some(42.0),
+                               "the job bar has no reading");
+                }
+                _ => {}
+            }
+        }
+        assert!(cards >= 8, "only {cards} named buttons in the panel");
+        assert_eq!(toggles, 1, "the light switch is not a checkbox");
+        assert_eq!(bars, 1, "the job bar is not a progress indicator");
     }
 
     /// C2: a card is the widget, so a click anywhere on it opens what it

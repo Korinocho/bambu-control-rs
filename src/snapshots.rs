@@ -1202,6 +1202,40 @@ fn a_context_shot_twice_is_refused() {
     shoot(&ctx, [8, 8], 1.0, Vec::new(), draw);
 }
 
+/// A8: the tool buttons take the keyboard in the order they are painted,
+/// left to right. They sit at the right end of the bar, and laying them
+/// out right to left would walk them backwards.
+#[test]
+fn tab_walks_the_tool_buttons_left_to_right() {
+    let ctx = context(1.0);
+    let dir = TempDir::new("tab-order");
+    let mut app = app(&ctx, &PRINTERS, &dir);
+    let mut frame = eframe::Frame::_new_kittest();
+    let points = vec2(1080.0, 780.0);
+    let key = egui::Event::Key {
+        key: egui::Key::Tab, physical_key: None, pressed: true,
+        repeat: false, modifiers: egui::Modifiers::default(),
+    };
+    let mut walked: Vec<egui::Rect> = Vec::new();
+    for step in 0..12 {
+        let events = match step {
+            0 => Vec::new(),
+            _ => vec![key.clone()],
+        };
+        let _ = ctx.run_ui(raw_input(points, f64::from(step), events),
+                           |ui| app.ui(ui, &mut frame));
+        if let Some(id) = ctx.memory(|mem| mem.focused())
+            && let Some(response) = ctx.read_response(id)
+            && response.rect.size() == crate::theme::size::ICON_BUTTON
+        {
+            walked.push(response.rect);
+        }
+    }
+    assert_eq!(walked.len(), 3, "the three tool buttons: {walked:?}");
+    assert!(walked.windows(2).all(|pair| pair[0].min.x < pair[1].min.x),
+            "Tab walks the tools backwards: {walked:?}");
+}
+
 /// The control for the clash check in `shoot`: two widgets under one id
 /// fail the shot.
 #[test]
