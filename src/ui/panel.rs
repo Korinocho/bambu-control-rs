@@ -80,6 +80,10 @@ pub struct PanelView<'a> {
     pub show_humidity: bool,
     pub model: String,
     pub light_shown_on: bool,
+    /// the printer errors on screen, resolved by `PrinterUi::sync_hms`:
+    /// the lookup takes a lock per code and never runs while painting
+    /// (D38)
+    pub hms: &'a [String],
     /// the light command was sent and telemetry has not agreed yet (C18)
     pub light_pending: bool,
     /// the printer never confirmed the last light command (C18, D40)
@@ -198,10 +202,13 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
     card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
         theme::tight_stack(ui);
-        let ams_root = state.get("ams").cloned().unwrap_or(Value::Null);
-        let units = ams_root.get("ams").and_then(|v| v.as_array())
-            .cloned().unwrap_or_default();
-        let tray_now = ams_root.get("tray_now")
+        // the AMS subtree is read where it is: cloning it copied every
+        // unit and tray on every frame (E25, D35)
+        let ams_root = state.get("ams");
+        let units: &[Value] = ams_root.and_then(|root| root.get("ams"))
+            .and_then(|v| v.as_array())
+            .map_or(&[], Vec::as_slice);
+        let tray_now = ams_root.and_then(|root| root.get("tray_now"))
             .map(|v| v.as_str().map(|s| s.to_string())
                 .unwrap_or_else(|| v.to_string()))
             .unwrap_or_else(|| "255".into());
@@ -275,7 +282,7 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
             });
         };
 
-        for unit in &units {
+        for unit in units {
             let uid = unit.get("id").and_then(|v| v.as_i64())
                 .or_else(|| unit.get("id").and_then(|v| v.as_str())
                     .and_then(|s| s.parse().ok()))
@@ -285,16 +292,17 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
                 .and_then(|id| b'A'.checked_add(id))
                 .filter(u8::is_ascii_uppercase)
                 .map_or('?', char::from);
-            for tray in unit.get("tray").and_then(|v| v.as_array())
-                .cloned().unwrap_or_default()
-            {
+            let trays: &[Value] = unit.get("tray")
+                .and_then(|v| v.as_array())
+                .map_or(&[], Vec::as_slice);
+            for tray in trays {
                 let tid = tray.get("id").and_then(|v| v.as_i64())
                     .or_else(|| tray.get("id").and_then(|v| v.as_str())
                         .and_then(|s| s.parse().ok()))
                     .unwrap_or(0);
                 let global = uid.saturating_mul(4).saturating_add(tid);
                 slot_row(ui, format!("{letter}{}", tid.saturating_add(1)),
-                         &tray,
+                         tray,
                          tray_now == global.to_string());
                 shown = true;
             }
@@ -535,17 +543,13 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
             egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_width(ui.available_width());
         {
-            // HMS banner — looks the errors up in Bambu's public DB
-            // and opens the matching wiki page on click
-            let hms = state.get("hms").and_then(|v| v.as_array())
-                .cloned().unwrap_or_default();
+            // HMS banner — the lines are looked up in `sync_hms`, not
+            // here: the table takes a lock per code (D38). A click opens
+            // the matching wiki page.
+            let hms: &[Value] = state.get("hms")
+                .and_then(|v| v.as_array())
+                .map_or(&[], Vec::as_slice);
             if !hms.is_empty() {
-                crate::hms::ensure_loaded(ui.ctx());
-                let ecodes: Vec<String> = hms.iter().take(3)
-                    .map(|h| crate::hms::ecode(
-                        h.get("attr").and_then(|v| v.as_u64()).unwrap_or(0),
-                        h.get("code").and_then(|v| v.as_u64()).unwrap_or(0)))
-                    .collect();
                 // the banner is the widget, so hover, pressed and
                 // keyboard focus all land on it (C2, C3, E24)
                 let response = widgets::clickable(
@@ -558,14 +562,10 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
                             "⚠ {} printer error(s)", hms.len()))
                             .color(theme::DANGER)
                             .font(font::body_strong()));
-                        for ecode in &ecodes {
-                            // description only; the code stays in the
-                            // popup (fallback when no description)
-                            let line = crate::hms::lookup(ecode)
-                                .unwrap_or_else(
-                                    || crate::hms::dashed(ecode));
+                        // description only; the code stays in the popup
+                        for line in view.hms {
                             ui.add(egui::Label::new(
-                                RichText::new(line)
+                                RichText::new(line.as_str())
                                     .color(theme::DANGER)
                                     .font(font::caption()))
                                 .wrap());
@@ -754,6 +754,7 @@ mod tests {
             fw_latest: String::new(),
             show_humidity: false,
             model: "Bambu Lab A1".to_string(),
+            hms: &[],
             light_shown_on: true,
             light_pending: false,
             light_unconfirmed: false,

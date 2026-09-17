@@ -219,6 +219,12 @@ pub struct View<'a> {
     /// the disk cache's usage and cap, for the footer (5.6, section 6)
     pub cache_usage: u64,
     pub cache_cap: u64,
+    /// Clear cache is running on its thread (E31): the button says so and
+    /// takes no second click.
+    pub clearing: bool,
+    /// a file is being opened in the player on its thread, so the play
+    /// buttons say "Opening…" until it lands (E31, D07)
+    pub opening: bool,
     /// a complete, key-matching copy of a remote file already in the disk
     /// cache (5.6). Without it a file that is on disk from an earlier
     /// session is offered as "Download ~6 min"; `None` means the view has
@@ -299,6 +305,38 @@ pub struct FilesUi {
     /// the last frame painted and the height reserved for it. Only the
     /// tests read it (E17): a row is never resized from what it painted.
     row_mismatch: f32,
+    /// The row model and the key it was built for (E16). The key carries
+    /// everything `build_rows` reads: the state's revision, the tab, the
+    /// filter, the sort, the kind filter, the column count, the folders
+    /// the user opened and whether a damaged card is up. It is invalidated
+    /// by the key alone — nothing clears it by hand — so a listing that
+    /// lands, a letter typed or a window resized rebuilds it, and an
+    /// unchanged frame does not (E28).
+    rows: Option<(RowKey, Rows)>,
+    /// How many times the model was built, for the counter test of E27.
+    builds: u64,
+    /// What the detail pane shows, and the (revision, selected path) it
+    /// was found for. Finding it scans every listing and clones the entry,
+    /// so it is found once per key, not once per frame (E27, D37).
+    chosen: Option<((u64, Option<String>), Selected)>,
+    /// The size parts of the status line, and the revision they were
+    /// summed for: they add up every listing (E27, D37). The "updated N s
+    /// ago" part is not in here, because it changes every second.
+    sizes: Option<(u64, Vec<String>)>,
+}
+
+/// What the row model depends on (E16).
+#[derive(PartialEq)]
+struct RowKey {
+    revision: u64,
+    tab: Tab,
+    filter: String,
+    sort: Sort,
+    shown: Shown,
+    columns: usize,
+    /// the opened folders, order-independent: a set has no order
+    folders: u64,
+    damaged: bool,
 }
 
 const ROW_KINDS: usize = 7;
@@ -309,6 +347,13 @@ impl FilesUi {
         self.textures.clear();
         self.preview = None;
         self.close_focused = false;
+    }
+
+    /// How many times the row model was built. Only the E27 test reads it.
+    #[cfg_attr(not(test), allow(dead_code,
+        reason = "read by the stage 5 frame-cost test, not by the app"))]
+    pub fn row_builds(&self) -> u64 {
+        self.builds
     }
 
     /// Whether the refusal card's default button has the focus; the tests of
@@ -353,10 +398,11 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             widgets::banner(ui, widgets::Tone::Warn, None, &notice);
         });
     }
-    status_line(ui, state, view, &mut out);
-    if let Some(error) = state.error.clone() {
+    status_line(ui, state, files, view, &mut out);
+    // read where it is: the card only paints and reports (E26)
+    if let Some(error) = &state.error {
         ui.push_id("error-card", |ui| {
-            error_card(ui, &error, view.serial, &mut out);
+            error_card(ui, error, view.serial, &mut out);
         });
     }
     // "couldn't open the file": said here, where it happened, until Back
@@ -425,7 +471,25 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             ui.add_space(space::XS);
         });
     }
-    let rows = build_rows(state, files, columns, view.serial, damaged);
+    // the model is rebuilt only when its key changes: filtering, sorting
+    // and grouping the whole listing ran on every frame (E16, E27, D37)
+    let key = RowKey {
+        revision: state.revision(),
+        tab: files.tab,
+        filter: files.filter.clone(),
+        sort: files.sort,
+        shown: files.shown,
+        columns,
+        folders: folders_key(&files.open_folders),
+        damaged,
+    };
+    let rows = match files.rows.take() {
+        Some((built, rows)) if built == key => rows,
+        _ => {
+            files.builds += 1;
+            build_rows(state, files, columns, view.serial, damaged)
+        }
+    };
     // the transfer bar and the cache line sit below the grid, so the list
     // is given what is left rather than the whole height (section 6)
     let reserved = footer_height(ui, state, view);
@@ -448,6 +512,8 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             });
         });
     });
+    // kept for the next frame, with the key it was built for
+    files.rows = Some((key, rows));
     footer(ui, state, view, &mut out);
     out
 }
@@ -485,8 +551,11 @@ fn footer_rows(state: &BrowserState) -> Vec<&TransferUi> {
 /// measured rate, the ETA and a Cancel per transfer.
 fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
           out: &mut Outcome) {
-    let rows: Vec<TransferUi> = footer_rows(state).into_iter()
-        .cloned().collect();
+    // the rows are read where they are: cloning every transfer once a
+    // frame copied each one's whole RemoteEntry (E26, D37). What a row's
+    // buttons ask for is applied once the borrow is over.
+    let mut asked: Vec<RowAction> = Vec::new();
+    let rows = footer_rows(state);
     if !rows.is_empty() {
         // past three rows the bar scrolls instead of pushing Clear cache
         // and the ✕ of a failed row off the window (C13, D03)
@@ -502,10 +571,22 @@ fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                     // keyed by the transfer, so its ✕ and retry stay its
                     // own when a row above it goes away
                     ui.push_id(transfer.id, |ui| {
-                        transfer_row(ui, state, view, transfer, out);
+                        asked.extend(transfer_row(ui, view, transfer));
                     });
                 }
             });
+    }
+    for action in asked {
+        match action {
+            RowAction::Dismiss(id) => state.dismiss(id),
+            RowAction::Cancel(id) =>
+                out.cmds.push(state.cancel_transfer(id)),
+            RowAction::Retry(remote, dest) => {
+                if let Some(cmd) = state.download(&remote, dest) {
+                    out.cmds.push(cmd);
+                }
+            }
+        }
     }
     if view.cache_cap == 0 {
         return;
@@ -516,17 +597,36 @@ fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
             human_bytes(view.cache_cap)))
             .color(theme::TEXT_DIM).font(font::caption()));
         // it skips what the player has open (5.6)
-        if ui.button("Clear cache").clicked() {
+        let label = match view.clearing {
+            true => "Clearing…",
+            false => "Clear cache",
+        };
+        let running = view.clearing.then_some("Already clearing the cache");
+        if widgets::button(ui, egui::Button::new(label), running) {
             out.actions.push(Action::ClearCache);
         }
     });
 }
 
+/// What a transfer row's buttons asked for. The row borrows its transfer
+/// out of the state, so the state is changed after the loop (E26).
+enum RowAction {
+    Dismiss(u64),
+    Cancel(u64),
+    /// a failed transfer restarts from its own entry and destination
+    Retry(RemoteEntry, Dest),
+}
+
 /// One row of the transfer bar: its glyph, name and line, and on the right
 /// the bar, a retry when it failed, and ✕.
-fn transfer_row(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
-                transfer: &TransferUi, out: &mut Outcome) {
+fn transfer_row(ui: &mut Ui, view: &View<'_>, transfer: &TransferUi)
+                -> Option<RowAction> {
+    let mut asked = None;
     let failed = transfer.failure().is_some();
+    // "connecting N s" and "queued" count from the row's own start (E32)
+    if transfer.active() {
+        tick_seconds(ui.ctx(), transfer.started, view.now);
+    }
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(radius::CONTROL)
@@ -577,20 +677,17 @@ fn transfer_row(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                     // the same button cancels a running transfer and
                     // dismisses a failed one
                     if ui.button("✕").clicked() {
-                        match failed {
-                            true => state.dismiss(transfer.id),
-                            false => out.cmds.push(
-                                state.cancel_transfer(transfer.id)),
-                        }
+                        asked = Some(match failed {
+                            true => RowAction::Dismiss(transfer.id),
+                            false => RowAction::Cancel(transfer.id),
+                        });
                     }
                     // 5.10 pairs "download interrupted" with a Retry. It
                     // restarts at 0 — there is no resume (REST is 502) — and
                     // it keeps the destination the failed transfer had.
-                    if failed && ui.button("⟳ retry").clicked()
-                        && let Some(cmd) = state.download(
-                            &transfer.remote, transfer.dest)
-                    {
-                        out.cmds.push(cmd);
+                    if failed && ui.button("⟳ retry").clicked() {
+                        asked = Some(RowAction::Retry(
+                            transfer.remote.clone(), transfer.dest));
                     }
                     if let Some(done) = transfer.fraction() {
                         ui.add(egui::ProgressBar::new(done)
@@ -600,6 +697,7 @@ fn transfer_row(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                     }
                 });
         });
+    asked
 }
 
 /// One transfer's line: real bytes off the socket, the measured rate and
@@ -949,28 +1047,19 @@ fn header(ui: &mut Ui, state: &BrowserState, files: &mut FilesUi,
     });
 }
 
-fn status_line(ui: &mut Ui, state: &BrowserState, view: &View<'_>,
-               out: &mut Outcome) {
-    let mut parts: Vec<String> = Vec::new();
-    for name in SPACE_DIRS {
-        let dir = format!("/{name}");
-        if !matches!(state.dirs.get(&dir), Some(DirState::Ready { .. })) {
-            continue;
-        }
-        let bytes = state.used_bytes(&dir);
-        if bytes > 0 {
-            parts.push(format!("{name} {}", human_bytes(bytes)));
-        }
-    }
-    // the whole card, after the directories it contains: the parts of this
-    // line never count the same file twice
-    let total = state.total_bytes();
-    if total > 0 {
-        parts.push(format!("total {}", human_bytes(total)));
-    }
+fn status_line(ui: &mut Ui, state: &BrowserState, files: &mut FilesUi,
+               view: &View<'_>, out: &mut Outcome) {
+    // summed once per listing, not once per frame (E27, D37)
+    let sizes = match files.sizes.take() {
+        Some((revision, sizes)) if revision == state.revision() => sizes,
+        _ => size_parts(state),
+    };
+    let mut parts = sizes.clone();
+    files.sizes = Some((state.revision(), sizes));
     if let Some(at) = state.updated_at() {
         parts.push(format!("updated {} ago",
                            ago(view.now.saturating_duration_since(at))));
+        tick_seconds(ui.ctx(), at, view.now);
     }
     let summary = match parts.is_empty() {
         true => "no listing yet".to_string(),
@@ -978,6 +1067,12 @@ fn status_line(ui: &mut Ui, state: &BrowserState, view: &View<'_>,
     };
     // the line gate G4 reads (section 6)
     let mut session = format!("FTP session: {}", state.conn.label(view.now));
+    // it counts seconds while a session connects or sits idle (E32)
+    if let ConnState::Connecting { since }
+        | ConnState::Open { idle_since: Some(since) } = state.conn
+    {
+        tick_seconds(ui.ctx(), since, view.now);
+    }
     if view.open_sessions > 1 {
         session.push_str(&format!("  ({} open)", view.open_sessions));
     }
@@ -1168,6 +1263,16 @@ struct Rows {
     order: Vec<usize>,
     empty: Option<String>,
     loading: bool,
+}
+
+/// A hash of the opened folders that does not depend on their order.
+fn folders_key(folders: &HashSet<String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    folders.iter().fold(0_u64, |total, dir| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        dir.hash(&mut hasher);
+        total.wrapping_add(hasher.finish())
+    })
 }
 
 fn build_rows(state: &BrowserState, files: &FilesUi, columns: usize,
@@ -1877,6 +1982,11 @@ fn tile_texture(ctx: &egui::Context, state: &mut BrowserState,
     // every visible tile keeps its 500 ms timer running, but only one
     // request is in flight (section 4)
     let ready = files.visible.ready(&entry.path, view.now);
+    // the gate is a deadline, not a poll: the thumbnail of a tile that is
+    // still waiting depends on this repaint (E32)
+    if let Some(left) = files.visible.wait(&entry.path, view.now) {
+        ctx.request_repaint_after(left);
+    }
     if ready && *tile.may_request
         && let Some(cmd) = state.request_thumb(entry, THUMB_PX)
     {
@@ -2155,7 +2265,12 @@ fn may_reach_shell(view: &View<'_>, path: &Path) -> bool {
 
 fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                view: &View<'_>, height: f32, out: &mut Outcome) {
-    let picked = selection(state, files);
+    // found once per (revision, selection), not once per frame (E27)
+    let key = (state.revision(), files.selected.clone());
+    let picked = match files.chosen.take() {
+        Some((found, picked)) if found == key => picked,
+        _ => selection(state, files),
+    };
     // what does not fit the body scrolls inside the pane, actions included,
     // instead of pushing them and the footer off the window (C12, D01)
     let inner = (height - pad::CARD.sum().y - 2.0 * stroke::HAIRLINE)
@@ -2171,7 +2286,9 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         ui.label(RichText::new("DETAILS").color(theme::TEXT_DIM)
             .font(font::label()));
         ui.add_space(space::S);
-        match picked {
+        // by reference: the pane keeps the found selection for the next
+        // frame instead of taking it apart (E27)
+        match &picked {
             Selected::None => {
                 ui.label(RichText::new("Select a file to see its details.")
                     .color(theme::TEXT_DIM).font(font::caption()));
@@ -2179,7 +2296,7 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             // the pane says the file went, instead of falling back to
             // "Select a file" while it stays selected (C12, D21)
             Selected::Gone(path) => {
-                let name = path.rsplit('/').next().unwrap_or(&path);
+                let name = path.rsplit('/').next().unwrap_or(path);
                 ui.add(egui::Label::new(RichText::new(name)
                     .font(font::body_strong())).wrap());
                 ui.add_space(space::XS);
@@ -2187,26 +2304,27 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                     .color(theme::TEXT_DIM).font(font::caption()));
             }
             Selected::Timelapse { stem, video, thumb, started, ended } => {
-                ui.add(egui::Label::new(RichText::new(stem)
+                ui.add(egui::Label::new(RichText::new(stem.as_str())
                     .font(font::body_strong())).wrap());
                 ui.add_space(space::XS);
                 facts(ui, |ui| {
-                    fact(ui, "PRINT", &format!("{} → {}", when_text(started),
-                                               when_text(ended)));
-                    match &video {
+                    fact(ui, "PRINT", &format!("{} → {}",
+                                               when_text(*started),
+                                               when_text(*ended)));
+                    match video {
                         Some(video) => fact(ui, "VIDEO",
                             &format!("{}  ·  {}", human_bytes(video.size),
                                      extension(&video.name))),
                         None => fact(ui, "VIDEO",
                                      "deleted; only the thumbnail is left"),
                     }
-                    if let Some(thumb) = &thumb {
+                    if let Some(thumb) = thumb {
                         fact(ui, "THUMB", &human_bytes(thumb.size));
                     }
                 });
                 clock_note(ui, view);
                 // an orphan thumbnail has nothing to download (5.4)
-                if let Some(video) = &video {
+                if let Some(video) = video {
                     let playable = is_playable(&video.name);
                     file_actions(ui, state, view, video, playable, out);
                 }
@@ -2221,7 +2339,7 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 });
                 clock_note(ui, view);
                 let playable = is_playable(&entry.name);
-                file_actions(ui, state, view, &entry, playable, out);
+                file_actions(ui, state, view, entry, playable, out);
             }
             Selected::File(item) => {
                 ui.add(egui::Label::new(RichText::new(&item.remote.name)
@@ -2240,7 +2358,7 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 });
                 clock_note(ui, view);
                 if item.remote.name.to_ascii_lowercase().ends_with(".3mf") {
-                    threemf_pane(ui, state, files, view, &item, out);
+                    threemf_pane(ui, state, files, view, item, out);
                 } else if matches!(item.kind, FileKind::PlainGcode
                                    | FileKind::CacheGcode)
                 {
@@ -2263,12 +2381,14 @@ fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 clock_note(ui, view);
                 if !entry.is_dir && !entry.unreadable {
                     let playable = is_playable(&entry.name);
-                    file_actions(ui, state, view, &entry, playable, out);
+                    file_actions(ui, state, view, entry, playable, out);
                 }
             }
         }
             });
     });
+    // kept for the next frame, with the key it was found for
+    files.chosen = Some((key, picked));
 }
 
 /// The actions of section 6 for one remote file. A file already on disk
@@ -2290,12 +2410,17 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
     let busy = state.transfer_of(&remote.path)
         .is_some_and(TransferUi::active)
         .then_some("Already downloading");
+    // and a player still opening takes no second file (E31, D07)
+    let opening = view.opening.then_some("Opening the last file…");
+    if view.opening {
+        ui.label(RichText::new("Opening…").color(theme::TEXT_DIM)
+            .font(font::caption()));
+    }
     match &local {
         Some(path) => {
             if playable
-                && accent_button_response(ui, "Play",
-                                          vec2(width, size::BUTTON_H))
-                    .clicked()
+                && accent_button_reason(ui, "Play",
+                                        vec2(width, size::BUTTON_H), opening)
             {
                 // the remote path decides the speed, not the cached name
                 out.actions.push(Action::Play {
@@ -2319,7 +2444,8 @@ fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                 .color(theme::TEXT_DIM).font(font::caption()));
             if playable
                 && accent_button_reason(ui, "Download & play",
-                                        vec2(width, size::BUTTON_H), busy)
+                                        vec2(width, size::BUTTON_H),
+                                        busy.or(opening))
                 && let Some(cmd) = state.download(
                     remote, Dest::Cache { open_after: true })
             {
@@ -2368,7 +2494,11 @@ fn threemf_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             out.cmds.push(cmd);
         }
     }
-    match state.details.get(&item.remote.path).cloned() {
+    // the detail is read where it is: cloning it copied the decoded
+    // plate picture on every frame (E26, D36). The one change it can ask
+    // for waits until the borrow is over.
+    let mut forget = false;
+    match state.details.get(&item.remote.path) {
         Some(DetailState::Loading) => {
             ui.label(RichText::new("reading the 3mf…")
                 .color(theme::TEXT_DIM).font(font::caption()));
@@ -2376,15 +2506,16 @@ fn threemf_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         Some(DetailState::Failed(err)) => {
             ui.add(egui::Label::new(RichText::new(err.text(view.serial))
                 .color(theme::DANGER).font(font::caption())).wrap());
-            if ui.button("⟳ retry").clicked() {
-                state.forget_details(&item.remote.path);
-            }
+            forget = ui.button("⟳ retry").clicked();
         }
         Some(DetailState::Ready(three)) => {
-            plate_picture(ui, files, &item.remote.path, &three);
-            threemf_facts(ui, &three);
+            plate_picture(ui, files, &item.remote.path, three);
+            threemf_facts(ui, three);
         }
         None => {}
+    }
+    if forget {
+        state.forget_details(&item.remote.path);
     }
 }
 
@@ -2464,13 +2595,12 @@ fn threemf_fact_rows(ui: &mut Ui, three: &ThreeMf) {
 /// its own, so only the button starts it.
 fn gcode_pane(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
               remote: &RemoteEntry, out: &mut Outcome) {
-    match state.headers.get(&remote.path).cloned() {
+    // read where it is, and the two changes it can ask for wait until
+    // the borrow is over (E26)
+    let (mut read, mut forget) = (false, false);
+    match state.headers.get(&remote.path) {
         None => {
-            if ui.button("Read header (~2 s)").clicked()
-                && let Some(cmd) = state.request_header(remote)
-            {
-                out.cmds.push(cmd);
-            }
+            read = ui.button("Read header (~2 s)").clicked();
         }
         Some(HeaderState::Loading) => {
             ui.label(RichText::new("reading the header…")
@@ -2479,9 +2609,7 @@ fn gcode_pane(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
         Some(HeaderState::Failed(err)) => {
             ui.add(egui::Label::new(RichText::new(err.text(view.serial))
                 .color(theme::DANGER).font(font::caption())).wrap());
-            if ui.button("⟳ retry").clicked() {
-                state.forget_header(&remote.path);
-            }
+            forget = ui.button("⟳ retry").clicked();
         }
         Some(HeaderState::Ready(header)) => {
             facts(ui, |ui| {
@@ -2506,6 +2634,12 @@ fn gcode_pane(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
                     .color(theme::TEXT_DIM).font(font::caption()));
             }
         }
+    }
+    if read && let Some(cmd) = state.request_header(remote) {
+        out.cmds.push(cmd);
+    }
+    if forget {
+        state.forget_header(&remote.path);
     }
 }
 
@@ -2575,6 +2709,36 @@ fn human_bytes(bytes: u64) -> String {
         true => format!("{value:.1} {}", UNITS[unit]),
         false => format!("{value:.0} {}", UNITS[unit]),
     }
+}
+
+/// Asks for a repaint when a counter that reads whole seconds changes,
+/// instead of ten times a second (E32, D34). `since` is what the counter
+/// counts from, so the repaint lands on its own boundary.
+fn tick_seconds(ctx: &egui::Context, since: Instant, now: Instant) {
+    let elapsed = now.saturating_duration_since(since);
+    let into_second = Duration::from_nanos(u64::from(elapsed.subsec_nanos()));
+    ctx.request_repaint_after(Duration::from_secs(1) - into_second);
+}
+
+/// What the card and its directories hold, for the status line. The parts
+/// never count the same file twice.
+fn size_parts(state: &BrowserState) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for name in SPACE_DIRS {
+        let dir = format!("/{name}");
+        if !matches!(state.dirs.get(&dir), Some(DirState::Ready { .. })) {
+            continue;
+        }
+        let bytes = state.used_bytes(&dir);
+        if bytes > 0 {
+            parts.push(format!("{name} {}", human_bytes(bytes)));
+        }
+    }
+    let total = state.total_bytes();
+    if total > 0 {
+        parts.push(format!("total {}", human_bytes(total)));
+    }
+    parts
 }
 
 fn ago(elapsed: Duration) -> String {
@@ -2829,6 +2993,7 @@ mod tests {
         View { name: "P1S #1", serial, profile: Some(ServerProfile::BblP003),
                open_sessions: 0, printing: false, dialog_open: false, now,
                cache_usage: 0, cache_cap: 5 * 1024 * 1024 * 1024,
+               clearing: false, opening: false,
                cached: None, shell_openable: None,
                player: None, player_error: None, player_error_path: None,
                open_error: None }
@@ -3120,6 +3285,106 @@ mod tests {
                             &view(P1S, Instant::now()));
         assert!(painted.has("listing /timelapse…"));
         assert!(!painted.has("No timelapses on this printer"));
+    }
+
+    /// E31, D07, D08: work that runs on a thread says so on the control
+    /// that started it, and takes no second click.
+    #[test]
+    fn work_on_a_thread_says_so_where_it_started() {
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        files.selected = Some(
+            "/timelapse/video_2026-06-01_06-11-57.avi".to_string());
+        let now = Instant::now();
+        let with = |view: View<'_>, state: &mut BrowserState,
+                    files: &mut FilesUi| {
+            let ctx = ctx();
+            frame(&ctx, raw(Vec::new()), state, files, &view);
+            frame(&ctx, raw(Vec::new()), state, files, &view)
+        };
+        // the positive control: nothing is running, so nothing says it
+        let quiet = with(view(P1S, now), &mut state, &mut files);
+        assert!(quiet.exact("Clear cache"), "{:?}", quiet.spots);
+        assert!(!quiet.has("Clearing…"));
+        assert!(!quiet.has("Opening…"));
+        // Clear cache while its thread runs
+        let mut clearing = view(P1S, now);
+        clearing.clearing = true;
+        let painted = with(clearing, &mut state, &mut files);
+        assert!(painted.exact("Clearing…"), "{:?}", painted.spots);
+        assert!(!painted.has("Clear cache"));
+        // a player still opening
+        let mut opening = view(P1S, now);
+        opening.opening = true;
+        let painted = with(opening, &mut state, &mut files);
+        assert!(painted.exact("Opening…"), "{:?}", painted.spots);
+        // and the reason is on the button it would have started
+        let painted = {
+            let mut view = view(P1S, now);
+            view.opening = true;
+            hover(&mut state, &mut files, &view, "Download & play")
+        };
+        assert!(painted.has("Opening the last file…"),
+                "{:?}", painted.spots);
+    }
+
+    /// E32, D34: the view has no repaint rate of its own. What it asks for
+    /// is the counter's next second, or the gate a tile is waiting on.
+    #[test]
+    fn the_view_repaints_on_deadlines_not_on_a_timer() {
+        fn delay(ctx: &egui::Context, state: &mut BrowserState,
+                 files: &mut FilesUi, view: &View<'_>) -> Duration {
+            let full = ctx.run_ui(raw(Vec::new()), |ui| {
+                show(ui, state, files, view);
+            });
+            full.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+        }
+        // Print files: a listing is on screen, no transfer, no tile gate.
+        // The only counter is "updated N s ago", and the listing landed
+        // now, so the next second is a second away.
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Files);
+        let now = Instant::now();
+        delay(&ctx, &mut state, &mut files, &view(P1S, now));
+        let idle = delay(&ctx, &mut state, &mut files, &view(P1S, now));
+        assert!(idle >= Duration::from_millis(900) && idle.as_secs() <= 1,
+                "an idle list asked for {idle:?}");
+        // Timelapses: the tiles are waiting on their 500 ms gate, so the
+        // view asks for that, and no later — the thumbnails depend on it
+        let mut files = files_ui(Tab::Timelapses);
+        delay(&ctx, &mut state, &mut files, &view(P1S, now));
+        let waiting = delay(&ctx, &mut state, &mut files, &view(P1S, now));
+        assert!(waiting <= crate::browser::PREFETCH_VISIBLE,
+                "a waiting tile asked for {waiting:?}");
+        assert!(waiting > Duration::ZERO, "a busy loop");
+    }
+
+    /// E16, E27, D37: the row model is built once for a key and not again
+    /// on a frame that changed nothing.
+    #[test]
+    fn the_row_model_is_built_once_per_key() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let now = Instant::now();
+        for _ in 0..4 {
+            frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                  &view(P1S, now));
+        }
+        assert_eq!(files.row_builds(), 1, "four frames, one key");
+        // a letter typed into the filter is a new key
+        files.filter = "video".to_string();
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &view(P1S, now));
+        assert_eq!(files.row_builds(), 2);
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &view(P1S, now));
+        assert_eq!(files.row_builds(), 2, "the same filter twice");
+        // and so is anything the worker says
+        listed(&mut state, "/timelapse", &TIMELAPSE);
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &view(P1S, now));
+        assert_eq!(files.row_builds(), 3, "a listing that landed");
+        frame(&ctx, raw(Vec::new()), &mut state, &mut files, &view(P1S, now));
+        assert_eq!(files.row_builds(), 3);
     }
 
     /// C17, D30: what stands in for a listing has the shape of what

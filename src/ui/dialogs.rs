@@ -654,7 +654,10 @@ pub fn show_info(ctx: &egui::Context, dlg: &mut InfoDlg, view: &InfoView)
                                     .font(font::body_strong()));
                             });
                     });
-                ctx.request_repaint_after(Duration::from_millis(200));
+                // the toast goes when it expires: that is the deadline,
+                // not five frames a second (E32, D34)
+                ctx.request_repaint_after(
+                    until.saturating_duration_since(Instant::now()));
             } else {
                 dlg.toast_until = None;
             }
