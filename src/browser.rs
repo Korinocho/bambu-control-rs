@@ -5406,8 +5406,15 @@ mod tests {
     /// be far below printing values. Anything unknown is a refusal.
     #[cfg(test)]
     fn idle_from(probe: &crate::mqtt::StateProbe) -> Result<String, String> {
-        if !probe.connected {
-            return Err("the probe never reached the printer".into());
+        // The positive is required, and the outcome is what denies. Exactly
+        // one variant gets past here, so an outcome added later and not
+        // considered refuses rather than slipping through. Without a granted
+        // subscription, "no reports" is evidence about this client and says
+        // nothing whatever about the printer.
+        match &probe.outcome {
+            crate::mqtt::ProbeOutcome::Subscribed => {}
+            other => return Err(format!(
+                "the probe never held a granted subscription ({other:?})")),
         }
         if probe.reports == 0 {
             return Err("the printer sent no report at all".into());

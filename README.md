@@ -87,9 +87,12 @@ Each connection to the printer is treated separately.
   after the handshake carry the access code, so a certificate that is refused leaves them
   unsent, and the tests assert that nothing above the handshake ever reaches a printer
   whose certificate was refused.
-- **MQTT, port 8883:** **not verified yet.** It accepts any certificate, so the access
-  code is sent to whatever answers at the printer's address. Tracked as issue #1; until
-  it lands, treat MQTT as LAN-only.
+- **MQTT, port 8883:** verified, by the same embedded `BBL CA`, the same configured
+  serial and the same handshake signature check as the two above. The app runs the MQTT
+  connection itself over that verified stream, so the `CONNECT` packet carrying the
+  access code is written only to a printer whose certificate was accepted, and a
+  subscription is believed only once the printer acknowledges it for the identifier the
+  app sent.
 - The LAN access code is stored in plain text in `config.toml`.
 - Outbound connections: your printer on the LAN, plus Bambu Lab servers for HMS error
   descriptions and firmware version information.
