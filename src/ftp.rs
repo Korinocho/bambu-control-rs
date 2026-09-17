@@ -21,8 +21,9 @@
     reason = "the files view (stage 2, part 2) is the first caller"))]
 
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -50,6 +51,11 @@ pub const SMALL_RETR_MAX: u64 = 1024 * 1024;
 /// browse lane (5.4, interim). Above it the skip-objects dialog says the
 /// file is too big instead of growing the process until it aborts.
 pub const BUNDLE_RETR_MAX: u64 = 64 * 1024 * 1024;
+/// Bytes a transfer reads from the data connection at a time (design doc
+/// 5.2). Progress is the real count off the socket, never an estimate, so
+/// the chunk size is also how often the transfer lane can report and how
+/// often it can see a cancel.
+pub const TRANSFER_CHUNK: usize = 64 * 1024;
 
 type FtpsStream = ImplFtpStream<AnchoredStream>;
 
@@ -147,6 +153,9 @@ pub enum FtpError {
     TooLarge { size: u64, max: u64 },
     /// fewer bytes than the listed size
     Truncated { got: u64, want: u64 },
+    /// the free-space check before a download, or a write that failed
+    /// because the volume filled up (5.6)
+    DiskFull { need: u64, free: u64 },
     /// EOF, reset or a transport error on a verified connection
     SessionLost(String),
     /// any other reply, verbatim (without CRLF, capped)
@@ -162,6 +171,23 @@ pub enum FtpError {
 
 /// Longest reply text kept in `FtpError::Reply`.
 const REPLY_TEXT_MAX: usize = 160;
+
+/// A byte count as the Windows shell writes it (1024-based), for the
+/// disk-space message. One decimal below 10 of a unit, none above.
+fn bytes_text(n: u64) -> String {
+    const UNITS: [(&str, u64); 3] =
+        [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)];
+    for (unit, scale) in UNITS {
+        if n >= scale {
+            let whole = n / scale;
+            return match whole >= 10 {
+                true => format!("{whole} {unit}"),
+                false => format!("{:.1} {unit}", n as f64 / scale as f64),
+            };
+        }
+    }
+    format!("{n} B")
+}
 
 impl FtpError {
     /// The text the UI shows (design doc 5.10); `serial` only picks the
@@ -197,6 +223,9 @@ impl FtpError {
             Self::TooLarge { size, max } =>
                 format!("file too big to load here ({size} B, limit {max} B)"),
             Self::Truncated { .. } => "download interrupted".into(),
+            Self::DiskFull { need, free } =>
+                format!("not enough disk space: needs {}, {} free",
+                        bytes_text(*need), bytes_text(*free)),
             Self::SessionLost(what) => format!("FTP connection lost ({what})"),
             Self::Reply(reply) => format!("printer replied: {reply}"),
             Self::Local(what) => what.clone(),
@@ -423,7 +452,10 @@ pub struct Handshakes {
 }
 
 impl Handshakes {
-    fn of(conns: &SessionConns) -> Self {
+    /// The counts of one session's connections. Public because a session
+    /// that `retr_head` consumed cannot be asked itself (5.7): its caller
+    /// keeps the `SessionConns` and counts them after the call.
+    pub fn of(conns: &SessionConns) -> Self {
         let mut counts = Self::default();
         for record in conns.records() {
             let data = record.kind() == ConnKind::Data;
@@ -824,12 +856,134 @@ impl FtpSession {
         Ok(data)
     }
 
+    /// Streams a file to `out` in `TRANSFER_CHUNK` chunks: the transfer
+    /// lane's read (design doc 5.2). Returns the bytes written, which are
+    /// the bytes that came off the socket, so the caller's progress is
+    /// measured and never estimated.
+    ///
+    /// `cancel` is checked between chunks, and a cancel from another thread
+    /// also cancels the session (`SessionConns::cancel`), so a read already
+    /// waiting fails within 100 ms instead of holding the lane until the IO
+    /// timeout.
+    ///
+    /// The byte count is compared with `expected`, the SIZE taken before
+    /// the transfer: short is `Truncated` and the caller deletes its
+    /// `.part`. A file that grows past `expected` while it is read is cut
+    /// off like `retr_small` does, so bytes from the card can never decide
+    /// how much disk this download takes.
+    ///
+    /// Any Err but `NotFound` poisons the session: there is no resume, and
+    /// an early close kills the control connection anyway (3.1).
+    pub fn retr_to(&mut self, path: &str, expected: u64, out: &mut dyn Write,
+                   cancel: &AtomicBool, progress: &mut dyn FnMut(u64))
+                   -> Result<u64, FtpError> {
+        addressable(path)?;
+        let mark = self.conns.mark();
+        let mut stream = self.call(|ftp| ftp.retr_as_stream(path))?;
+        let mut done: u64 = 0;
+        let mut chunk = vec![0u8; TRANSFER_CHUNK];
+        let cancelled = |session: &Self| {
+            cancel.load(Ordering::SeqCst) || session.conns.is_cancelled()
+        };
+        loop {
+            if cancelled(self) {
+                // the early close kills the control connection (3.1), which
+                // is why a cancel discards the whole session (5.4)
+                drop(stream);
+                self.poisoned = true;
+                return Err(FtpError::Cancelled);
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) if done + n as u64 > expected => {
+                    drop(stream);
+                    self.poisoned = true;
+                    return Err(FtpError::TooLarge {
+                        size: done + n as u64, max: expected });
+                }
+                Ok(n) => {
+                    if let Err(e) = out.write_all(&chunk[..n]) {
+                        drop(stream);
+                        self.poisoned = true;
+                        return Err(local_write_failure(&e));
+                    }
+                    done += n as u64;
+                    progress(done);
+                }
+                Err(e) => {
+                    drop(stream);
+                    self.poisoned = true;
+                    return Err(classify(&self.conns, mark,
+                                        SuppaError::ConnectionError(e)));
+                }
+            }
+        }
+        self.call(|ftp| ftp.finalize_retr_stream(stream))?;
+        if done < expected {
+            self.poisoned = true;
+            return Err(FtpError::Truncated { got: done, want: expected });
+        }
+        if let Err(e) = out.flush() {
+            self.poisoned = true;
+            return Err(local_write_failure(&e));
+        }
+        Ok(done)
+    }
+
+    /// The first `max` bytes of a file, for the "Read header (~2 s)" action
+    /// (design doc 5.7). It closes the transfer early, which kills the
+    /// control connection (3.1), so it consumes the session by type: there
+    /// is no way to use one afterwards, and the next command reconnects.
+    pub fn retr_head(mut self, path: &str, max: usize)
+                     -> Result<Vec<u8>, FtpError> {
+        addressable(path)?;
+        let mark = self.conns.mark();
+        let mut stream = self.call(|ftp| ftp.retr_as_stream(path))?;
+        let mut data: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; TRANSFER_CHUNK.min(max.max(1))];
+        while data.len() < max {
+            if self.conns.is_cancelled() {
+                return Err(FtpError::Cancelled);
+            }
+            let want = (max - data.len()).min(chunk.len());
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) => break,
+                Ok(n) => data.extend_from_slice(&chunk[..n]),
+                Err(e) => {
+                    drop(stream);
+                    return Err(classify(&self.conns, mark,
+                                        SuppaError::ConnectionError(e)));
+                }
+            }
+        }
+        // no finalize and no QUIT: the session dies with this close, and
+        // `self` is dropped here so nothing can try to use it
+        drop(stream);
+        Ok(data)
+    }
+
     /// QUIT unless the session failed. Dropping it closes every connection
     /// without waiting for the server.
     pub fn quit(mut self) {
         if !self.poisoned {
             let _ = self.ftp.quit();
         }
+    }
+}
+
+/// A local file write that failed while a transfer ran. A full volume is
+/// named as such (5.10); anything else is reported as the local step it is.
+///
+/// The two figures are left at zero here on purpose: this stream knows
+/// neither the file it is writing nor the volume under it. The transfer
+/// lane fills them in from the SIZE it already has and a fresh probe of the
+/// destination (`browser::disk_full_figures`), so the card never reads
+/// "needs 0 B, 0 B free".
+fn local_write_failure(err: &io::Error) -> FtpError {
+    match err.kind() {
+        io::ErrorKind::StorageFull =>
+            FtpError::DiskFull { need: 0, free: 0 },
+        kind => FtpError::Local(format!("could not write the file ({kind})")),
     }
 }
 
@@ -1455,6 +1609,134 @@ mod tests {
                                         &mut |_| {}).unwrap();
         assert_eq!(data.len(), 200_000);
         session.quit();
+    }
+
+    /// 5.2: the transfer lane's read streams to a writer, and the progress
+    /// it reports is the byte count off the socket, not an estimate.
+    #[test]
+    fn retr_to_streams_real_bytes_and_reports_them() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let server = ftp_server(HOST, genuine(
+            vec![("big.avi".into(), body.clone())]));
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let mut out: Vec<u8> = Vec::new();
+        let mut seen: Vec<u64> = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let got = session.retr_to("/big.avi", body.len() as u64, &mut out,
+                                  &cancel, &mut |done| seen.push(done))
+            .expect("the transfer ran");
+
+        assert_eq!(got, body.len() as u64);
+        assert_eq!(out, body, "the file is the bytes the server sent");
+        assert!(!session.is_poisoned(), "a whole transfer keeps its session");
+        // every report is the running total, the last one is the whole file
+        assert_eq!(seen.last().copied(), Some(body.len() as u64));
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "{seen:?}");
+        assert!(seen.len() > 1, "progress was reported once, not per chunk");
+        session.quit();
+    }
+
+    /// 5.10: fewer bytes than SIZE is `Truncated`, and the session is not
+    /// reused — there is no resume, so the caller starts again at 0.
+    #[test]
+    fn retr_to_reports_a_short_transfer() {
+        let server = ftp_server(HOST, genuine(
+            vec![("short.avi".into(), vec![3u8; 1000])]));
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let mut out: Vec<u8> = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let failure = session.retr_to("/short.avi", 5000, &mut out, &cancel,
+                                      &mut |_| {});
+        assert_eq!(failure, Err(FtpError::Truncated { got: 1000,
+                                                      want: 5000 }));
+        assert!(session.is_poisoned());
+    }
+
+    /// A file that grew past its SIZE is cut off, so the bytes on the card
+    /// never decide how much disk the download takes (5.2).
+    #[test]
+    fn retr_to_stops_a_file_that_grew_past_its_size() {
+        let server = ftp_server(HOST, genuine(
+            vec![("grew.avi".into(), vec![4u8; 200_000])]));
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let mut out: Vec<u8> = Vec::new();
+        let cancel = AtomicBool::new(false);
+        let failure = session.retr_to("/grew.avi", 100_000, &mut out, &cancel,
+                                      &mut |_| {});
+        assert!(matches!(failure, Err(FtpError::TooLarge { size, max })
+                    if size > 100_000 && max == 100_000), "{failure:?}");
+        assert!(out.len() <= 100_000, "{} bytes were written", out.len());
+        assert!(session.is_poisoned(), "the early close killed the session");
+    }
+
+    /// Hard part 1 and 2 of stage 3: Cancel stops the transfer while it
+    /// runs, within a chunk, and the session is discarded rather than
+    /// reused (3.1: the early close kills the control connection).
+    #[test]
+    fn retr_to_is_cancelled_while_it_runs() {
+        let mut spec = genuine(vec![("slow.avi".into(), vec![5u8; 512 * 1024])]);
+        spec.data_mode = DataMode::Slow;
+        let server = ftp_server(HOST, spec);
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let mut session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        let mut out: Vec<u8> = Vec::new();
+        let started = Instant::now();
+        let failure = session.retr_to("/slow.avi", 512 * 1024, &mut out,
+                                      &cancel, &mut |_| {});
+        let elapsed = started.elapsed();
+        canceller.join().unwrap();
+
+        assert_eq!(failure, Err(FtpError::Cancelled));
+        // the whole file would take at least 8 pieces of SLOW_PIECE
+        assert!(elapsed < SLOW_PIECE * 8, "cancel waited {elapsed:?}");
+        assert!(!out.is_empty(), "the transfer had not started");
+        assert!(out.len() < 512 * 1024, "the whole file arrived anyway");
+        assert!(session.is_poisoned(),
+                "a cancelled session may never be reused");
+    }
+
+    /// 5.7: a head read closes the transfer early, which kills the control
+    /// connection (3.1), so it consumes the session by type. The next
+    /// command has to open a new one, which is what the type enforces.
+    #[test]
+    fn retr_head_reads_a_head_and_consumes_the_session() {
+        let header = b"; HEADER_BLOCK_START\n; total layer number: 46\n"
+            .to_vec();
+        let mut body = header.clone();
+        body.extend(vec![b'x'; 300_000]);
+        let server = ftp_server(HOST, genuine(
+            vec![("big.gcode".into(), body)]));
+        let tls = test_tls(TEST_CA, TEST_SERIAL);
+        let session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let started = Instant::now();
+        let head = session.retr_head("/big.gcode", 8 * 1024)
+            .expect("the head was read");
+        assert_eq!(head.len(), 8 * 1024, "it read exactly its cap");
+        assert!(head.starts_with(&header));
+        assert!(started.elapsed() < REFUSAL_BOUND, "{:?}", started.elapsed());
+        assert!(server.commands().iter().any(|command| command == "RETR"));
+
+        // a file shorter than the cap simply ends
+        let session = open(&tls, server.port, IO_TIMEOUT)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let all = session.retr_head("/big.gcode", 1024 * 1024)
+            .expect("the whole file");
+        assert_eq!(all.len(), 300_000 + header.len());
     }
 
     /// 3.1: PASV can name a host that is not the printer (an all-zero host
@@ -2128,6 +2410,7 @@ mod tests {
             FtpError::UnreadableName,
             FtpError::TooLarge { size: 2_000_000, max: SMALL_RETR_MAX },
             FtpError::Truncated { got: 1, want: 2 },
+            FtpError::DiskFull { need: 92 << 20, free: 40 << 20 },
             FtpError::SessionLost("unexpected end of file".into()),
             FtpError::Reply("500 size unavailable".into()),
             FtpError::Local("thumbnail could not be decoded".into()),

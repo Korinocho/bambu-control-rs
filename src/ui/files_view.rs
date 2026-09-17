@@ -8,16 +8,21 @@
 //! none: no dead buttons, no trust action, and never an endless spinner.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDateTime, NaiveTime};
 use egui::{Color32, CornerRadius, Modifiers, RichText, Sense, Stroke, Ui,
            vec2};
 
-use crate::browser::{BrowserState, Cmd, ConnState, DirState, FileItem,
-                     FileKind, RECORDINGS_DIR, ThumbState, VisibleSince};
+use crate::avi::AviIndex;
+use crate::browser::{BrowserState, Cmd, ConnState, Dest, DetailState,
+                     DirState, FileItem, FileKind, HeaderState,
+                     RECORDINGS_DIR, ThreeMf, ThumbState, TransferPhase,
+                     TransferUi, VisibleSince};
 use crate::config;
 use crate::ftp::{FtpError, RemoteEntry, ServerProfile};
+use crate::player::{self, PlayerCmd};
 use crate::theme;
 use crate::tls;
 use crate::ui::dialogs::accent_button_response;
@@ -34,6 +39,12 @@ const TEXTURE_CAP: usize = 150;
 const SPACE_DIRS: [&str; 4] = ["timelapse", "ipcam", "cache", "model"];
 /// How deep an "Other folder" may be opened, one level at a time (5.5).
 const FOLDER_DEPTH: usize = 4;
+/// A 3mf preview loads on its own only up to this (design doc 4). Anything
+/// larger shows "preview: 6.9 MB · ~35 s [Load]" and waits for the click,
+/// because it is a download and the user should decide to spend the time.
+const AUTO_PREVIEW_MAX: u64 = 1024 * 1024;
+/// The same while the printer is printing (design doc 4).
+const AUTO_PREVIEW_PRINTING: u64 = 256 * 1024;
 
 const TILE_W: f32 = 168.0;
 const TILE_IMAGE_H: f32 = 94.0;
@@ -45,6 +56,12 @@ const COMPANION_H: f32 = 26.0;
 const NOTE_H: f32 = 22.0;
 const HEADING_H: f32 = 24.0;
 const DETAIL_W: f32 = 268.0;
+/// The player's own controls row, under the picture: the play button, the
+/// seek slider, the clock and the speed selector, with the spacing around
+/// them. Everything below it — the transfer bar and the cache line — is
+/// reserved separately, so the picture never pushes them off the bottom
+/// (section 6).
+const PLAYER_CONTROLS_H: f32 = 68.0;
 
 /// The three tabs of section 6.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,7 +141,10 @@ impl Shown {
 
 /// What the view asks the app to do. Everything else it needs it asks the
 /// worker for directly, as `Outcome::cmds`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The player and the OS both live in `main.rs`: the view says what should
+/// happen and never opens a file or a window itself.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     /// leave the files view
     Back,
@@ -133,6 +153,20 @@ pub enum Action {
     Retry,
     /// the refusal card's "Edit printer"
     EditPrinter,
+    /// open this local file in the app's MJPEG player, at the speed its
+    /// kind starts on: 10x for an `/ipcam` recording (section 6, section 7)
+    Play { path: PathBuf, speed: f32 },
+    /// leave the player, back to the grid
+    ClosePlayer,
+    /// a player control: play, pause, seek or speed (5.8)
+    Player(PlayerCmd),
+    /// "Open in player": the OS player, always offered and the fallback
+    /// when the header sniff is not MJPEG (section 7, option B)
+    OpenExternally(PathBuf),
+    /// "Show in folder" (section 7, option B)
+    Reveal(PathBuf),
+    /// Clear cache; it skips files the player has open (5.6)
+    ClearCache,
 }
 
 #[derive(Default)]
@@ -155,6 +189,53 @@ pub struct View<'a> {
     /// takes the focus back nor answers Enter and Esc (section 6)
     pub dialog_open: bool,
     pub now: Instant,
+    /// the disk cache's usage and cap, for the footer (5.6, section 6)
+    pub cache_usage: u64,
+    pub cache_cap: u64,
+    /// a complete, key-matching copy of a remote file already in the disk
+    /// cache (5.6). Without it a file that is on disk from an earlier
+    /// session is offered as "Download ~6 min"; `None` means the view has
+    /// no cache to ask, which is what the tests use.
+    pub cached: Option<CachedCopy<'a>>,
+    /// whether a local file may be handed to the Windows shell (F2).
+    /// `None` offers no "Open in player" at all, which is the closed side
+    /// of the rule and what a test that does not care about it uses.
+    pub shell_openable: Option<ShellOpenable<'a>>,
+    /// the open player, which takes over the grid area (section 6)
+    pub player: Option<PlayerView<'a>>,
+    /// why the player could not open this file: "can't play this format in
+    /// the app" or "empty recording", with the OS player next to it (5.10)
+    pub player_error: Option<&'a str>,
+    /// the local file that error is about, so the fallback can still offer
+    /// "Open in player" and "Show in folder" for it (section 7)
+    pub player_error_path: Option<&'a Path>,
+}
+
+/// Where a remote file's complete copy is in the disk cache, if it is there
+/// at all (5.6). The view holds a lookup rather than the cache itself, so
+/// it stays testable without one.
+pub type CachedCopy<'a> = &'a dyn Fn(&RemoteEntry) -> Option<PathBuf>;
+
+/// Whether a local file may be handed to the Windows shell: its header and
+/// its extension must agree that it is media (`player::openable_by_shell`,
+/// stage 3 security review, F2). Like [`CachedCopy`], the view asks rather
+/// than looks, so it neither reads the disk while painting nor needs real
+/// files to be tested.
+pub type ShellOpenable<'a> = &'a dyn Fn(&Path) -> bool;
+
+/// The open player, as the view draws it (section 6, 5.8). `main.rs` owns
+/// the `MjpegPlayer` and its texture; this is the frame's worth of it.
+pub struct PlayerView<'a> {
+    pub title: &'a str,
+    pub texture: Option<&'a egui::TextureHandle>,
+    pub index: &'a AviIndex,
+    /// the frame it is on
+    pub pos: u32,
+    pub playing: bool,
+    pub speed: f32,
+    pub path: &'a Path,
+    /// frames that did not decode and were skipped (5.8)
+    pub skipped: u32,
 }
 
 struct Texture {
@@ -177,6 +258,9 @@ pub struct FilesUi {
     /// "Other folders" the user opened, one level at a time (5.5)
     open_folders: HashSet<String>,
     textures: HashMap<String, Texture>,
+    /// the plate picture of the 3mf in the detail pane, decoded once and
+    /// kept only while that file stays selected
+    preview: Option<(String, egui::TextureHandle)>,
     visible: VisibleSince,
     frame: u64,
     /// the refusal card's Close button holds the focus (section 6)
@@ -208,6 +292,7 @@ impl FilesUi {
     /// Leaving the view drops its textures (design doc 12).
     pub fn close(&mut self) {
         self.textures.clear();
+        self.preview = None;
         self.close_focused = false;
     }
 
@@ -257,6 +342,26 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     if let Some(error) = state.error.clone() {
         error_card(ui, &error, view.serial, &mut out);
     }
+    // the player takes over the grid area; Back returns to the grid
+    // (section 6)
+    if let Some(player) = &view.player {
+        ui.add_space(4.0);
+        // the transfer bar and the cache line sit below the picture here
+        // too, so the picture is given what is left of the height rather
+        // than a fixed margin: a transfer running while a video played used
+        // to push Clear cache and that transfer's ✕ off the bottom
+        let reserved = footer_height(state, view);
+        player_pane(ui, view, player, reserved, &mut out);
+        footer(ui, state, view, &mut out);
+        return out;
+    }
+    // the file could not be played here: the OS player is the way out
+    // (5.10, section 7 option B)
+    if let Some(note) = view.player_error {
+        ui.add_space(4.0);
+        player_error_card(ui, view, note, view.player_error_path,
+                          &mut out);
+    }
     ui.add_space(4.0);
     controls(ui, files);
     ui.add_space(6.0);
@@ -290,21 +395,392 @@ pub fn show(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
         ui.add_space(4.0);
     }
     let rows = build_rows(state, files, columns, view.serial, damaged);
-    ui.horizontal_top(|ui| {
-        ui.allocate_ui_with_layout(vec2(list_w, ui.available_height()),
-            egui::Layout::top_down(egui::Align::Min), |ui| {
-            ui.set_width(list_w);
-            // the list never eats the detail pane's width
-            ui.set_max_width(list_w);
-            list(ui, state, files, view, &rows, &mut out);
-        });
-        ui.allocate_ui_with_layout(vec2(ui.available_width(),
-                                        ui.available_height()),
-            egui::Layout::top_down(egui::Align::Min), |ui| {
-            detail_pane(ui, state, files, view);
+    // the transfer bar and the cache line sit below the grid, so the list
+    // is given what is left rather than the whole height (section 6)
+    let reserved = footer_height(state, view);
+    let body = (ui.available_height() - reserved).max(160.0);
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), body),
+        egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_height(body);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(vec2(list_w, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(list_w);
+                // the list never eats the detail pane's width
+                ui.set_max_width(list_w);
+                list(ui, state, files, view, &rows, &mut out);
+            });
+            ui.allocate_ui_with_layout(vec2(ui.available_width(),
+                                            ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min), |ui| {
+                detail_pane(ui, state, files, view, &mut out);
+            });
         });
     });
+    footer(ui, state, view, &mut out);
     out
+}
+
+// ------------------------------------------- transfers, cache and player
+
+/// Height the footer needs, so the grid above it is given the rest.
+fn footer_height(state: &BrowserState, view: &View<'_>) -> f32 {
+    let rows = footer_rows(state).len() as f32;
+    // the cache line, plus a row per transfer shown
+    let cache = match view.cache_cap > 0 {
+        true => 26.0,
+        false => 0.0,
+    };
+    cache + rows * 34.0 + 6.0
+}
+
+/// Transfers the bar shows: everything still running or waiting, and the
+/// ones that failed, which stay until the user dismisses them (section 6).
+fn footer_rows(state: &BrowserState) -> Vec<&TransferUi> {
+    state.transfers.iter()
+        .filter(|transfer| transfer.active() || transfer.failure().is_some())
+        .collect()
+}
+
+/// The transfer bar and the cache line of section 6: real progress, the
+/// measured rate, the ETA and a Cancel per transfer.
+fn footer(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
+          out: &mut Outcome) {
+    let rows: Vec<TransferUi> = footer_rows(state).into_iter()
+        .cloned().collect();
+    for transfer in &rows {
+        egui::Frame::new()
+            .fill(theme::CARD)
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(10, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let failed = transfer.failure().is_some();
+                    let icon = match failed {
+                        true => "⚠",
+                        false => "↓",
+                    };
+                    ui.label(RichText::new(icon)
+                        .color(match failed {
+                            true => theme::DANGER,
+                            false => theme::ACCENT,
+                        }).size(12.0));
+                    ui.add(egui::Label::new(RichText::new(transfer.name())
+                        .size(12.0)).truncate());
+                    ui.label(RichText::new(transfer_line(transfer, view))
+                        .color(match failed {
+                            true => theme::DANGER,
+                            false => theme::TEXT_DIM,
+                        }).size(11.0));
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            // the same button cancels a running transfer
+                            // and dismisses a failed one
+                            if ui.button("✕").clicked() {
+                                match failed {
+                                    true => state.dismiss(transfer.id),
+                                    false => out.cmds.push(
+                                        state.cancel_transfer(transfer.id)),
+                                }
+                            }
+                            // 5.10 pairs "download interrupted" with a
+                            // Retry. It restarts at 0 — there is no resume
+                            // (REST is 502) — and it keeps the destination
+                            // the failed transfer had.
+                            if failed && ui.button("⟳ retry").clicked()
+                                && let Some(cmd) = state.download(
+                                    &transfer.remote, transfer.dest)
+                            {
+                                out.cmds.push(cmd);
+                            }
+                            if let Some(done) = transfer.fraction() {
+                                ui.add(egui::ProgressBar::new(done)
+                                    .desired_width(160.0)
+                                    .desired_height(8.0)
+                                    .fill(theme::ACCENT));
+                            }
+                        });
+                });
+            });
+    }
+    if view.cache_cap == 0 {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!(
+            "cache {} / {}", human_bytes(view.cache_usage),
+            human_bytes(view.cache_cap)))
+            .color(theme::TEXT_DIM).size(11.0));
+        // it skips what the player has open (5.6)
+        if ui.button("Clear cache").clicked() {
+            out.actions.push(Action::ClearCache);
+        }
+    });
+}
+
+/// One transfer's line: real bytes off the socket, the measured rate and
+/// the ETA, or why it is waiting or failed (section 6, 5.10).
+fn transfer_line(transfer: &TransferUi, view: &View<'_>) -> String {
+    match &transfer.phase {
+        TransferPhase::Starting => connecting_text(transfer, view.now),
+        TransferPhase::Queued(reason) => reason.clone(),
+        TransferPhase::Running { done, total, bytes_per_s } => {
+            let mut line = format!("{} / {}", human_bytes(*done),
+                                   human_bytes(*total));
+            if *bytes_per_s > 1.0 {
+                line.push_str(&format!("  ·  {}/s",
+                                       human_bytes(*bytes_per_s as u64)));
+            }
+            if let Some(left) = transfer.eta_s() {
+                line.push_str(&format!("  ·  {} left", duration_text(left)));
+            }
+            line
+        }
+        TransferPhase::Done(Ok(done)) => match done.from_cache {
+            true => "already downloaded".to_string(),
+            false => format!("{} done", human_bytes(done.bytes)),
+        },
+        TransferPhase::Done(Err(err)) => err.text(view.serial),
+    }
+}
+
+/// "connecting 3 s": section 6 asks for the seconds elapsed, and this phase
+/// is ~0.9 s normally but also covers a stalled handshake and the one retry
+/// behind it, which is when the counter is the whole point.
+fn connecting_text(transfer: &TransferUi, now: Instant) -> String {
+    format!("connecting {} s",
+            now.saturating_duration_since(transfer.started).as_secs())
+}
+
+/// What a tile says while its file is transferring (section 6): waiting,
+/// queued with its reason, a percentage, done, or a short failure.
+fn transfer_note(transfer: &TransferUi, now: Instant)
+                 -> Option<(String, Color32)> {
+    match &transfer.phase {
+        TransferPhase::Starting =>
+            Some((connecting_text(transfer, now), theme::TEXT_DIM)),
+        TransferPhase::Queued(reason) =>
+            Some((reason.clone(), theme::TEXT_DIM)),
+        TransferPhase::Running { .. } => Some((
+            match transfer.percent() {
+                Some(pct) => format!("↓ {pct}%"),
+                None => "↓ …".to_string(),
+            }, theme::ACCENT)),
+        TransferPhase::Done(Ok(_)) =>
+            Some(("✓ ready".to_string(), theme::ACCENT)),
+        TransferPhase::Done(Err(err)) =>
+            Some((short_failure(err).to_string(), theme::DANGER)),
+    }
+}
+
+fn note_for(state: &BrowserState, path: &str, now: Instant)
+            -> Option<(String, Color32)> {
+    state.transfer_of(path)
+        .and_then(|transfer| transfer_note(transfer, now))
+}
+
+/// The player of section 6: the frame, the transport controls, and the OS
+/// player next to them. `reserved` is the height the transfer bar and the
+/// cache line need below it.
+fn player_pane(ui: &mut Ui, view: &View<'_>, player: &PlayerView<'_>,
+               reserved: f32, out: &mut Outcome) {
+    let frames = player.index.frames.len().max(1);
+    ui.horizontal(|ui| {
+        // named apart from the view's own Back, which leaves the files
+        // view altogether (section 6)
+        if ui.button("‹ Back to the list").clicked() {
+            out.actions.push(Action::ClosePlayer);
+        }
+        ui.add(egui::Label::new(RichText::new(player.title)
+            .font(theme::bold(13.0))).truncate());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+            let mut facts = format!("{}x{}", player.index.width,
+                                    player.index.height);
+            if player.index.fps() > 0.0 {
+                facts.push_str(&format!("  ·  {:.0} fps",
+                                        player.index.fps()));
+            }
+            facts.push_str(&format!("  ·  {frames} frames"));
+            ui.label(RichText::new(facts).color(theme::TEXT_DIM)
+                .size(11.0));
+        });
+    });
+    // the cut last chunk of 5.8, said plainly rather than shown as a
+    // half-grey frame
+    if player.index.truncated {
+        ui.label(RichText::new(
+            "this recording was cut short; the last frame was dropped")
+            .color(theme::WARN).size(11.0));
+    }
+    if player.skipped > 0 {
+        ui.label(RichText::new(format!(
+            "{} frame(s) could not be decoded and were skipped",
+            player.skipped)).color(theme::TEXT_DIM).size(11.0));
+    }
+    let width = ui.available_width();
+    let height = (ui.available_height() - PLAYER_CONTROLS_H - reserved)
+        .max(160.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height),
+                                           Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(12), Color32::BLACK);
+    match player.texture {
+        Some(handle) => {
+            let size = handle.size_vec2();
+            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            egui::Image::new((handle.id(), size))
+                .corner_radius(CornerRadius::same(8))
+                .paint_at(ui, egui::Rect::from_center_size(rect.center(),
+                                                           size * scale));
+        }
+        None => {
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                              "decoding…",
+                              egui::FontId::proportional(12.0),
+                              theme::TEXT_DIM);
+        }
+    }
+    ui.horizontal(|ui| {
+        let label = match player.playing {
+            true => "⏸",
+            false => "▶",
+        };
+        if ui.button(label).clicked() {
+            out.actions.push(Action::Player(match player.playing {
+                true => PlayerCmd::Pause,
+                false => PlayerCmd::Play,
+            }));
+        }
+        let last = frames.saturating_sub(1) as u32;
+        let mut at = player.pos.min(last);
+        let slider = ui.add(egui::Slider::new(&mut at, 0..=last)
+            .show_value(false));
+        if slider.changed() {
+            out.actions.push(Action::Player(PlayerCmd::Seek(at)));
+        }
+        let per_frame = player.index.frame_us() as f32 / 1_000_000.0;
+        ui.label(RichText::new(format!(
+            "{} / {}", clock_text(player.pos as f32 * per_frame),
+            clock_text(player.index.duration_s())))
+            .color(theme::TEXT_DIM).size(11.0));
+        // Display on an f32 drops the trailing ".0", so these read 1x, 10x
+        egui::ComboBox::from_id_salt("player-speed")
+            .width(72.0)
+            .selected_text(format!("{}x", player.speed))
+            .show_ui(ui, |ui| {
+                for speed in player::SPEEDS {
+                    if ui.selectable_label(
+                        (player.speed - speed).abs() < f32::EPSILON,
+                        format!("{speed}x")).clicked()
+                    {
+                        out.actions.push(
+                            Action::Player(PlayerCmd::Speed(speed)));
+                    }
+                }
+            });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+            // the app is playing this file, so the OS player is section 7's
+            // documented fallback for it — but the shell still picks its
+            // program by extension, so the same rule decides (F2)
+            let openable = may_reach_shell(view, player.path);
+            os_player_buttons(ui, player.path, openable, out);
+        });
+    });
+}
+
+/// "Open in player" and "Show in folder" (section 7, option B). "Show in
+/// folder" is offered wherever a local copy exists; "Open in player" hands
+/// the file to the Windows shell, so `offer_open` is false where the file
+/// is merely a saved copy rather than something the app tried to play.
+///
+/// Names come off an SD card this app does not control: sanitising keeps a
+/// hostile name inside `Downloads\Bambu Control\<printer>`, but it keeps
+/// the extension, so a card offering "invoice.exe" would otherwise be two
+/// clicks from a ShellExecute under a button labelled as a player (stage 3
+/// security review, F2).
+fn os_player_buttons(ui: &mut Ui, path: &Path, offer_open: bool,
+                     out: &mut Outcome) {
+    if ui.button("Show in folder").clicked() {
+        out.actions.push(Action::Reveal(path.to_path_buf()));
+    }
+    if offer_open && ui.button("Open in player").clicked() {
+        out.actions.push(Action::OpenExternally(path.to_path_buf()));
+    }
+}
+
+/// 5.10: "can't play this format in the app" / "empty recording", with the
+/// OS player offered next to it rather than a dead end.
+fn player_error_card(ui: &mut Ui, view: &View<'_>, note: &str,
+                     path: Option<&Path>, out: &mut Outcome) {
+    egui::Frame::new()
+        .fill(theme::WARN_BG)
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(RichText::new(note)
+                    .color(theme::WARN).size(12.0)).wrap());
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // not a dead end: the card can be put away, and the
+                        // file handed to the OS player (section 7, B)
+                        if ui.button("✕").clicked() {
+                            out.actions.push(Action::ClosePlayer);
+                        }
+                        if let Some(path) = path {
+                            // the sniff refused it, which is exactly when
+                            // section 7 hands it to the OS player — as long
+                            // as its header and name agree it is media (F2)
+                            let openable = may_reach_shell(view, path);
+                            os_player_buttons(ui, path, openable, out);
+                        }
+                    });
+            });
+        });
+}
+
+/// `00:21`, for the player's position and length.
+fn clock_text(seconds: f32) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// "21 s", "3 min", "1 h 5 min": how long something still takes.
+fn duration_text(seconds: f32) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    match seconds {
+        0..=89 => format!("{seconds} s"),
+        90..=3599 => format!("{} min", (seconds + 30) / 60),
+        _ => format!("{} h {} min", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
+/// What a download will cost, before it starts (section 6: every action
+/// shows its time cost up front). The rolling rate when there is one, the
+/// documented 200 kB/s until then (5.4).
+fn download_eta(size: u64, rate_bps: f64) -> String {
+    let rate = match rate_bps > 1.0 {
+        true => rate_bps,
+        false => crate::browser::DEFAULT_RATE_BPS,
+    };
+    format!("~{}", duration_text((size as f64 / rate) as f32))
+}
+
+/// The confirmation wording of section 6, used before closing the app,
+/// removing a printer or editing its connection while transfers run.
+pub fn active_transfer_note(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 download is still running and will be discarded."
+            .to_string()),
+        many => Some(format!(
+            "{many} downloads are still running and will be discarded.")),
+    }
 }
 
 /// "not tested on this model" for every model except A1 and P1S, prefixes
@@ -866,16 +1342,19 @@ fn list(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
                 Tab::Recordings => {
                     let entry = state.recordings[rows.order[*position]]
                         .clone();
-                    entry_row(ui, files, &entry, "REC", 0.0);
+                    let note = note_for(state, &entry.path, view.now);
+                    entry_row(ui, files, &entry, "REC", 0.0, note);
                 }
                 _ => {
                     let item = state.files[rows.order[*position]].clone();
-                    file_row(ui, files, &item, false);
+                    let note = note_for(state, &item.remote.path, view.now);
+                    file_row(ui, files, &item, false, note);
                 }
             },
             Row::Companion(position) => {
                 let item = state.files[rows.order[*position]].clone();
-                file_row(ui, files, &item, true);
+                let note = note_for(state, &item.remote.path, view.now);
+                file_row(ui, files, &item, true, note);
             }
             Row::Folder { entry, depth, open } => {
                 let entry = entry.clone();
@@ -1019,6 +1498,11 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
     let thumb = item.thumb.clone();
     let orphan = item.video.is_none();
     let started = item.started;
+    // the per-tile transfer state of section 6, taken before the state is
+    // borrowed mutably below
+    let note = item.video.as_ref()
+        .map(|video| video.path.clone())
+        .and_then(|path| note_for(state, &path, view.now));
     let size = item.video.as_ref().or(item.thumb.as_ref())
         .map_or(0, |entry| entry.size);
     let selected = files.selected.as_deref() == Some(key.as_str());
@@ -1067,7 +1551,17 @@ fn timelapse_tile(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
             // click is registered over its contents, so a button inside it
             // would never see the pointer
             let mut retry_at = None;
-            if orphan {
+            if let Some((text, color)) = &note {
+                // A tile that is transferring says so instead of its date.
+                // The 5.10 queued wording is 50 characters and a tile is
+                // 156 px wide: wrapped, it would make every tile row in the
+                // grid three lines tall for as long as the transfer waits,
+                // because the virtualiser reserves what a row kind paints.
+                // The transfer bar below carries the reason in full.
+                ui.add(egui::Label::new(RichText::new(text).color(*color)
+                    .size(11.0)).truncate())
+                    .on_hover_text(text.as_str());
+            } else if orphan {
                 ui.label(RichText::new("⚠ no video").color(theme::WARN)
                     .size(11.0));
             } else if failed {
@@ -1184,7 +1678,8 @@ fn drop_textures(state: &mut BrowserState, files: &mut FilesUi,
 }
 
 fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
-             icon: &str, indent: f32) -> bool {
+             icon: &str, indent: f32,
+             note: Option<(String, Color32)>) -> bool {
     let selected = files.selected.as_deref() == Some(entry.path.as_str());
     let response = egui::Frame::new()
         .fill(if selected { theme::CARD_HOVER } else { theme::CARD })
@@ -1214,6 +1709,11 @@ fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
                             ui.label(RichText::new(human_bytes(entry.size))
                                 .color(theme::TEXT_DIM).size(11.0));
                         }
+                        // the per-row transfer state of section 6
+                        if let Some((text, color)) = &note {
+                            ui.label(RichText::new(text).color(*color)
+                                .size(11.0));
+                        }
                     });
             });
         })
@@ -1230,7 +1730,7 @@ fn entry_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
 }
 
 fn file_row(ui: &mut Ui, files: &mut FilesUi, item: &FileItem,
-            companion: bool) {
+            companion: bool, note: Option<(String, Color32)>) {
     if companion {
         let plate = item.plate_hint
             .map(|plate| format!(" (plate {plate})"))
@@ -1249,7 +1749,7 @@ fn file_row(ui: &mut Ui, files: &mut FilesUi, item: &FileItem,
         });
         return;
     }
-    entry_row(ui, files, &item.remote, kind_icon(item.kind), 0.0);
+    entry_row(ui, files, &item.remote, kind_icon(item.kind), 0.0, note);
 }
 
 fn folder_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
@@ -1259,7 +1759,7 @@ fn folder_row(ui: &mut Ui, files: &mut FilesUi, entry: &RemoteEntry,
         (true, false) => "▸ DIR",
         (false, _) => "FILE",
     };
-    entry_row(ui, files, entry, icon, 14.0 * depth as f32)
+    entry_row(ui, files, entry, icon, 14.0 * depth as f32, None)
 }
 
 fn kind_icon(kind: FileKind) -> &'static str {
@@ -1285,79 +1785,156 @@ fn kind_label(kind: FileKind) -> &'static str {
 
 // ------------------------------------------------------------ detail pane
 
-fn detail_pane(ui: &mut Ui, state: &BrowserState, files: &FilesUi,
-               view: &View<'_>) {
+/// What the detail pane is showing, cloned out of the browser state so the
+/// pane can then borrow that state mutably to start a download or a
+/// preview.
+enum Selected {
+    Timelapse {
+        stem: String,
+        video: Option<RemoteEntry>,
+        thumb: Option<RemoteEntry>,
+        started: Option<NaiveDateTime>,
+        ended: Option<NaiveDateTime>,
+    },
+    Recording(RemoteEntry),
+    File(Box<FileItem>),
+    /// an "Other folder" entry
+    Entry(RemoteEntry),
+    None,
+}
+
+fn selection(state: &BrowserState, files: &FilesUi) -> Selected {
+    let Some(selected) = files.selected.as_deref() else {
+        return Selected::None;
+    };
+    if let Some(item) = state.timelapses.iter()
+        .find(|item| item.video.as_ref().or(item.thumb.as_ref())
+            .is_some_and(|entry| entry.path == selected))
+    {
+        return Selected::Timelapse {
+            stem: item.stem().to_string(),
+            video: item.video.clone(),
+            thumb: item.thumb.clone(),
+            started: item.started,
+            ended: item.ended,
+        };
+    }
+    if let Some(entry) = state.recordings.iter()
+        .find(|entry| entry.path == selected)
+    {
+        return Selected::Recording(entry.clone());
+    }
+    if let Some(item) = state.files.iter()
+        .find(|item| item.remote.path == selected)
+    {
+        return Selected::File(Box::new(item.clone()));
+    }
+    // something a refresh dropped, or a file inside an opened folder
+    state.dirs.values()
+        .filter_map(|dir| match dir {
+            DirState::Ready { entries, .. } => Some(entries),
+            _ => None,
+        })
+        .flatten()
+        .find(|entry| entry.path == selected)
+        .map_or(Selected::None, |entry| Selected::Entry(entry.clone()))
+}
+
+/// Timelapses and `/ipcam` recordings are AVI. The player sniffs the real
+/// format when it opens the file (5.8), so this only decides whether the
+/// app's own player is offered, never what the player believes: a `.avi`
+/// that is not one ends on the error card, which is the documented path.
+fn is_playable(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".avi")
+}
+
+/// Whether this local file may be handed to the Windows shell (stage 3
+/// security review, F2).
+///
+/// A different question from [`is_playable`], which reads a remote name to
+/// decide whether to offer the app's own player. The shell picks its
+/// program by extension and runs whatever it finds, so this answer comes
+/// from the file on disk — header and extension both — and never from a
+/// name the printer chose.
+///
+/// The view does not read the file itself: `main.rs` answers, and memoises,
+/// so nothing touches the disk on the paint path (5.1, rule 5). With no
+/// answer available the button is not offered, which is the closed side.
+fn may_reach_shell(view: &View<'_>, path: &Path) -> bool {
+    view.shell_openable.is_some_and(|openable| openable(path))
+}
+
+fn detail_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
+               view: &View<'_>, out: &mut Outcome) {
+    let picked = selection(state, files);
     card_frame(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.label(RichText::new("DETAILS").color(theme::TEXT_DIM)
             .font(theme::bold(11.5)));
         ui.add_space(6.0);
-        let Some(selected) = files.selected.as_deref() else {
-            ui.label(RichText::new("Select a file to see its details.")
-                .color(theme::TEXT_DIM).size(12.0));
-            return;
-        };
-        if let Some(item) = state.timelapses.iter()
-            .find(|item| item.video.as_ref().or(item.thumb.as_ref())
-                .is_some_and(|entry| entry.path == selected))
-        {
-            ui.add(egui::Label::new(RichText::new(item.stem())
-                .font(theme::bold(13.0))).wrap());
-            ui.add_space(4.0);
-            fact(ui, "PRINT", &format!("{} → {}", when_text(item.started),
-                                       when_text(item.ended)));
-            match &item.video {
-                Some(video) => fact(ui, "VIDEO",
-                    &format!("{}  ·  {}", human_bytes(video.size),
-                             extension(&video.name))),
-                None => fact(ui, "VIDEO",
-                             "deleted; only the thumbnail is left"),
+        match picked {
+            Selected::None => {
+                ui.label(RichText::new("Select a file to see its details.")
+                    .color(theme::TEXT_DIM).size(12.0));
             }
-            if let Some(thumb) = &item.thumb {
-                fact(ui, "THUMB", &human_bytes(thumb.size));
+            Selected::Timelapse { stem, video, thumb, started, ended } => {
+                ui.add(egui::Label::new(RichText::new(stem)
+                    .font(theme::bold(13.0))).wrap());
+                ui.add_space(4.0);
+                fact(ui, "PRINT", &format!("{} → {}", when_text(started),
+                                           when_text(ended)));
+                match &video {
+                    Some(video) => fact(ui, "VIDEO",
+                        &format!("{}  ·  {}", human_bytes(video.size),
+                                 extension(&video.name))),
+                    None => fact(ui, "VIDEO",
+                                 "deleted; only the thumbnail is left"),
+                }
+                if let Some(thumb) = &thumb {
+                    fact(ui, "THUMB", &human_bytes(thumb.size));
+                }
+                clock_note(ui, view);
+                // an orphan thumbnail has nothing to download (5.4)
+                if let Some(video) = &video {
+                    let playable = is_playable(&video.name);
+                    file_actions(ui, state, view, video, playable, out);
+                }
             }
-            clock_note(ui, view);
-            return;
-        }
-        if let Some(entry) = state.recordings.iter()
-            .find(|entry| entry.path == selected)
-        {
-            ui.add(egui::Label::new(RichText::new(&entry.name)
-                .font(theme::bold(13.0))).wrap());
-            ui.add_space(4.0);
-            fact(ui, "SIZE", &human_bytes(entry.size));
-            fact(ui, "TIME", &when_text(entry.mtime));
-            clock_note(ui, view);
-            return;
-        }
-        if let Some(item) = state.files.iter()
-            .find(|item| item.remote.path == selected)
-        {
-            ui.add(egui::Label::new(RichText::new(&item.remote.name)
-                .font(theme::bold(13.0))).wrap());
-            ui.add_space(4.0);
-            fact(ui, "KIND", kind_label(item.kind));
-            fact(ui, "SIZE", &human_bytes(item.remote.size));
-            fact(ui, "TIME", &when_text(item.remote.mtime));
-            if let Some(plate) = item.plate_hint {
-                fact(ui, "PLATE", &plate.to_string());
+            Selected::Recording(entry) => {
+                ui.add(egui::Label::new(RichText::new(&entry.name)
+                    .font(theme::bold(13.0))).wrap());
+                ui.add_space(4.0);
+                fact(ui, "SIZE", &human_bytes(entry.size));
+                fact(ui, "TIME", &when_text(entry.mtime));
+                clock_note(ui, view);
+                let playable = is_playable(&entry.name);
+                file_actions(ui, state, view, &entry, playable, out);
             }
-            if let Some(root) = &item.companion_of {
-                fact(ui, "COPY OF", root);
+            Selected::File(item) => {
+                ui.add(egui::Label::new(RichText::new(&item.remote.name)
+                    .font(theme::bold(13.0))).wrap());
+                ui.add_space(4.0);
+                fact(ui, "KIND", kind_label(item.kind));
+                fact(ui, "SIZE", &human_bytes(item.remote.size));
+                fact(ui, "TIME", &when_text(item.remote.mtime));
+                if let Some(plate) = item.plate_hint {
+                    fact(ui, "PLATE", &plate.to_string());
+                }
+                if let Some(root) = &item.companion_of {
+                    fact(ui, "COPY OF", root);
+                }
+                clock_note(ui, view);
+                if item.remote.name.to_ascii_lowercase().ends_with(".3mf") {
+                    threemf_pane(ui, state, files, view, &item, out);
+                } else if matches!(item.kind, FileKind::PlainGcode
+                                   | FileKind::CacheGcode)
+                {
+                    ui.add_space(6.0);
+                    gcode_pane(ui, state, view, &item.remote, out);
+                }
+                file_actions(ui, state, view, &item.remote, false, out);
             }
-            clock_note(ui, view);
-            return;
-        }
-        // an "Other folder" entry, or something a refresh dropped
-        let entry = state.dirs.values()
-            .filter_map(|dir| match dir {
-                DirState::Ready { entries, .. } => Some(entries),
-                _ => None,
-            })
-            .flatten()
-            .find(|entry| entry.path == selected);
-        match entry {
-            Some(entry) => {
+            Selected::Entry(entry) => {
                 ui.add(egui::Label::new(RichText::new(&entry.name)
                     .font(theme::bold(13.0))).wrap());
                 ui.add_space(4.0);
@@ -1367,13 +1944,239 @@ fn detail_pane(ui: &mut Ui, state: &BrowserState, files: &FilesUi,
                 }
                 fact(ui, "TIME", &when_text(entry.mtime));
                 clock_note(ui, view);
-            }
-            None => {
-                ui.label(RichText::new("Select a file to see its details.")
-                    .color(theme::TEXT_DIM).size(12.0));
+                if !entry.is_dir && !entry.unreadable {
+                    let playable = is_playable(&entry.name);
+                    file_actions(ui, state, view, &entry, playable, out);
+                }
             }
         }
     });
+}
+
+/// The actions of section 6 for one remote file. A file already on disk
+/// offers the players and the folder; one that is not offers the downloads,
+/// each with the time it will cost.
+fn file_actions(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
+                remote: &RemoteEntry, playable: bool, out: &mut Outcome) {
+    ui.add_space(8.0);
+    // The borrow ends here, so the buttons below can start a download. A
+    // copy this session downloaded is the first answer; after it, a
+    // complete key-matching copy already in the disk cache, so a file that
+    // is on disk from an earlier session is not advertised as a download
+    // with six minutes on it (5.6).
+    let local = state.local_copy(&remote.path).map(Path::to_path_buf)
+        .or_else(|| view.cached.and_then(|cached| cached(remote)));
+    let width = ui.available_width();
+    match &local {
+        Some(path) => {
+            if playable
+                && accent_button_response(ui, "Play", vec2(width, 30.0))
+                    .clicked()
+            {
+                // the remote path decides the speed, not the cached name
+                out.actions.push(Action::Play {
+                    path: path.clone(),
+                    speed: player::default_speed(&remote.path) });
+            }
+            // a saved copy of anything: the shell only gets a file whose
+            // header and extension agree that it is media (F2)
+            let openable = may_reach_shell(view, path);
+            ui.horizontal(|ui| os_player_buttons(ui, path, openable, out));
+            // a key-matching copy is copied, never downloaded again (5.6)
+            if ui.button("Save to PC").clicked()
+                && let Some(cmd) = state.download(remote, Dest::SaveToPc)
+            {
+                out.cmds.push(cmd);
+            }
+        }
+        None => {
+            ui.label(RichText::new(format!(
+                "Download {}", download_eta(remote.size, state.rate_bps)))
+                .color(theme::TEXT_DIM).size(11.0));
+            if playable
+                && accent_button_response(ui, "Download & play",
+                                          vec2(width, 30.0)).clicked()
+                && let Some(cmd) = state.download(
+                    remote, Dest::Cache { open_after: true })
+            {
+                out.cmds.push(cmd);
+            }
+            if ui.button("Save to PC").clicked()
+                && let Some(cmd) = state.download(remote, Dest::SaveToPc)
+            {
+                out.cmds.push(cmd);
+            }
+        }
+    }
+    if let Some((text, color)) = note_for(state, &remote.path, view.now) {
+        ui.label(RichText::new(text).color(color).size(11.0));
+    }
+}
+
+/// The 3mf preview: automatic for small files, "[Load]" for the rest
+/// (design doc 4), then what the file says about itself (5.7).
+fn threemf_pane(ui: &mut Ui, state: &mut BrowserState, files: &mut FilesUi,
+                view: &View<'_>, item: &FileItem, out: &mut Outcome) {
+    // 1 MB, or 256 KB while the printer prints (design doc 4)
+    let cap = match view.printing {
+        true => AUTO_PREVIEW_PRINTING,
+        false => AUTO_PREVIEW_MAX,
+    };
+    ui.add_space(6.0);
+    let known = state.details.contains_key(&item.remote.path);
+    if !known && item.remote.size <= cap {
+        if let Some(cmd) = state.request_details(&item.remote,
+                                                 item.plate_hint)
+        {
+            out.cmds.push(cmd);
+        }
+    } else if !known {
+        // too big to load on its own: it is a download, so the user says
+        // when, and the cost is on the button (section 6)
+        ui.label(RichText::new(format!(
+            "preview: {}  ·  {}", human_bytes(item.remote.size),
+            download_eta(item.remote.size, state.rate_bps)))
+            .color(theme::TEXT_DIM).size(11.0));
+        if ui.button("Load preview").clicked()
+            && let Some(cmd) = state.request_details(&item.remote,
+                                                     item.plate_hint)
+        {
+            out.cmds.push(cmd);
+        }
+    }
+    match state.details.get(&item.remote.path).cloned() {
+        Some(DetailState::Loading) => {
+            ui.label(RichText::new("reading the 3mf…")
+                .color(theme::TEXT_DIM).size(11.0));
+        }
+        Some(DetailState::Failed(err)) => {
+            ui.add(egui::Label::new(RichText::new(err.text(view.serial))
+                .color(theme::DANGER).size(11.0)).wrap());
+            if ui.button("⟳ retry").clicked() {
+                state.forget_details(&item.remote.path);
+            }
+        }
+        Some(DetailState::Ready(three)) => {
+            plate_picture(ui, files, &item.remote.path, &three);
+            threemf_facts(ui, &three);
+        }
+        None => {}
+    }
+}
+
+/// The sliced plate's picture, decoded once and kept while it is shown.
+fn plate_picture(ui: &mut Ui, files: &mut FilesUi, path: &str,
+                 three: &ThreeMf) {
+    // decoded and downscaled on the lane thread; this only uploads it
+    // (5.1, rule 5), like `Event::Thumb` does for a tile
+    let Some(picture) = &three.plate else { return };
+    let stale = files.preview.as_ref()
+        .is_none_or(|(shown, _)| shown != path);
+    if stale {
+        let handle = ui.ctx().load_texture(format!("plate-{path}"),
+                                           picture.0.clone(),
+                                           Default::default());
+        files.preview = Some((path.to_string(), handle));
+    }
+    if let Some((shown, handle)) = &files.preview
+        && shown == path
+    {
+        let size = handle.size_vec2();
+        let scale = (ui.available_width() / size.x).min(1.0);
+        ui.add(egui::Image::new((handle.id(), size))
+            .fit_to_exact_size(size * scale)
+            .corner_radius(CornerRadius::same(8)));
+    }
+}
+
+/// What a 3mf says about itself (5.7).
+fn threemf_facts(ui: &mut Ui, three: &ThreeMf) {
+    let info = &three.info;
+    if let Some(plate) = info.plate {
+        fact(ui, "PLATE", &plate.to_string());
+    }
+    if !info.printer_model.is_empty() {
+        fact(ui, "SLICED FOR", &info.printer_model);
+    }
+    if let Some(seconds) = info.prediction_s {
+        fact(ui, "TIME", &duration_text(seconds as f32));
+    }
+    if let Some(grams) = info.weight_g {
+        fact(ui, "WEIGHT", &format!("{grams:.2} g"));
+    }
+    match (info.layers, info.max_z_mm) {
+        (Some(layers), Some(z)) =>
+            fact(ui, "LAYERS", &format!("{layers}  ·  {z:.1} mm")),
+        (Some(layers), None) => fact(ui, "LAYERS", &layers.to_string()),
+        _ => {}
+    }
+    if !info.bed_type.is_empty() {
+        fact(ui, "BED", &info.bed_type);
+    }
+    for filament in &info.filaments {
+        let mut line = filament.kind.clone();
+        if !filament.color.is_empty() {
+            line.push_str(&format!("  {}", filament.color));
+        }
+        if let Some(grams) = filament.used_g {
+            line.push_str(&format!("  ·  {grams:.2} g"));
+        }
+        fact(ui, "FILAMENT", &line);
+    }
+    if !info.objects.is_empty() {
+        fact(ui, "OBJECTS", &info.objects.len().to_string());
+    }
+    for warning in &info.warnings {
+        ui.add(egui::Label::new(RichText::new(warning)
+            .color(theme::WARN).size(11.0)).wrap());
+    }
+}
+
+/// "Read header (~2 s)" (5.7): never automatic, and it costs a session of
+/// its own, so only the button starts it.
+fn gcode_pane(ui: &mut Ui, state: &mut BrowserState, view: &View<'_>,
+              remote: &RemoteEntry, out: &mut Outcome) {
+    match state.headers.get(&remote.path).cloned() {
+        None => {
+            if ui.button("Read header (~2 s)").clicked()
+                && let Some(cmd) = state.request_header(remote)
+            {
+                out.cmds.push(cmd);
+            }
+        }
+        Some(HeaderState::Loading) => {
+            ui.label(RichText::new("reading the header…")
+                .color(theme::TEXT_DIM).size(11.0));
+        }
+        Some(HeaderState::Failed(err)) => {
+            ui.add(egui::Label::new(RichText::new(err.text(view.serial))
+                .color(theme::DANGER).size(11.0)).wrap());
+            if ui.button("⟳ retry").clicked() {
+                state.forget_header(&remote.path);
+            }
+        }
+        Some(HeaderState::Ready(header)) => {
+            if let Some(seconds) = header.prediction_s {
+                fact(ui, "TIME", &duration_text(seconds as f32));
+            }
+            if let Some(layers) = header.layers {
+                fact(ui, "LAYERS", &layers.to_string());
+            }
+            if let Some(grams) = header.weight_g {
+                fact(ui, "WEIGHT", &format!("{grams:.2} g"));
+            }
+            if let Some(z) = header.max_z_mm {
+                fact(ui, "HEIGHT", &format!("{z:.1} mm"));
+            }
+            // a head read that stopped early is never shown as the whole
+            // truth (5.7)
+            if !header.complete {
+                ui.label(RichText::new(
+                    "the header was cut short; this is what it carried")
+                    .color(theme::TEXT_DIM).size(10.5));
+            }
+        }
+    }
 }
 
 fn fact(ui: &mut Ui, label: &str, value: &str) {
@@ -1647,7 +2450,10 @@ mod tests {
 
     fn view(serial: &str, now: Instant) -> View<'_> {
         View { name: "P1S #1", serial, profile: Some(ServerProfile::BblP003),
-               open_sessions: 0, printing: false, dialog_open: false, now }
+               open_sessions: 0, printing: false, dialog_open: false, now,
+               cache_usage: 0, cache_cap: 5 * 1024 * 1024 * 1024,
+               cached: None, shell_openable: None,
+               player: None, player_error: None, player_error_path: None }
     }
 
     fn thumb_image() -> egui::ColorImage {
@@ -1656,6 +2462,14 @@ mod tests {
 
     fn files_ui(tab: Tab) -> FilesUi {
         FilesUi { tab, ..FilesUi::default() }
+    }
+
+    /// The shell verdict a test wants, without a file on disk: `main.rs`
+    /// answers this in the app, from the file's header and extension
+    /// (`player::openable_by_shell`, stage 3 security review, F2), and the
+    /// rule itself is tested there against real files.
+    fn shell_says(answer: bool) -> impl Fn(&Path) -> bool {
+        move |_: &Path| answer
     }
 
     // --------------------------------------------------- refusal and models
@@ -2157,10 +2971,11 @@ mod tests {
         assert!(painted.has("No print files on this printer."));
     }
 
-    /// The detail pane shows facts only: this stage has no download, so it
-    /// offers no action at all (section 6, no dead buttons).
+    /// Section 6: the detail pane keeps its facts and now performs the
+    /// actions this stage added. This replaces the stage 2 test that
+    /// asserted their absence, which the transfer lane supersedes.
     #[test]
-    fn the_detail_pane_shows_facts_and_no_actions() {
+    fn the_detail_pane_shows_facts_and_this_stages_actions() {
         let ctx = ctx();
         let mut state = browsed();
         let mut files = files_ui(Tab::Files);
@@ -2172,11 +2987,232 @@ mod tests {
         assert!(painted.has("Sep 07 19:38"));
         assert!(painted.has("sent from Studio"));
         assert!(painted.has("times are the printer's clock"));
-        for absent in ["Download", "Save to PC", "Open in player",
-                       "Show in folder", "Load", "Read header",
-                       "Clear cache", "Delete"] {
-            assert!(!painted.has(absent), "{absent} has no lane yet");
-        }
+        // the actions the transfer lane can finally perform
+        assert!(painted.exact("Save to PC"), "{:?}", painted.spots);
+        // and the cost of it, before the click (section 6)
+        assert!(painted.has("Download ~"));
+        // a 3mf is not played in the app
+        assert!(!painted.has("Download & play"));
+        // still not built: deletion is v2 (section 9)
+        assert!(!painted.has("Delete"));
+    }
+
+    /// Section 6: Download & play starts one transfer for that file, with
+    /// the destination that opens the player when it lands.
+    #[test]
+    fn download_and_play_starts_one_transfer_for_the_file() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let video = "/timelapse/video_2026-06-01_06-11-57.avi";
+        files.selected = Some(video.to_string());
+        let now = Instant::now();
+
+        let out = click(&ctx, &mut state, &mut files, &view(P1S, now),
+                        "Download & play");
+        let started = out.cmds.iter().find_map(|cmd| match cmd {
+            Cmd::Download { id, remote, dest } =>
+                Some((*id, remote.path.clone(), *dest)),
+            _ => None,
+        });
+        let (id, path, dest) =
+            started.unwrap_or_else(|| panic!("no download: {:?}", out.cmds));
+        assert_eq!(path, video);
+        assert_eq!(dest, Dest::Cache { open_after: true });
+        assert_eq!(state.active_transfers(), 1);
+
+        // a second click while it runs does not start it twice
+        let again = click(&ctx, &mut state, &mut files, &view(P1S, now),
+                          "Download & play");
+        assert!(!again.cmds.iter().any(|cmd|
+            matches!(cmd, Cmd::Download { .. })), "{:?}", again.cmds);
+
+        // real bytes off the socket drive the bar, the rate and the ETA
+        state.apply(Event::Progress { id, done: 1_000_000,
+                                      total: 4_411_548,
+                                      bytes_per_s: 205_000.0 });
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, now));
+        assert!(painted.has("/ 4.2 MB"), "{:?}", painted.spots);
+        assert!(painted.has("KB/s"), "no rate on the transfer bar");
+        assert!(painted.has("left"), "no ETA on the transfer bar");
+        assert_eq!(state.running_percent(), Some(23));
+        // the tile says so too (the per-tile state of section 6)
+        assert!(painted.has("↓ 23%"));
+
+        // and the bar's ✕ asks the worker to cancel that transfer
+        let out = click(&ctx, &mut state, &mut files, &view(P1S, now), "✕");
+        assert!(out.cmds.iter().any(|cmd|
+            matches!(cmd, Cmd::Cancel(cancelled) if *cancelled == id)),
+            "{:?}", out.cmds);
+    }
+
+    /// 5.10: a queued transfer says why it is waiting, on its tile.
+    #[test]
+    fn a_queued_transfer_says_why_it_waits() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let video = "/timelapse/video_2026-06-01_06-11-57.avi";
+        files.selected = Some(video.to_string());
+        let now = Instant::now();
+        let out = click(&ctx, &mut state, &mut files, &view(P1S, now),
+                        "Download & play");
+        let id = out.cmds.iter().find_map(|cmd| match cmd {
+            Cmd::Download { id, .. } => Some(*id),
+            _ => None,
+        }).expect("a download");
+
+        let reason = "waiting: printer is printing, one download at a time";
+        state.apply(Event::Queued { id, reason: reason.to_string() });
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, now));
+        assert!(painted.has(reason), "{:?}", painted.spots);
+    }
+
+    /// Design doc 4: a small 3mf previews on its own; a big one is a
+    /// download, so it waits for the click and says what it will cost.
+    #[test]
+    fn a_small_3mf_previews_itself_and_a_big_one_waits() {
+        let ctx = ctx();
+        let now = Instant::now();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Files);
+        files.selected = Some("/job.gcode.3mf".to_string());
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, now));
+        assert!(painted.out.cmds.iter().any(|cmd| matches!(cmd,
+            Cmd::Details { remote, .. }
+                if remote.path == "/job.gcode.3mf")),
+            "a 51 KB 3mf did not preview itself: {:?}", painted.out.cmds);
+
+        let mut state = BrowserState::default();
+        let _ = state.refresh();
+        listed(&mut state, "/", &[
+            "-rw-rw-rw-   1 root  root   7234567 Sep 07 19:38 \
+             big.gcode.3mf"]);
+        let mut files = files_ui(Tab::Files);
+        files.selected = Some("/big.gcode.3mf".to_string());
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, now));
+        assert!(!painted.out.cmds.iter()
+                    .any(|cmd| matches!(cmd, Cmd::Details { .. })),
+                "a 6.9 MB 3mf previewed itself");
+        assert!(painted.has("preview: 6.9 MB"), "{:?}", painted.spots);
+        let out = click(&ctx, &mut state, &mut files, &view(P1S, now),
+                        "Load preview");
+        assert!(out.cmds.iter().any(|cmd|
+            matches!(cmd, Cmd::Details { .. })), "{:?}", out.cmds);
+    }
+
+    /// Section 6: the player takes over the grid, shows what it is playing
+    /// and offers the OS player next to its own controls.
+    #[test]
+    fn the_player_takes_over_the_grid_and_comes_back() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = FilesUi::default();
+        let index = AviIndex { width: 1280, height: 720,
+                               us_per_frame: 41667,
+                               frames: vec![(0, 10); 48],
+                               truncated: false };
+        let path = Path::new("cache/file/0123456789abcdef.avi");
+        let now = Instant::now();
+        let openable = shell_says(true);
+        let shown = || View {
+            shell_openable: Some(&openable),
+            player: Some(PlayerView {
+                title: "video_2026-06-01_06-11-57.avi",
+                texture: None,
+                index: &index,
+                pos: 24,
+                playing: true,
+                speed: 1.0,
+                path,
+                skipped: 0,
+            }),
+            ..view(P1S, now)
+        };
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &shown());
+        assert!(painted.has("1280x720"), "{:?}", painted.spots);
+        assert!(painted.has("24 fps"));
+        assert!(painted.has("00:01 / 00:02"));
+        assert!(painted.exact("Open in player"));
+        assert!(painted.exact("Show in folder"));
+        // the grid is not drawn underneath it
+        assert!(!painted.has("queued"), "the grid is still there");
+
+        let out = click(&ctx, &mut state, &mut files, &shown(),
+                        "‹ Back to the list");
+        assert!(out.actions.contains(&Action::ClosePlayer), "{:?}",
+                out.actions);
+        let out = click(&ctx, &mut state, &mut files, &shown(),
+                        "Show in folder");
+        assert!(out.actions.contains(&Action::Reveal(path.to_path_buf())),
+                "{:?}", out.actions);
+    }
+
+    /// 5.10 and section 7: a format the app cannot decode says so and hands
+    /// the file to the OS player instead of failing.
+    #[test]
+    fn an_unplayable_format_offers_the_os_player() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = FilesUi::default();
+        let path = Path::new("cache/file/0123456789abcdef.mp4");
+        let now = Instant::now();
+        // an MP4 the app cannot decode, but whose header and name agree it
+        // is media: section 7's fallback applies to it (F2)
+        let openable = shell_says(true);
+        let shown = || View {
+            player_error: Some("can't play this format in the app (MP4)"),
+            player_error_path: Some(path),
+            shell_openable: Some(&openable),
+            ..view(P1S, now)
+        };
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &shown());
+        assert!(painted.has("can't play this format in the app"),
+                "{:?}", painted.spots);
+        assert!(painted.exact("Open in player"));
+
+        let out = click(&ctx, &mut state, &mut files, &shown(),
+                        "Open in player");
+        assert!(out.actions
+                    .contains(&Action::OpenExternally(path.to_path_buf())),
+                "{:?}", out.actions);
+    }
+
+    /// Section 6: the cache line shows usage against the cap, and Clear
+    /// cache asks for it.
+    #[test]
+    fn the_cache_line_shows_usage_and_clears_it() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = FilesUi::default();
+        let now = Instant::now();
+        let shown = || View { cache_usage: 1_288_490_188,
+                              ..view(P1S, now) };
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &shown());
+        assert!(painted.has("cache 1.2 GB / 5.0 GB"), "{:?}", painted.spots);
+        let out = click(&ctx, &mut state, &mut files, &shown(),
+                        "Clear cache");
+        assert!(out.actions.contains(&Action::ClearCache), "{:?}",
+                out.actions);
+    }
+
+    /// Section 6: closing, removing or editing with transfers running says
+    /// how many would be discarded.
+    #[test]
+    fn the_confirmations_name_the_running_transfers() {
+        assert_eq!(active_transfer_note(0), None);
+        let one = active_transfer_note(1).expect("a note");
+        assert!(one.starts_with("1 download is"), "{one}");
+        assert!(one.contains("discarded"), "{one}");
+        let many = active_transfer_note(3).expect("a note");
+        assert!(many.starts_with("3 downloads are"), "{many}");
     }
 
     /// T17: no message the view paints carries any run of the serial.
@@ -2415,5 +3451,262 @@ mod tests {
         assert_eq!(month_heading(Some((2026, 7))), "JULY 2026");
         assert_eq!(month_heading(Some((2026, 1))), "JANUARY 2026");
         assert_eq!(month_heading(None), "NO DATE");
+    }
+
+    // ------------------------------------------- the disk cache and time
+
+    /// 5.6 and section 6: a complete, key-matching copy already in the disk
+    /// cache is not a download. The view only knows the transfers it
+    /// started this session, so it asks the cache as well — otherwise a
+    /// file that is already on disk was offered as "Download ~6 min", which
+    /// is the one direction "every action shows its time cost up front"
+    /// must not get wrong.
+    #[test]
+    fn a_file_already_in_the_cache_is_played_not_downloaded() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let video = "/timelapse/video_2026-06-01_06-11-57.avi";
+        files.selected = Some(video.to_string());
+        let now = Instant::now();
+        let copy = PathBuf::from("cache/file/0123456789abcdef.avi");
+        let on_disk = copy.clone();
+        let cached: &dyn Fn(&RemoteEntry) -> Option<PathBuf> =
+            &move |_: &RemoteEntry| Some(on_disk.clone());
+        let openable = shell_says(true);
+        let shown = || View { cached: Some(cached),
+                              shell_openable: Some(&openable),
+                              ..view(P1S, now) };
+
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &shown());
+        assert!(painted.exact("Play"), "{:?}", painted.spots);
+        assert!(painted.exact("Open in player"));
+        assert!(painted.exact("Show in folder"));
+        assert!(!painted.has("Download &"),
+                "a file on disk was offered as a download");
+        assert!(!painted.has("Download ~"),
+                "a file on disk was given a download's ETA");
+
+        // Play opens the copy on disk, at the speed the remote path asks
+        // for — the cached name is a hash, so it cannot say (section 7)
+        let out = click(&ctx, &mut state, &mut files, &shown(), "Play");
+        assert!(out.actions.contains(&Action::Play { path: copy,
+                                                     speed: 1.0 }),
+                "{:?}", out.actions);
+
+        // and with no cache to ask, the same file is a download again
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, now));
+        assert!(painted.has("Download ~"), "{:?}", painted.spots);
+    }
+
+    /// The other half of the rule above: a saved copy the app would never
+    /// play is not handed to the Windows shell. Names come off an SD card
+    /// this app does not control, and sanitising keeps the extension, so a
+    /// card offering "invoice.exe" would otherwise sit two clicks from a
+    /// ShellExecute under a button labelled as a player (stage 3 security
+    /// review, F2). "Show in folder" stays, because it opens the folder.
+    #[test]
+    fn a_saved_copy_the_app_cannot_play_is_not_offered_to_the_shell() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Files);
+        let hostile = "/cache/invoice.exe";
+        state.files = vec![FileItem {
+            remote: RemoteEntry {
+                path: hostile.to_string(),
+                name: "invoice.exe".to_string(),
+                size: 4096,
+                is_dir: false,
+                mtime: None,
+                unreadable: false,
+            },
+            kind: FileKind::Other,
+            plate_hint: None,
+            companion_of: None,
+        }];
+        files.selected = Some(hostile.to_string());
+        let now = Instant::now();
+        let copy = PathBuf::from("cache/file/0123456789abcdef.exe");
+        let on_disk = copy.clone();
+        let cached: &dyn Fn(&RemoteEntry) -> Option<PathBuf> =
+            &move |_: &RemoteEntry| Some(on_disk.clone());
+        // the rule refused this file: its header and name do not agree that
+        // it is media (player::openable_by_shell, tested there)
+        let openable = shell_says(false);
+        let shown = || View { cached: Some(cached),
+                              shell_openable: Some(&openable),
+                              ..view(P1S, now) };
+
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &shown());
+        assert!(!painted.has("Open in player"),
+                "a file the app cannot play was offered to the shell: {:?}",
+                painted.spots);
+        assert!(painted.exact("Show in folder"), "{:?}", painted.spots);
+        assert!(!painted.has("Play"), "{:?}", painted.spots);
+    }
+
+    /// 5.10: a failed transfer offers Retry, which restarts at 0 — there is
+    /// no resume (REST is 502). The only control on a failed row used to be
+    /// ✕, which dismisses it.
+    #[test]
+    fn a_failed_transfer_can_be_retried_from_the_bar() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let video = "/timelapse/video_2026-06-01_06-11-57.avi";
+        files.selected = Some(video.to_string());
+        let now = Instant::now();
+        let out = click(&ctx, &mut state, &mut files, &view(P1S, now),
+                        "Download & play");
+        let id = out.cmds.iter().find_map(|cmd| match cmd {
+            Cmd::Download { id, .. } => Some(*id),
+            _ => None,
+        }).expect("a download");
+        state.apply(Event::Done {
+            id, result: Err(FtpError::Truncated { got: 1, want: 2 }) });
+
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &view(P1S, now));
+        assert!(painted.has("download interrupted"), "{:?}", painted.spots);
+        assert!(painted.exact("⟳ retry"));
+
+        let out = click(&ctx, &mut state, &mut files, &view(P1S, now),
+                        "⟳ retry");
+        let again = out.cmds.iter().find_map(|cmd| match cmd {
+            Cmd::Download { id, remote, dest } =>
+                Some((*id, remote.path.clone(), *dest)),
+            _ => None,
+        }).unwrap_or_else(|| panic!("no retry: {:?}", out.cmds));
+        assert_eq!(again.1, video);
+        assert_eq!(again.2, Dest::Cache { open_after: true },
+                   "the retry did not keep the destination");
+        assert_ne!(again.0, id, "the retry is a transfer of its own");
+    }
+
+    /// Section 6: with the player open, the transfer bar and the cache line
+    /// still fit on screen. The picture used to take a fixed margin that
+    /// covered its own controls and the cache line only, so a transfer
+    /// running while a video played pushed Clear cache off the bottom.
+    #[test]
+    fn the_player_leaves_room_for_the_transfer_bar() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = FilesUi::default();
+        let video = "/timelapse/video_2026-06-01_06-11-57.avi";
+        files.selected = Some(video.to_string());
+        let now = Instant::now();
+        click(&ctx, &mut state, &mut files, &view(P1S, now),
+              "Download & play");
+        assert_eq!(state.active_transfers(), 1);
+
+        let index = AviIndex { width: 1280, height: 720, us_per_frame: 41667,
+                               frames: vec![(0, 10); 48], truncated: false };
+        let path = Path::new("cache/file/0123456789abcdef.avi");
+        let height = 820.0;
+        let shown = || View {
+            player: Some(PlayerView { title: "video.avi", texture: None,
+                                      index: &index, pos: 0, playing: true,
+                                      speed: 1.0, path, skipped: 0 }),
+            ..view(P1S, now)
+        };
+        let painted = frame(&ctx, raw_at(Vec2::new(1180.0, height),
+                                         Vec::new()),
+                            &mut state, &mut files, &shown());
+        let cache_line = painted.spot("Clear cache")
+            .expect("the cache line");
+        assert!(cache_line.y < height,
+                "Clear cache is off the bottom at {cache_line:?}");
+        let row = painted.spot("connecting").expect("the transfer row");
+        assert!(row.y < height,
+                "the transfer row is off the bottom at {row:?}");
+    }
+
+    /// Section 6: a tile truncates the queued reason. The 5.10 wording is
+    /// 50 characters and a tile is 156 px wide, so wrapped it made every
+    /// tile row in the grid that tall — the virtualiser reserves what a row
+    /// kind really paints — for as long as the transfer waited.
+    #[test]
+    fn a_queued_tile_keeps_the_grids_row_height() {
+        let ctx = ctx();
+        let now = Instant::now();
+        let row_height = |reason: &str| {
+            let mut state = browsed_tiles(8);
+            let mut files = FilesUi::default();
+            let video = state.timelapses[0].video.clone().expect("a video");
+            let cmd = state.download(&video,
+                                     Dest::Cache { open_after: true })
+                .expect("a download");
+            let Cmd::Download { id, .. } = cmd else {
+                panic!("a download");
+            };
+            state.apply(Event::Queued { id, reason: reason.to_string() });
+            // the first frame measures, the second reserves what it
+            // measured
+            for _ in 0..2 {
+                frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                      &view(P1S, now));
+            }
+            files.row_h.0[1]
+        };
+        let short = row_height("waiting");
+        let full = row_height(
+            "waiting: printer is printing, one download at a time");
+        assert_eq!(full, short,
+                   "the queued wording made every tile row taller");
+        assert!(full <= TILE_H + 1.0, "a tile row paints {full} px");
+    }
+
+    /// Section 6: "connecting…" carries the seconds elapsed. The phase is
+    /// ~0.9 s normally, but it also covers a stalled handshake and the one
+    /// retry behind it, which is when the counter is the point.
+    #[test]
+    fn a_starting_transfer_counts_the_seconds() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = files_ui(Tab::Timelapses);
+        let video = "/timelapse/video_2026-06-01_06-11-57.avi";
+        files.selected = Some(video.to_string());
+        click(&ctx, &mut state, &mut files, &view(P1S, Instant::now()),
+              "Download & play");
+        let started = Instant::now();
+
+        let later = view(P1S, started + Duration::from_secs(3));
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &later);
+        let seconds = painted.spots.iter()
+            .find_map(|(text, _)| text.strip_prefix("connecting ")
+                .and_then(|rest| rest.trim_end_matches(" s").parse::<u64>()
+                    .ok()))
+            .unwrap_or_else(|| panic!("no counter: {:?}", painted.spots));
+        assert!(seconds >= 3, "connecting {seconds} s after 3 s");
+        assert!(!painted.exact("connecting…"),
+                "the bare ellipsis is still painted");
+    }
+
+    /// 5.10: the "can't play this format in the app" card can be put away.
+    /// It used to stay above the grid for the rest of the visit, on every
+    /// tab, with nothing to dismiss it.
+    #[test]
+    fn the_player_error_card_can_be_dismissed() {
+        let ctx = ctx();
+        let mut state = browsed();
+        let mut files = FilesUi::default();
+        let path = Path::new("cache/file/0123456789abcdef.mp4");
+        let now = Instant::now();
+        let shown = || View {
+            player_error: Some("can't play this format in the app (MP4)"),
+            player_error_path: Some(path),
+            ..view(P1S, now)
+        };
+        let painted = frame(&ctx, raw(Vec::new()), &mut state, &mut files,
+                            &shown());
+        assert!(painted.exact("✕"), "the card cannot be dismissed");
+
+        let out = click(&ctx, &mut state, &mut files, &shown(), "✕");
+        assert!(out.actions.contains(&Action::ClosePlayer), "{:?}",
+                out.actions);
     }
 }

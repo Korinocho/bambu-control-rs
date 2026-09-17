@@ -4,20 +4,28 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod avi;
 mod browser;
+mod cache;
 mod camera;
 mod config;
 mod files;
 mod firmware;
 mod ftp;
+mod gcode;
 mod hms;
 mod instance;
 mod mqtt;
+mod player;
 mod theme;
+mod threemf;
 mod tls;
 mod ui;
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +33,7 @@ use egui::{Color32, CornerRadius, RichText, Sense, Stroke, StrokeKind};
 
 use browser::{BrowserState, Cmd, Event, FtpWorker};
 use config::{Config, PrinterCfg, model_from_serial};
+use player::{MjpegPlayer, PlayerCmd};
 use ui::dialogs::{self, Dialog};
 use ui::files_view::{self, FilesUi};
 use ui::panel::{self, PanelAction, PanelView};
@@ -44,13 +53,29 @@ struct PrinterUi {
     cam_texture: Option<egui::TextureHandle>,
     fw_latest_slot: Arc<Mutex<Option<String>>>,
     fw_latest: String,
-    /// browse lane: listings, thumbnails and the running job's bundle, on
-    /// one session at a time (design doc 4, rule 1)
+    /// browse lane and transfer lane: listings, thumbnails and the running
+    /// job's bundle on one session, user downloads on a second when one is
+    /// running (design doc 4, rules 1 and 2)
     ftp: FtpWorker,
+    /// the app's disk cache, shared by every printer (design doc 5.6)
+    cache: Arc<cache::Cache>,
     /// what the files view shows
     browser: BrowserState,
     /// the files view's own state: tab, filter, selection and textures
     files: FilesUi,
+    /// the open MJPEG player and the texture its frames go into
+    /// (design doc 5.9); `None` when the grid is showing
+    player: Option<Arc<MjpegPlayer>>,
+    player_tex: Option<egui::TextureHandle>,
+    /// why the last file could not be played, and the file it was about
+    /// when the OS player is the way out of it (section 7, option B). An
+    /// empty recording has nothing to open, so it carries no path.
+    player_error: Option<(String, Option<PathBuf>)>,
+    /// which local files may be handed to the Windows shell, answered by
+    /// `player::openable_by_shell` and remembered here: the verdict reads
+    /// the file's first bytes, and the view asks for it while painting
+    /// (design doc 5.1 rule 5; stage 3 security review, F2)
+    shell_openable: RefCell<HashMap<PathBuf, bool>>,
     job_bundle: Option<files::JobBundle>,
     plate_texture: Option<egui::TextureHandle>,
     current_job: String,
@@ -62,21 +87,25 @@ struct PrinterUi {
 }
 
 impl PrinterUi {
-    fn new(cfg: PrinterCfg, ctx: &egui::Context) -> Self {
-        Self::with_worker(cfg.clone(), ctx, FtpWorker::start(&cfg, ctx))
+    fn new(cfg: PrinterCfg, ctx: &egui::Context,
+           cache: Arc<cache::Cache>) -> Self {
+        let ftp = FtpWorker::start(&cfg, ctx, cache.clone());
+        Self::with_worker(cfg, ctx, ftp, cache)
     }
 
     /// The printer that replaces one whose connection was edited: its
-    /// worker opens no session until the old lane thread has ended
+    /// worker opens no session until the old lane threads have ended
     /// (design doc 4, rule 3).
     fn new_replacing(cfg: PrinterCfg, ctx: &egui::Context,
                      previous: &PrinterUi) -> Self {
-        let ftp = FtpWorker::start_replacing(&cfg, ctx, &previous.ftp);
-        Self::with_worker(cfg, ctx, ftp)
+        let cache = previous.cache.clone();
+        let ftp = FtpWorker::start_replacing(&cfg, ctx, &previous.ftp,
+                                             cache.clone());
+        Self::with_worker(cfg, ctx, ftp, cache)
     }
 
-    fn with_worker(cfg: PrinterCfg, ctx: &egui::Context,
-                   ftp: FtpWorker) -> Self {
+    fn with_worker(cfg: PrinterCfg, ctx: &egui::Context, ftp: FtpWorker,
+                   cache: Arc<cache::Cache>) -> Self {
         let client = mqtt::PrinterClient::start(
             &cfg.ip, &cfg.serial, &cfg.access_code, ctx.clone());
         let fw_latest_slot = Arc::new(Mutex::new(None));
@@ -90,8 +119,13 @@ impl PrinterUi {
             fw_latest_slot,
             fw_latest: String::new(),
             ftp,
+            cache,
             browser: BrowserState::default(),
             files: FilesUi::default(),
+            player: None,
+            player_tex: None,
+            player_error: None,
+            shell_openable: RefCell::new(HashMap::new()),
             job_bundle: None,
             plate_texture: None,
             current_job: String::new(),
@@ -120,12 +154,50 @@ impl PrinterUi {
         if let Some(cam) = self.camera.take() {
             cam.stop();
         }
+        self.close_player();
         self.client.stop();
         self.ftp.stop();
     }
 
+    /// Opens a local file in the app's MJPEG player (5.8). A format it
+    /// cannot decode is not a failure: the message and the OS player take
+    /// its place in the view (section 7, option B).
+    fn open_player(&mut self, path: PathBuf, speed: f32,
+                   ctx: &egui::Context) {
+        self.close_player();
+        match MjpegPlayer::open(path.clone(), self.cache.clone(),
+                                ctx.clone()) {
+            Ok(player) => {
+                // a cached copy is named by a hash, so the speed comes
+                // from the remote path the view resolved (section 7)
+                player.send(PlayerCmd::Speed(speed));
+                self.player = Some(player);
+            }
+            // only a format this app cannot decode has somewhere else to
+            // go; an empty recording has nothing to open (5.10)
+            Err(err) => {
+                let path = err.offers_os_player().then_some(path);
+                self.player_error = Some((err.text(), path));
+            }
+        }
+    }
+
+    /// Ends the decode thread and releases the file in the cache. It never
+    /// joins: the thread sees the flag and ends on its own (5.1, rule 7).
+    fn close_player(&mut self) {
+        if let Some(player) = self.player.take() {
+            player.stop();
+        }
+        self.player_tex = None;
+        self.player_error = None;
+    }
+
     /// Per-frame sync of async results into UI state.
     fn sync(&mut self, ctx: &egui::Context) {
+        // Textures are named by the hashed printer key, never by the
+        // serial: egui lists texture ids in its own inspection UI, and
+        // section 12 keeps the serial out of incidental strings.
+        let tex = cache::Cache::printer_key(&self.cfg.serial);
         if let Some(version) = self.fw_latest_slot.lock().unwrap().take() {
             self.fw_latest = version;
         }
@@ -136,8 +208,20 @@ impl PrinterUi {
                 Some(tex) => tex.set(frame, Default::default()),
                 None => {
                     self.cam_texture = Some(ctx.load_texture(
-                        format!("cam-{}", self.cfg.serial), frame,
-                        Default::default()));
+                        format!("cam-{tex}"), frame, Default::default()));
+                }
+            }
+        }
+        // the decode thread's latest frame becomes the texture; the UI
+        // thread only uploads it (design doc 5.1, rule 5)
+        if let Some(player) = &self.player
+            && let Some(frame) = player.frame.lock().unwrap().take()
+        {
+            match &mut self.player_tex {
+                Some(tex) => tex.set(frame, Default::default()),
+                None => {
+                    self.player_tex = Some(ctx.load_texture(
+                        format!("play-{tex}"), frame, Default::default()));
                 }
             }
         }
@@ -165,12 +249,18 @@ impl PrinterUi {
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 self.plate_texture = Some(ctx.load_texture(
-                    format!("plate-{}", self.cfg.serial),
+                    format!("plate-{tex}"),
                     egui::ColorImage::from_rgba_unmultiplied(
                         size, rgba.as_raw()),
                     Default::default()));
             }
             self.job_bundle = Some(bundle);
+        }
+        // "Download & play": the file landed, so the player opens on it,
+        // once (section 6). The remote path decides the starting speed.
+        if let Some((path, remote)) = self.browser.take_play_request() {
+            let speed = player::default_speed(&remote);
+            self.open_player(path, speed, ctx);
         }
 
         // auto-fetch job data when a new print shows up
@@ -219,6 +309,15 @@ impl PrinterUi {
     }
 }
 
+/// What one printer has in flight, for the confirmations of design doc 5.4:
+/// the rows the view started, or the worker's own queue when that is
+/// larger. The running job's 3mf over 1 MB and a big "Load preview" run on
+/// the transfer lane under reserved ids and have no row at all, so counting
+/// rows alone discarded an 86 MB download with no question asked.
+fn active_transfers(printer: &PrinterUi) -> usize {
+    printer.browser.active_transfers().max(printer.ftp.active_transfers())
+}
+
 enum ToolIcon {
     Edit,
     Add,
@@ -235,8 +334,26 @@ struct App {
     started: bool,
     /// config.toml; writes nothing after a failed load
     store: config::Store,
+    /// the disk cache of design doc 5.6, one per app
+    cache: Arc<cache::Cache>,
     /// a failed save, or an unreadable config.toml; shown above the panel
     config_error: Option<String>,
+    /// the app was asked to close while transfers were running, so the
+    /// close was cancelled and the question is on screen (design doc 5.4)
+    pending_close: bool,
+    /// the user confirmed the close: every worker is stopped and the app
+    /// exits without waiting for a thread (5.1, rule 7)
+    closing: bool,
+    /// a connection edit waiting for its confirmation, because that
+    /// printer still has transfers running (section 6)
+    pending_edit: Option<(usize, PrinterCfg)>,
+    /// `BAMBU_CONTROL_PLAY="<remote path>"` starts "Download & play" on
+    /// that file as soon as the listing naming it arrives. Debug builds
+    /// only, like `BAMBU_CONTROL_OPEN_FILES`: it exists so the stage's
+    /// screenshots can be taken without driving the mouse, and nothing of
+    /// it is in a release build.
+    #[cfg(debug_assertions)]
+    debug_play: Option<String>,
 }
 
 impl App {
@@ -250,8 +367,15 @@ impl App {
                 "config.toml can't be read; nothing is written until it is \
                  fixed ({e})"))),
         };
+        // stale .part files from a previous run are deleted here: without
+        // resume they are worthless (design doc 5.6)
+        let cache = cache::Cache::open(cfg.files.cache_cap_bytes());
+        // "Save to PC" writes outside the cache, so its folder is swept
+        // too: a crash during one would otherwise leave the whole file's
+        // bytes in the user's Downloads folder for ever (5.6)
+        cache.sweep_save_parts(&cache::save_root());
         let printers: Vec<PrinterUi> = cfg.printers.iter()
-            .map(|p| PrinterUi::new(p.clone(), ctx))
+            .map(|p| PrinterUi::new(p.clone(), ctx, cache.clone()))
             .collect();
         let dialog = if printers.is_empty() && !store.is_blocked() {
             Dialog::AddPrinter(dialogs::AddPrinterDlg {
@@ -264,7 +388,10 @@ impl App {
         };
         let mut app = Self {
             cfg, printers, selected: 0, dialog, view: AppView::Panel,
-            started: false, store, config_error,
+            started: false, store, cache, config_error,
+            pending_close: false, closing: false, pending_edit: None,
+            #[cfg(debug_assertions)]
+            debug_play: std::env::var("BAMBU_CONTROL_PLAY").ok(),
         };
         if migrated {
             app.save_config();
@@ -359,7 +486,17 @@ impl App {
         ctx.request_repaint_after(Duration::from_millis(100));
         // a dialog is painted over this view (Edit printer, for example):
         // it owns the keyboard while it is open (design doc 6)
+        /// The cache's usage is a walk of the whole cache directory, and
+        /// this view repaints at least ten times a second, so it is
+        /// re-walked at most this often (design doc 5.1, rule 5). Clear
+        /// cache and every finished download forget the memo, so the line
+        /// never keeps showing a figure that has changed.
+        const CACHE_USAGE_REFRESH: Duration = Duration::from_secs(2);
+
         let dialog_open = !matches!(self.dialog, Dialog::None);
+        let cache_usage = self.cache.usage_bytes_cached(CACHE_USAGE_REFRESH);
+        let cache_cap = self.cache.cap_bytes();
+        let disk = self.cache.clone();
         let (actions, cmds) = {
             let printer = &mut self.printers[selected];
             let status = printer.ftp.status();
@@ -368,17 +505,69 @@ impl App {
                 matches!(panel::s_str(&state, "gcode_state"),
                          "RUNNING" | "PAUSE")
             };
+            // a complete, key-matching copy on disk is not a download: the
+            // detail pane offers Play and the folder for it instead of an
+            // ETA (design doc 5.6). The key is the worker's own, so the two
+            // always name the same file.
+            let printer_key = cache::Cache::printer_key(&printer.cfg.serial);
+            let cached = move |entry: &ftp::RemoteEntry| -> Option<PathBuf> {
+                let key = cache::Cache::key(&printer_key, entry, None);
+                let ext = browser::extension_of(&entry.name);
+                disk.get(&printer_key, cache::Kind::File, key, &ext)
+            };
+            // Whether a local file may be handed to the Windows shell: its
+            // header and its extension must agree that it is media, because
+            // the shell picks its program by extension and runs whatever it
+            // finds, while a name off the card can lie about both (design
+            // doc 5.8, section 7; stage 3 security review, F2). The answer
+            // reads the file's first bytes, so it is taken once per path and
+            // remembered: the view asks while it paints (5.1, rule 5).
+            let verdicts = &printer.shell_openable;
+            let shell_openable = move |path: &Path| -> bool {
+                if let Some(known) = verdicts.borrow().get(path) {
+                    return *known;
+                }
+                let verdict = player::openable_by_shell(path);
+                verdicts.borrow_mut().insert(path.to_path_buf(), verdict);
+                verdict
+            };
+            // the fields are split apart here so the view can change the
+            // browser state while it reads the player next to it
+            let PrinterUi { cfg, browser, files, player, player_tex,
+                            player_error, .. } = printer;
+            let player_view = player.as_ref().map(|player| {
+                files_view::PlayerView {
+                    title: player.path().file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("recording"),
+                    texture: player_tex.as_ref(),
+                    index: player.index.as_ref(),
+                    pos: player.pos.load(Ordering::SeqCst),
+                    playing: player.is_playing(),
+                    speed: player.speed(),
+                    path: player.path(),
+                    skipped: player.skipped(),
+                }
+            });
             let view = files_view::View {
-                name: &printer.cfg.name,
-                serial: &printer.cfg.serial,
+                name: &cfg.name,
+                serial: &cfg.serial,
                 profile: status.profile,
                 open_sessions: status.open_sessions,
                 printing,
                 dialog_open,
                 now: Instant::now(),
+                cache_usage,
+                cache_cap,
+                cached: Some(&cached),
+                shell_openable: Some(&shell_openable),
+                player: player_view,
+                player_error: player_error.as_ref()
+                    .map(|(text, _)| text.as_str()),
+                player_error_path: player_error.as_ref()
+                    .and_then(|(_, path)| path.as_deref()),
             };
-            let out = files_view::show(ui, &mut printer.browser,
-                                       &mut printer.files, &view);
+            let out = files_view::show(ui, browser, files, &view);
             (out.actions, out.cmds)
         };
         for cmd in cmds {
@@ -388,7 +577,34 @@ impl App {
             match action {
                 files_view::Action::Back => {
                     self.printers[selected].files.close();
+                    self.printers[selected].close_player();
                     self.view = AppView::Panel;
+                }
+                files_view::Action::Play { path, speed } =>
+                    self.printers[selected].open_player(path, speed, ctx),
+                files_view::Action::ClosePlayer =>
+                    self.printers[selected].close_player(),
+                files_view::Action::Player(cmd) => {
+                    if let Some(player) = &self.printers[selected].player {
+                        player.send(cmd);
+                    }
+                }
+                // the OS player and Explorer (design doc 7, option B)
+                files_view::Action::OpenExternally(path) => {
+                    if let Err(e) = opener::open(&path) {
+                        self.config_error =
+                            Some(format!("couldn't open the file ({e})"));
+                    }
+                }
+                files_view::Action::Reveal(path) => {
+                    if let Err(e) = opener::reveal(&path) {
+                        self.config_error =
+                            Some(format!("couldn't show the file ({e})"));
+                    }
+                }
+                files_view::Action::ClearCache => {
+                    // it skips the file the player has open (5.6)
+                    self.cache.clear();
                 }
                 files_view::Action::Refresh => {
                     let printer = &mut self.printers[selected];
@@ -555,6 +771,17 @@ impl App {
                                         .color(color)
                                         .font(theme::bold(11.0)));
                                 }
+                                // the download badge of section 6: the
+                                // previous printer's transfers keep running
+                                // and stay visible on its chip
+                                if let Some(pct) =
+                                    printer.browser.running_percent()
+                                {
+                                    ui.label(RichText::new(
+                                        format!("↓ {pct}%"))
+                                        .color(theme::ACCENT)
+                                        .font(theme::bold(11.0)));
+                                }
                             });
                         })
                         .response
@@ -657,24 +884,24 @@ impl App {
                             let conn_changed = new_cfg.ip != old.ip
                                 || new_cfg.serial != old.serial
                                 || new_cfg.access_code != old.access_code;
-                            if conn_changed {
-                                self.printers[index].shutdown();
-                                // the replacement opens no session until the
-                                // old lane thread has ended (4, rule 3)
-                                let replacement = PrinterUi::new_replacing(
-                                    new_cfg, ctx, &self.printers[index]);
-                                self.printers[index] = replacement;
-                                if index == self.selected {
-                                    self.printers[index]
-                                        .set_active(true, ctx);
-                                }
-                            } else {
-                                self.printers[index].cfg = new_cfg;
+                            let running =
+                                active_transfers(&self.printers[index]);
+                            match (conn_changed, running) {
+                                // a connection edit replaces the worker, so
+                                // its transfers are discarded: ask first
+                                // (design doc 5.4)
+                                (true, 1..) =>
+                                    self.pending_edit = Some((index,
+                                                              new_cfg)),
+                                (true, 0) =>
+                                    self.apply_edit(index, new_cfg, ctx),
+                                (false, _) =>
+                                    self.printers[index].cfg = new_cfg,
                             }
                         }
                         _ => {
-                            self.printers
-                                .push(PrinterUi::new(new_cfg, ctx));
+                            self.printers.push(PrinterUi::new(
+                                new_cfg, ctx, self.cache.clone()));
                             let last = self.printers.len() - 1;
                             self.select(last, ctx);
                         }
@@ -807,9 +1034,19 @@ impl App {
             Dialog::ConfirmRemove => {
                 let name =
                     self.printers[self.selected].cfg.name.clone();
+                // removing a printer stops its worker, so a running
+                // download is discarded and the question says so (5.4)
+                let running =
+                    active_transfers(&self.printers[self.selected]);
+                let mut text = format!("Remove {name} from the app?");
+                if let Some(note) =
+                    files_view::active_transfer_note(running)
+                {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
                 let (close, yes) = dialogs::show_confirm(
-                    ctx, "confirm-remove",
-                    &format!("Remove {name} from the app?"), "Remove");
+                    ctx, "confirm-remove", &text, "Remove");
                 if yes {
                     let mut printer = self.printers.remove(self.selected);
                     printer.shutdown();
@@ -823,6 +1060,89 @@ impl App {
                 if !close {
                     self.dialog = Dialog::ConfirmRemove;
                 }
+            }
+        }
+    }
+
+    /// Replaces a printer whose connection was edited. Its worker is
+    /// stopped and the replacement opens no session until the old lane
+    /// threads have ended (design doc 4, rule 3).
+    fn apply_edit(&mut self, index: usize, new_cfg: PrinterCfg,
+                  ctx: &egui::Context) {
+        self.printers[index].shutdown();
+        let replacement =
+            PrinterUi::new_replacing(new_cfg, ctx, &self.printers[index]);
+        self.printers[index] = replacement;
+        if index == self.selected {
+            self.printers[index].set_active(true, ctx);
+        }
+    }
+
+    /// Starts the "Download & play" named by `BAMBU_CONTROL_PLAY`, once the
+    /// listing that carries the file has arrived. Debug builds only; it
+    /// goes through exactly the path the button does, so what the
+    /// screenshots show is the real one.
+    #[cfg(debug_assertions)]
+    fn start_debug_play(&mut self) {
+        let Some(wanted) = self.debug_play.clone() else { return };
+        let Some(printer) = self.printers.get_mut(self.selected) else {
+            return;
+        };
+        let found = printer.browser.timelapses.iter()
+            .filter_map(|item| item.video.clone())
+            .find(|video| video.path == wanted);
+        let Some(video) = found else { return };
+        printer.files.selected = Some(video.path.clone());
+        if let Some(cmd) = printer.browser
+            .download(&video, browser::Dest::Cache { open_after: true })
+        {
+            printer.ftp.send(cmd);
+        }
+        self.debug_play = None;
+    }
+
+    /// Transfers running across every printer, for the close confirmation.
+    fn running_transfers(&self) -> usize {
+        self.printers.iter().map(active_transfers).sum()
+    }
+
+    /// The confirmations that are not part of `Dialog`: closing the app and
+    /// editing a connection, both of which discard running transfers
+    /// (design doc 5.4, section 6).
+    fn show_confirmations(&mut self, ctx: &egui::Context) {
+        if self.pending_close {
+            let note = files_view::active_transfer_note(
+                self.running_transfers()).unwrap_or_default();
+            let (close, yes) = dialogs::show_confirm(
+                ctx, "confirm-close",
+                &format!("Close Bambu Control?\n{note}"), "Close anyway");
+            if yes {
+                // stop everything and go; `.part` files left behind are
+                // deleted at the next start (design doc 5.4)
+                self.closing = true;
+                for printer in &mut self.printers {
+                    printer.shutdown();
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if close {
+                self.pending_close = false;
+            }
+        }
+        if let Some((index, cfg)) = self.pending_edit.clone() {
+            let running = self.printers.get(index).map_or(0, active_transfers);
+            let note = files_view::active_transfer_note(running)
+                .unwrap_or_default();
+            let (close, yes) = dialogs::show_confirm(
+                ctx, "confirm-edit",
+                &format!("Change this printer's connection?\n{note}"),
+                "Change");
+            if yes {
+                self.apply_edit(index, cfg, ctx);
+                self.save_config();
+            }
+            if close {
+                self.pending_edit = None;
             }
         }
     }
@@ -916,11 +1236,23 @@ impl eframe::App for App {
         if self.selected >= self.printers.len() {
             self.selected = 0;
         }
+        #[cfg(debug_assertions)]
+        self.start_debug_play();
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
+
+        // closing with a transfer running asks first: the close is
+        // cancelled and the question goes on screen (design doc 5.4)
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.closing
+            && self.running_transfers() > 0
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_close = true;
+        }
 
         egui::Panel::top("bar")
             .show_separator_line(false)
@@ -1042,6 +1374,7 @@ impl eframe::App for App {
             });
 
         self.show_dialog(ctx);
+        self.show_confirmations(ctx);
     }
 
     fn on_exit(&mut self) {
