@@ -596,7 +596,21 @@ pub struct SessionConns { list: Mutex<Vec<Arc<ConnTls>>>, cancelled: AtomicBool,
 /// close_notify like suppaftp's RustlsStream (nothing for an unused or failed connection),
 /// written within 2 s.
 pub struct AnchoredStream { io: AnchoredIo, close_notify: bool }
+impl AnchoredStream {
+    /// Caller-supplied per-operation budget for reads and writes AFTER the handshake.
+    /// None (the default) leaves the construction io_timeout in force. Only tightens.
+    pub fn set_command_budget(&mut self, budget: Option<Duration>);
+}
 ```
+
+**Caller-supplied command budget (its own change, landing before issue #1).**
+
+`io_timeout` is one value serving two purposes whose magnitudes are incompatible. It is the per-operation budget for a handshake that measures 0.78-0.91 s on these printers, and — once MQTT runs its own loop over the verified stream (10.5, option 2a) — it would also be the latency floor for a UI command that wants roughly 250 ms. The current profiles are 20 s (browse) and 15 s (camera), at which pause, jog and light would be unusable. The fix is **two budgets, not one deadline applied uniformly**:
+
+- **Handshake budget — unchanged, and derived from construction only.** `io_timeout` per operation, `io_timeout * HANDSHAKE_IO_TIMEOUTS` for the phase. `AnchoredIo::handshake` ignores any caller budget outright. A 250 ms command budget must never be able to kill a handshake: that would be today's defect with more steps, and it is the first thing the tests assert.
+- **Command budget — reads and writes after the handshake is done.** Effective value is `min(caller budget, io_timeout)`. The construction `io_timeout` stays a hard ceiling, so a per-call value can only ever tighten. If a call could lengthen it, one distracted caller would hold a lane open indefinitely. This is the same tightening-only idiom `SessionSocket::wait` already uses for its phase deadline.
+- **Default preserved, and asserted.** With no caller budget the effective per-operation limit is exactly the construction `io_timeout`. That gets its own test: existing FTP tests continuing to pass is necessary but not sufficient, since they would pass whether or not the default path changed.
+- **`AnchoredConnector::new` keeps its signature.** FTPS and the camera pass no budget and are untouched. The FTP path exercises the new code by default, which is why this lands before the MQTT migration rather than inside it: if the plumbing is wrong, it fails against code that already works and has tests.
 
 **Models and certificate generations.**
 - **Serial prefixes.**
@@ -706,6 +720,7 @@ Connections (stage 1b):
 - **T27** Time limits, handshake placement and cancel (5.2, Error reporting). Each test asserts its elapsed time wherever it waits:
   - `silent_peer_ends_within_the_io_timeout`, `stalled_and_broken_handshakes_are_recorded_as_such`, `stalled_data_handshake_is_a_handshake_stall`;
   - `trickling_peer_is_bounded_by_the_handshake_limit` (2 IO timeouts, however the peer paces its bytes);
+  - the caller-supplied command budget (5.2): `a_command_budget_never_shortens_the_handshake` (a short command budget against a slow handshake, which must still complete — the condition that keeps the fix from being the old bug with more steps), `a_shorter_command_budget_is_honoured`, `a_longer_command_budget_is_still_capped_by_construction`, and `without_a_command_budget_the_limit_is_the_construction_timeout` (so "the default is preserved" is asserted, not declared);
   - `writes_to_a_peer_that_never_reads_end_within_the_io_timeout` (and the drop after it within the close limit);
   - `dropping_a_stream_never_waits_for_the_peer`, `refusal_returns_promptly_while_the_peer_keeps_the_socket_open`;
   - `cancel_ends_a_stalled_handshake_within_a_poll_slice`, `cancel_ends_a_stalled_retr_read`;
