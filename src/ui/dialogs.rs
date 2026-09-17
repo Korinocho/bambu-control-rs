@@ -132,9 +132,25 @@ pub(crate) fn accent_button_reason(ui: &mut egui::Ui, text: &str,
         return accent_button_response(ui, text, min_size).clicked();
     };
     let btn = egui::Button::new(
-        RichText::new(text).font(font::button_strong()))
-        .min_size(min_size);
-    widgets::button(ui, btn, Some(reason))
+        RichText::new(text).font(font::button_strong()));
+    widgets::button_sized(ui, btn, min_size, Some(reason))
+}
+
+/// The accent action at exactly `size`, for a block whose height is added
+/// up before it is painted (O3).
+pub(crate) fn accent_button_exact(ui: &mut egui::Ui, text: &str,
+                                  size: egui::Vec2,
+                                  reason: Option<&str>) -> bool {
+    let Some(reason) = reason else {
+        let btn = egui::Button::new(
+            RichText::new(text).color(theme::ON_ACCENT)
+                .font(font::button_strong()))
+            .fill(theme::ACCENT);
+        return ui.add_sized(size, btn).clicked();
+    };
+    let btn = egui::Button::new(
+        RichText::new(text).font(font::button_strong()));
+    widgets::button_sized(ui, btn, size, Some(reason))
 }
 
 // ------------------------------------------------------------ add/edit

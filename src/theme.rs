@@ -196,6 +196,16 @@ pub fn row_height(ui: &egui::Ui, font: &egui::FontId) -> f32 {
     ui.fonts_mut(|fonts| fonts.row_height(font))
 }
 
+/// The height egui gives one laid-out line of `font`. A galley is a
+/// little taller than the font's row height, and it is the galley that
+/// decides how tall a label or a button comes out, so a block that adds
+/// up its lines before it paints them measures with this (1.8, O3).
+pub fn line_height(ui: &egui::Ui, font: &egui::FontId) -> f32 {
+    ui.fonts_mut(|fonts| fonts.layout_no_wrap("Ag".to_string(),
+                                              font.clone(), TEXT)
+        .size().y).ceil()
+}
+
 /// The width `text` takes on one line in `font`: what a slot is sized for
 /// (E10).
 pub fn text_width(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
