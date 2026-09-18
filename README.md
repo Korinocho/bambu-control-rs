@@ -25,8 +25,34 @@ verify printers, and is not covered by this project's license.
 - Live printer status over MQTT (LAN mode): temperatures, progress, current job, AMS.
 - Camera stream from the printer.
 - Job files over FTPS: sliced `.3mf` metadata, plate thumbnails and object boxes.
+- A file browser over FTPS: timelapses, camera recordings and print files, with
+  thumbnails, downloads to your PC and an in-app player for timelapses.
+- Skip objects on a running print, picked on a map of the plate.
 - HMS error code lookup, so errors show a description instead of a number.
 - Firmware version information.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![The printer panel: camera, job card with progress, temperature and light cards, and the AMS trays](docs/screenshots/panel.png) | ![The files view on Timelapses: a grid of thumbnails with the selected one's details and its download actions](docs/screenshots/files-timelapses.png) |
+| The printer panel while a job runs | Timelapses, with a file's details and actions |
+| ![The files view on Print files: sliced jobs in rows, with the selected 3mf's facts and its plate preview](docs/screenshots/files-print-files.png) | ![The Skip objects dialog: the plate drawn as a map, with one object selected and one already skipped](docs/screenshots/skip-objects.png) |
+| Print files, with a sliced `.3mf` and its plate | Skipping objects on the plate map |
+
+These are rendered from the app's own test fixtures — a made-up printer at a
+`192.0.2.x` TEST-NET address with a zeroed serial — so no real address, serial or
+access code appears in them, and the camera well holds a placeholder frame rather
+than a live picture. To render them again:
+
+```sh
+BAMBU_SNAPSHOT_DIR=shots \
+BAMBU_SNAPSHOT_ONLY=panel-printing,files-timelapses,files-3mf,dlg-skip \
+  cargo test --bins --release -- --ignored screenshot_matrix
+```
+
+and copy `shots/<scene>-1080x780@1.0.png` over the four files in
+`docs/screenshots/`.
 
 ## Requirements
 
