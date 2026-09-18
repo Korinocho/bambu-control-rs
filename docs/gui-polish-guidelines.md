@@ -1,6 +1,6 @@
 # Bambu Control: GUI polish guidelines
 
-Baseline: branch `printer-files`, commit `d9a75ff`, eframe/egui 0.35.0. Every `file:line` below points at that commit and was checked against the source, not against a running build. When a number comes from egui's layout rules and was not measured, it is marked "≈" and names the stage test that must measure it. If HEAD has moved, re-anchor the line numbers before acting on them.
+Baseline: branch `development`, commit `d9a75ff`, eframe/egui 0.35.0. Every `file:line` below points at that commit and was checked against the source, not against a running build. When a number comes from egui's layout rules and was not measured, it is marked "≈" and names the stage test that must measure it. If HEAD has moved, re-anchor the line numbers before acting on them.
 
 ---
 
