@@ -17,6 +17,8 @@ mod hms;
 mod instance;
 mod mqtt;
 mod player;
+#[cfg(test)]
+mod snapshots;
 mod theme;
 mod threemf;
 mod tls;
@@ -29,7 +31,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, CornerRadius, RichText, Sense, Stroke, StrokeKind};
+use egui::{RichText, Sense, Stroke, StrokeKind};
+
+use theme::{font, pad, radius, size, stroke};
 
 use browser::{BrowserState, Cmd, Event, FtpWorker};
 use config::{Config, PrinterCfg, model_from_serial};
@@ -71,11 +75,20 @@ struct PrinterUi {
     /// when the OS player is the way out of it (section 7, option B). An
     /// empty recording has nothing to open, so it carries no path.
     player_error: Option<(String, Option<PathBuf>)>,
+    /// why "Open in player" or "Show in folder" last failed, shown in the
+    /// files view until Back or the next one that works (C3)
+    open_error: Option<String>,
     /// which local files may be handed to the Windows shell, answered by
     /// `player::openable_by_shell` and remembered here: the verdict reads
     /// the file's first bytes, and the view asks for it while painting
     /// (design doc 5.1 rule 5; stage 3 security review, F2)
     shell_openable: RefCell<HashMap<PathBuf, bool>>,
+    /// Which remote entries already have a complete copy on disk. The
+    /// answer is an `is_file()` on the cache's own key, which the detail
+    /// pane asked for on every frame it painted (E30, D08). Both this and
+    /// `shell_openable` are forgotten when a transfer of any file
+    /// finishes, on Clear cache and on Back (E28).
+    cached_copy: RefCell<HashMap<String, Option<PathBuf>>>,
     job_bundle: Option<files::JobBundle>,
     plate_texture: Option<egui::TextureHandle>,
     current_job: String,
@@ -84,6 +97,20 @@ struct PrinterUi {
     last_job: String,
     last_gcode_state: String,
     light_pending: Option<(bool, Instant)>,
+    /// the printer never agreed with the last light command (C18, D40)
+    light_unconfirmed: bool,
+    /// The HMS errors on screen, resolved once: a lookup takes the global
+    /// table's lock per code, and the banner asked for three of them on
+    /// every frame it painted (D38). Rebuilt in `sync` when the codes
+    /// change, which is the only thing that changes the lines.
+    hms_codes: Vec<String>,
+    hms_lines: Vec<String>,
+    /// a player being opened on a thread: the file, the speed it asked
+    /// for, and the slot the thread leaves the result in (E30, D07)
+    #[allow(clippy::type_complexity, reason = "one slot, read in sync")]
+    opening: Option<(PathBuf, f32,
+                     Arc<Mutex<Option<Result<Arc<MjpegPlayer>,
+                                             player::PlayerError>>>>)>,
 }
 
 impl PrinterUi {
@@ -125,13 +152,19 @@ impl PrinterUi {
             player: None,
             player_tex: None,
             player_error: None,
+            open_error: None,
             shell_openable: RefCell::new(HashMap::new()),
+            cached_copy: RefCell::new(HashMap::new()),
             job_bundle: None,
             plate_texture: None,
             current_job: String::new(),
             last_job: String::new(),
             last_gcode_state: String::new(),
+            hms_codes: Vec::new(),
+            hms_lines: Vec::new(),
             light_pending: None,
+            light_unconfirmed: false,
+            opening: None,
         }
     }
 
@@ -164,11 +197,29 @@ impl PrinterUi {
     /// Opens a local file in the app's MJPEG player (5.8). A format it
     /// cannot decode is not a failure: the message and the OS player take
     /// its place in the view (section 7, option B).
+    /// Opening walks the whole AVI to build its index, which on a long
+    /// timelapse takes seconds: it runs on a thread and the view says
+    /// "Opening…" until the result lands in `opening` (E30, E31, D07).
     fn open_player(&mut self, path: PathBuf, speed: f32,
                    ctx: &egui::Context) {
         self.close_player();
-        match MjpegPlayer::open(path.clone(), self.cache.clone(),
-                                ctx.clone()) {
+        let slot = Arc::new(Mutex::new(None));
+        self.opening = Some((path.clone(), speed, slot.clone()));
+        let (cache, ctx) = (self.cache.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let opened = MjpegPlayer::open(path, cache, ctx.clone());
+            *slot.lock().unwrap() = Some(opened);
+            ctx.request_repaint();
+        });
+    }
+
+    /// The opening thread's result, taken in `sync`.
+    fn take_opened(&mut self) {
+        let Some((path, speed, slot)) = &self.opening else { return };
+        let Some(opened) = slot.lock().unwrap().take() else { return };
+        let (path, speed) = (path.clone(), *speed);
+        self.opening = None;
+        match opened {
             Ok(player) => {
                 // a cached copy is named by a hash, so the speed comes
                 // from the remote path the view resolved (section 7)
@@ -182,6 +233,44 @@ impl PrinterUi {
                 self.player_error = Some((err.text(), path));
             }
         }
+    }
+
+    /// The HMS lines the banner shows, resolved when the codes change and
+    /// not while painting (D38). The table is fetched once, here, for the
+    /// same reason.
+    fn sync_hms(&mut self, ctx: &egui::Context) {
+        let codes: Vec<String> = {
+            let state = self.client.state.lock().unwrap();
+            state.get("hms").and_then(|v| v.as_array())
+                .map(|errors| errors.iter().take(3)
+                    .map(|error| {
+                        let field = |name: &str| error.get(name)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        hms::ecode(field("attr"), field("code"))
+                    })
+                    .collect())
+                .unwrap_or_default()
+        };
+        if codes == self.hms_codes {
+            return;
+        }
+        if !codes.is_empty() {
+            hms::ensure_loaded(ctx);
+        }
+        // description only; the code stays in the dialog
+        self.hms_lines = codes.iter()
+            .map(|ecode| hms::lookup(ecode)
+                .unwrap_or_else(|| hms::dashed(ecode)))
+            .collect();
+        self.hms_codes = codes;
+    }
+
+    /// Forgets what this printer knows about the disk: which files have a
+    /// copy, and which may be handed to the shell (E28).
+    fn forget_disk_answers(&mut self) {
+        self.cached_copy.borrow_mut().clear();
+        self.shell_openable.borrow_mut().clear();
     }
 
     /// Ends the decode thread and releases the file in the cache. It never
@@ -227,6 +316,7 @@ impl PrinterUi {
                 }
             }
         }
+        self.take_opened();
         // at most 64 worker events per frame (design doc 5.9)
         for _ in 0..64 {
             let Ok(event) = self.ftp.events.try_recv() else { break };
@@ -239,6 +329,11 @@ impl PrinterUi {
                 // the files view (stage 2 part 2) shows the rest; a bundle
                 // for another job is dropped, as JobFetcher dropped it
                 event => {
+                    // a transfer that landed changed the disk, so what
+                    // this printer knows about it is forgotten (E28)
+                    if matches!(event, Event::Done { .. }) {
+                        self.forget_disk_answers();
+                    }
                     for cmd in self.browser.apply(event) {
                         self.ftp.send(cmd);
                     }
@@ -250,11 +345,15 @@ impl PrinterUi {
             {
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
-                self.plate_texture = Some(ctx.load_texture(
-                    format!("plate-{tex}"),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        size, rgba.as_raw()),
-                    Default::default()));
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    size, rgba.as_raw());
+                // a job that follows another replaces the picture in the
+                // texture it already has (E35)
+                match &mut self.plate_texture {
+                    Some(handle) => handle.set(image, Default::default()),
+                    None => self.plate_texture = Some(ctx.load_texture(
+                        format!("plate-{tex}"), image, Default::default())),
+                }
             }
             self.job_bundle = Some(bundle);
         }
@@ -265,17 +364,21 @@ impl PrinterUi {
             self.open_player(path, speed, ctx);
         }
 
-        // auto-fetch job data when a new print shows up
-        let state = self.client.state.lock().unwrap().clone();
-        let gcode_state = panel::s_str(&state, "gcode_state").to_string();
-        let job = {
-            let s = panel::s_str(&state, "subtask_name");
-            if s.is_empty() {
-                panel::s_str(&state, "gcode_file")
-            } else {
-                s
-            }
-        }.to_string();
+        self.sync_hms(ctx);
+        // auto-fetch job data when a new print shows up. The four fields
+        // this needs are read under the lock: cloning the whole map here
+        // copied every printer's telemetry on every frame (E25, D35)
+        let (gcode_state, job, file_name, print_type) = {
+            let state = self.client.state.lock().unwrap();
+            let job = match panel::s_str(&state, "subtask_name") {
+                "" => panel::s_str(&state, "gcode_file"),
+                name => name,
+            };
+            (panel::s_str(&state, "gcode_state").to_string(),
+             job.to_string(),
+             panel::s_str(&state, "gcode_file").to_string(),
+             panel::s_str(&state, "print_type").to_string())
+        };
         // a job preparing or starting closes an idle session at once
         // (design doc 4, rule 5)
         if gcode_state != self.last_gcode_state || job != self.last_job {
@@ -302,11 +405,7 @@ impl PrinterUi {
             self.plate_texture = None;
             // a fetch still running for the previous job name is cancelled,
             // and this one runs on the browse session (design doc 5.4)
-            self.ftp.send(Cmd::JobBundle {
-                job,
-                file_name: panel::s_str(&state, "gcode_file").to_string(),
-                print_type: panel::s_str(&state, "print_type").to_string(),
-            });
+            self.ftp.send(Cmd::JobBundle { job, file_name, print_type });
         }
     }
 }
@@ -323,8 +422,31 @@ fn active_transfers(printer: &PrinterUi) -> usize {
 enum ToolIcon {
     Edit,
     Add,
-    Trash,
 }
+
+/// The tool buttons' glyphs, in points from the button's centre: geometry
+/// private to that one painter. Segments are [x0, y0, x1, y1].
+mod tool_icon {
+
+    pub const STROKE: f32 = 1.7;
+    pub const PENCIL_STROKE: f32 = 2.4;
+    pub const PLUS_H: [f32; 4] = [-6.0, 0.0, 6.0, 0.0];
+    pub const PLUS_V: [f32; 4] = [0.0, -6.0, 0.0, 6.0];
+    pub const PENCIL_BODY: [f32; 4] = [-4.5, 5.5, 4.0, -3.0];
+    pub const PENCIL_TIP: [[f32; 2]; 4] =
+        [[4.9, -6.4], [6.4, -4.9], [3.2, -2.2], [2.2, -3.2]];
+
+}
+
+/// The chip drag feedback: how far the insertion marker sits outside the
+/// chips, and where the ghost trails the pointer.
+const MARKER_GAP: f32 = 4.0;
+const MARKER_OVERHANG: f32 = 3.0;
+const GHOST_OFFSET: egui::Vec2 = egui::vec2(14.0, 10.0);
+
+/// How long a light command waits for telemetry to agree before the switch
+/// goes back to what the printer reports.
+const LIGHT_PENDING: Duration = Duration::from_secs(6);
 
 struct App {
     cfg: Config,
@@ -338,6 +460,16 @@ struct App {
     store: config::Store,
     /// the disk cache of design doc 5.6, one per app
     cache: Arc<cache::Cache>,
+    /// The cache's used bytes, walked on a thread: the walk reads every
+    /// file in the cache directory and must never run inside a frame
+    /// (E30, D08). The figure the view shows is the last one that landed;
+    /// `asked_at` keeps the 2 s rule, and Clear cache and a transfer that
+    /// finishes clear the memo in `cache` itself (E28).
+    cache_usage: Arc<Mutex<Option<u64>>>,
+    cache_asked_at: Option<Instant>,
+    /// Clear cache deletes files, so it runs on a thread too; while the
+    /// flag is up the button says "Clearing…" (E30, E31).
+    clearing: Arc<std::sync::atomic::AtomicBool>,
     /// a failed save, or an unreadable config.toml; shown above the panel
     config_error: Option<String>,
     /// the app was asked to close while transfers were running, so the
@@ -391,6 +523,9 @@ impl App {
         let mut app = Self {
             cfg, printers, selected: 0, dialog, view: AppView::Panel,
             started: false, store, cache, config_error,
+            cache_usage: Arc::new(Mutex::new(None)),
+            cache_asked_at: None,
+            clearing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_close: false, closing: false, pending_edit: None,
             #[cfg(debug_assertions)]
             debug_play: std::env::var("BAMBU_CONTROL_PLAY").ok(),
@@ -399,6 +534,42 @@ impl App {
             app.save_config();
         }
         app
+    }
+
+    /// Ctrl+scroll and Ctrl+plus change egui's zoom; the level is saved so
+    /// the next launch opens at it (decision O7). A zoom change is a user
+    /// action, so the one small atomic write it costs is allowed (E30).
+    fn save_zoom(&mut self, ctx: &egui::Context) {
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.cfg.ui.zoom).abs() < 0.001 {
+            return;
+        }
+        self.cfg.ui.zoom = zoom;
+        self.save_config();
+    }
+
+    /// The cache's used bytes for this frame: the last figure a walk
+    /// landed, and a new walk started at most once per
+    /// `CACHE_USAGE_REFRESH` (E28, E30). A frame never walks the disk.
+    fn cache_usage(&mut self, ctx: &egui::Context) -> u64 {
+        /// The walk reads every file in the cache directory, so it runs
+        /// at most this often (design doc 5.1, rule 5).
+        const CACHE_USAGE_REFRESH: Duration = Duration::from_secs(2);
+
+        let stale = self.cache_asked_at
+            .is_none_or(|asked| asked.elapsed() >= CACHE_USAGE_REFRESH);
+        if stale && !self.clearing.load(Ordering::SeqCst) {
+            self.cache_asked_at = Some(Instant::now());
+            let (cache, slot) =
+                (self.cache.clone(), self.cache_usage.clone());
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let bytes = cache.usage_bytes();
+                *slot.lock().unwrap() = Some(bytes);
+                ctx.request_repaint();
+            });
+        }
+        self.cache_usage.lock().unwrap().unwrap_or(0)
     }
 
     /// Saves atomically and shows a failure. While config.toml is unreadable
@@ -484,20 +655,15 @@ impl App {
     /// The files view of design doc 6, in place of the printer panel.
     fn show_files(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let selected = self.selected;
-        // the session line ticks while a session connects or sits idle
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // no repaint rate of its own: every counter and every gate in the
+        // view asks for the moment it needs, and the earliest wins (E32,
+        // D34). An idle view with a listing repaints once a second.
         // a dialog is painted over this view (Edit printer, for example):
         // it owns the keyboard while it is open (design doc 6)
-        /// The cache's usage is a walk of the whole cache directory, and
-        /// this view repaints at least ten times a second, so it is
-        /// re-walked at most this often (design doc 5.1, rule 5). Clear
-        /// cache and every finished download forget the memo, so the line
-        /// never keeps showing a figure that has changed.
-        const CACHE_USAGE_REFRESH: Duration = Duration::from_secs(2);
-
         let dialog_open = !matches!(self.dialog, Dialog::None);
-        let cache_usage = self.cache.usage_bytes_cached(CACHE_USAGE_REFRESH);
+        let cache_usage = self.cache_usage(ctx);
         let cache_cap = self.cache.cap_bytes();
+        let clearing = self.clearing.load(Ordering::SeqCst);
         let disk = self.cache.clone();
         let (actions, cmds) = {
             let printer = &mut self.printers[selected];
@@ -512,10 +678,17 @@ impl App {
             // ETA (design doc 5.6). The key is the worker's own, so the two
             // always name the same file.
             let printer_key = cache::Cache::printer_key(&printer.cfg.serial);
+            let copies = &printer.cached_copy;
             let cached = move |entry: &ftp::RemoteEntry| -> Option<PathBuf> {
+                if let Some(known) = copies.borrow().get(&entry.path) {
+                    return known.clone();
+                }
                 let key = cache::Cache::key(&printer_key, entry, None);
                 let ext = browser::extension_of(&entry.name);
-                disk.get(&printer_key, cache::Kind::File, key, &ext)
+                let hit = disk.get(&printer_key, cache::Kind::File, key,
+                                   &ext);
+                copies.borrow_mut().insert(entry.path.clone(), hit.clone());
+                hit
             };
             // Whether a local file may be handed to the Windows shell: its
             // header and its extension must agree that it is media, because
@@ -536,7 +709,7 @@ impl App {
             // the fields are split apart here so the view can change the
             // browser state while it reads the player next to it
             let PrinterUi { cfg, browser, files, player, player_tex,
-                            player_error, .. } = printer;
+                            player_error, open_error, .. } = printer;
             let player_view = player.as_ref().map(|player| {
                 files_view::PlayerView {
                     title: player.path().file_name()
@@ -561,6 +734,8 @@ impl App {
                 now: Instant::now(),
                 cache_usage,
                 cache_cap,
+                clearing,
+                opening: printer.opening.is_some(),
                 cached: Some(&cached),
                 shell_openable: Some(&shell_openable),
                 player: player_view,
@@ -568,6 +743,7 @@ impl App {
                     .map(|(text, _)| text.as_str()),
                 player_error_path: player_error.as_ref()
                     .and_then(|(_, path)| path.as_deref()),
+                open_error: open_error.as_deref(),
             };
             let out = files_view::show(ui, browser, files, &view);
             (out.actions, out.cmds)
@@ -578,6 +754,8 @@ impl App {
         for action in actions {
             match action {
                 files_view::Action::Back => {
+                    self.printers[selected].forget_disk_answers();
+                    self.printers[selected].open_error = None;
                     self.printers[selected].files.close();
                     self.printers[selected].close_player();
                     self.view = AppView::Panel;
@@ -592,21 +770,38 @@ impl App {
                     }
                 }
                 // the OS player and Explorer (design doc 7, option B)
+                // a failure is said in the files view, where it happened,
+                // and not in the settings-error slot above every page (C3)
                 files_view::Action::OpenExternally(path) => {
-                    if let Err(e) = opener::open(&path) {
-                        self.config_error =
-                            Some(format!("couldn't open the file ({e})"));
-                    }
+                    self.printers[selected].open_error = opener::open(&path)
+                        .err()
+                        .map(|e| format!("couldn't open the file ({e})"));
                 }
                 files_view::Action::Reveal(path) => {
-                    if let Err(e) = opener::reveal(&path) {
-                        self.config_error =
-                            Some(format!("couldn't show the file ({e})"));
-                    }
+                    self.printers[selected].open_error = opener::reveal(&path)
+                        .err()
+                        .map(|e| format!("couldn't show the file ({e})"));
                 }
                 files_view::Action::ClearCache => {
-                    // it skips the file the player has open (5.6)
-                    self.cache.clear();
+                    // deleting every cached file is disk work: it runs on
+                    // a thread, and the button says so until it is done
+                    // (E30, E31, D08)
+                    let (cache, clearing) =
+                        (self.cache.clone(), self.clearing.clone());
+                    let usage = self.cache_usage.clone();
+                    let ctx = ctx.clone();
+                    clearing.store(true, Ordering::SeqCst);
+                    self.cache_asked_at = None;
+                    for printer in &mut self.printers {
+                        printer.forget_disk_answers();
+                    }
+                    std::thread::spawn(move || {
+                        // it skips the file the player has open (5.6)
+                        cache.clear();
+                        *usage.lock().unwrap() = Some(cache.usage_bytes());
+                        clearing.store(false, Ordering::SeqCst);
+                        ctx.request_repaint();
+                    });
                 }
                 files_view::Action::Refresh => {
                     let printer = &mut self.printers[selected];
@@ -655,62 +850,65 @@ impl App {
     }
 
     // ------------------------------------------------------------ chips
-    fn tool_button(ui: &mut egui::Ui, icon: ToolIcon,
-                   tip: &str) -> bool {
+    /// One icon button. With a `reason` it doesn't sense clicks at all: it
+    /// draws in the dim colour and says why on hover, instead of looking
+    /// live and swallowing the click (D11, D23, A11).
+    fn tool_button(ui: &mut egui::Ui, icon: ToolIcon, tip: &str,
+                   reason: Option<&str>) -> bool {
+        let sense = match reason {
+            Some(_) => Sense::hover(),
+            None => Sense::click(),
+        };
         let (rect, response) = ui.allocate_exact_size(
-            egui::vec2(36.0, 30.0), Sense::click());
+            size::ICON_BUTTON, sense);
         let visuals = ui.style().interact(&response);
-        ui.painter().rect(rect, CornerRadius::same(10),
+        let color = match reason {
+            Some(_) => theme::TEXT_DIM,
+            None => theme::TEXT,
+        };
+        ui.painter().rect(rect, radius::CONTROL,
                           visuals.bg_fill, visuals.bg_stroke,
                           StrokeKind::Inside);
         let c = rect.center();
-        let s = Stroke::new(1.7, theme::TEXT);
+        let at = |[x, y]: [f32; 2]| c + egui::Vec2::new(x, y);
+        let segment = |[x0, y0, x1, y1]: [f32; 4]| [at([x0, y0]), at([x1, y1])];
+        let s = Stroke::new(tool_icon::STROKE, color);
         let p = ui.painter();
         match icon {
             ToolIcon::Add => {
-                p.line_segment([c + egui::vec2(-6.0, 0.0),
-                                c + egui::vec2(6.0, 0.0)], s);
-                p.line_segment([c + egui::vec2(0.0, -6.0),
-                                c + egui::vec2(0.0, 6.0)], s);
+                p.line_segment(segment(tool_icon::PLUS_H), s);
+                p.line_segment(segment(tool_icon::PLUS_V), s);
             }
             ToolIcon::Edit => {
                 // pencil: body + tip
-                let body = Stroke::new(2.4, theme::TEXT);
-                p.line_segment([c + egui::vec2(-4.5, 5.5),
-                                c + egui::vec2(4.0, -3.0)], body);
+                let body = Stroke::new(tool_icon::PENCIL_STROKE, color);
+                p.line_segment(segment(tool_icon::PENCIL_BODY), body);
                 p.add(egui::Shape::convex_polygon(
-                    vec![c + egui::vec2(4.9, -6.4),
-                         c + egui::vec2(6.4, -4.9),
-                         c + egui::vec2(3.2, -2.2),
-                         c + egui::vec2(2.2, -3.2)],
-                    theme::TEXT, Stroke::NONE));
-            }
-            ToolIcon::Trash => {
-                // lid + handle
-                p.line_segment([c + egui::vec2(-7.0, -5.0),
-                                c + egui::vec2(7.0, -5.0)], s);
-                p.line_segment([c + egui::vec2(-2.5, -7.5),
-                                c + egui::vec2(2.5, -7.5)], s);
-                // body
-                let body = egui::Rect::from_min_max(
-                    c + egui::vec2(-5.0, -3.0), c + egui::vec2(5.0, 7.0));
-                p.rect(body, CornerRadius::same(2),
-                       Color32::TRANSPARENT, s, StrokeKind::Inside);
-                // inner lines
-                p.line_segment([c + egui::vec2(-1.7, -1.0),
-                                c + egui::vec2(-1.7, 5.0)],
-                               Stroke::new(1.2, theme::TEXT));
-                p.line_segment([c + egui::vec2(1.7, -1.0),
-                                c + egui::vec2(1.7, 5.0)],
-                               Stroke::new(1.2, theme::TEXT));
+                    tool_icon::PENCIL_TIP.iter().map(|point| at(*point))
+                        .collect(),
+                    color, Stroke::NONE));
             }
         }
-        if response.hovered() {
-            ui.output_mut(|o| {
-                o.cursor_icon = egui::CursorIcon::PointingHand;
-            });
+        // an icon button has no text, so its name is the one on its
+        // tooltip (A9)
+        let enabled = reason.is_none();
+        let named = |response: egui::Response| {
+            response.widget_info(|| egui::WidgetInfo::labeled(
+                egui::WidgetType::Button, enabled, tip));
+            response
+        };
+        let response = named(response);
+        // the cursor changes only where the click acts (A11, E23)
+        match reason {
+            Some(reason) => {
+                response.on_hover_text(reason);
+                false
+            }
+            None => response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(tip)
+                .clicked(),
         }
-        response.on_hover_text(tip).clicked()
     }
 
     fn chips_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -727,7 +925,10 @@ impl App {
                     panel::s_str(&state, "gcode_state").to_string();
                 let pct = panel::s_i64(&state, "mc_percent").unwrap_or(0);
                 drop(state);
-                let color = theme::state_color(&gcode_state);
+                // a printer the app cannot reach reads Offline, with no
+                // percentage: its last telemetry is not news (C4, D10)
+                let online = printer.client.conn.lock().unwrap().0;
+                let (word, color) = theme::state_word(&gcode_state, online);
                 let selected = i == self.selected;
                 let is_dragged = dragging == Some(i);
 
@@ -737,41 +938,55 @@ impl App {
                         // cursor
                         ui.multiply_opacity(0.35);
                     }
-                    egui::Frame::new()
-                        .fill(theme::CARD)
-                        .stroke(if selected {
-                            Stroke::new(2.0, Color32::WHITE)
-                        } else {
-                            Stroke::new(1.0, theme::BORDER)
-                        })
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(egui::Margin::symmetric(12, 6))
-                        .show(ui, |ui| {
+                    // the chip is the widget, so hover, pressed and
+                    // focus land on it and the drag starts on it (C2, C4)
+                    ui::widgets::clickable_sense(
+                        ui, ("chip", printer.cfg.serial.as_str()),
+                        &format!("{} — {word}", printer.cfg.name),
+                        ui::widgets::Surface::card()
+                            .radius(radius::CONTROL)
+                            .padding(pad::CHIP)
+                            .selected(selected, false)
+                            .ring(theme::CHIP_SELECTED),
+                        Sense::click_and_drag(),
+                        |ui| {
                             ui.horizontal(|ui| {
+                                let label = font::label();
                                 // baseline-aligned status dot
                                 ui.label(RichText::new("●")
-                                    .size(10.0).color(color));
-                                ui.label(RichText::new(&printer.cfg.name)
-                                    .font(theme::bold(14.0)));
-                                let mut parts = Vec::new();
-                                if !gcode_state.is_empty() {
-                                    let mut s = gcode_state.to_lowercase();
-                                    if let Some(c) = s.get_mut(0..1) {
-                                        c.make_ascii_uppercase();
-                                    }
-                                    parts.push(s);
+                                    .font(font::caption()).color(color));
+                                // a long name is truncated, and egui shows
+                                // it whole on hover (C4)
+                                let name = &printer.cfg.name;
+                                let strong = font::body_strong();
+                                let name_w = theme::text_width(ui, name,
+                                                               &strong)
+                                    .min(size::CHIP_NAME_MAX_W);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(name_w, size::CONTROL_H),
+                                    egui::Layout::left_to_right(
+                                        egui::Align::Center),
+                                    |ui| {
+                                        ui.set_width(name_w);
+                                        ui.add(egui::Label::new(
+                                            RichText::new(name).font(strong))
+                                            .truncate());
+                                    });
+                                if !word.is_empty() {
+                                    ui.label(RichText::new(&word)
+                                        .color(color).font(label.clone()));
                                 }
+                                // numbers sit in slots for their widest
+                                // value, so 9% becoming 10% moves no chip
+                                // to the right of this one (C4)
                                 if matches!(gcode_state.as_str(),
                                             "RUNNING" | "PAUSE")
-                                    && pct > 0
+                                    && pct > 0 && online
                                 {
-                                    parts.push(format!("{pct}%"));
-                                }
-                                if !parts.is_empty() {
-                                    ui.label(RichText::new(
-                                        parts.join("  "))
-                                        .color(color)
-                                        .font(theme::bold(11.0)));
+                                    ui::widgets::slot(ui, "100%",
+                                        RichText::new(format!("{pct}%"))
+                                            .color(color),
+                                        &label, egui::Align::Min);
                                 }
                                 // the download badge of section 6: the
                                 // previous printer's transfers keep running
@@ -779,23 +994,21 @@ impl App {
                                 if let Some(pct) =
                                     printer.browser.running_percent()
                                 {
-                                    ui.label(RichText::new(
-                                        format!("↓ {pct}%"))
-                                        .color(theme::ACCENT)
-                                        .font(theme::bold(11.0)));
+                                    ui::widgets::slot(ui, "↓ 100%",
+                                        RichText::new(format!("↓ {pct}%"))
+                                            .color(theme::ACCENT),
+                                        &label, egui::Align::Min);
                                 }
                             });
-                        })
-                        .response
+                        }).response
                 }).inner;
 
-                let response = frame_response
-                    .interact(Sense::click_and_drag());
+                let mut response = frame_response;
                 chip_rects.push(response.rect);
-                if response.hovered() && dragging.is_none() {
-                    ui.output_mut(|o| {
-                        o.cursor_icon = egui::CursorIcon::PointingHand;
-                    });
+                // while something is being dragged the grab cursor rules
+                if dragging.is_none() {
+                    response = response.on_hover_cursor(
+                        egui::CursorIcon::PointingHand);
                 }
                 if response.clicked() {
                     clicked = Some(i);
@@ -810,9 +1023,7 @@ impl App {
         if let Some(src) = dragging
             && src < self.printers.len()
         {
-            ctx.output_mut(|o| {
-                o.cursor_icon = egui::CursorIcon::Grabbing;
-            });
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             let pointer = ctx.input(|i| i.pointer.latest_pos());
             if let Some(pos) = pointer
                 && !chip_rects.is_empty()
@@ -824,33 +1035,35 @@ impl App {
                 let moves = slot != src && slot != src + 1;
                 if moves {
                     let x = if slot == 0 {
-                        chip_rects[0].left() - 4.0
+                        chip_rects[0].left() - MARKER_GAP
                     } else if slot >= chip_rects.len() {
-                        chip_rects.last().unwrap().right() + 4.0
+                        chip_rects.last().unwrap().right() + MARKER_GAP
                     } else {
                         (chip_rects[slot - 1].right()
                          + chip_rects[slot].left()) / 2.0
                     };
-                    let top = chip_rects[0].top() - 3.0;
-                    let bottom = chip_rects[0].bottom() + 3.0;
+                    let top = chip_rects[0].top() - MARKER_OVERHANG;
+                    let bottom = chip_rects[0].bottom() + MARKER_OVERHANG;
                     ui.painter().line_segment(
                         [egui::pos2(x, top), egui::pos2(x, bottom)],
-                        Stroke::new(3.0, theme::ACCENT));
+                        Stroke::new(stroke::HEAVY, theme::ACCENT));
                 }
                 // ghost tile following the cursor
                 let name = self.printers[src].cfg.name.clone();
                 egui::Area::new(egui::Id::new("chip-ghost"))
                     .order(egui::Order::Tooltip)
-                    .fixed_pos(pos + egui::vec2(14.0, 10.0))
+                    .fixed_pos(pos + GHOST_OFFSET)
                     .interactable(false)
                     .show(ctx, |ui| {
                         egui::Frame::new()
                             .fill(theme::CARD_HOVER)
-                            .stroke(Stroke::new(1.5, Color32::WHITE))
-                            .corner_radius(CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(12, 6))
+                            .stroke(Stroke::new(stroke::MEDIUM,
+                                                theme::CHIP_SELECTED))
+                            .corner_radius(radius::CONTROL)
+                            .inner_margin(pad::CHIP)
                             .show(ui, |ui| {
-                                ui.label(RichText::new(name).font(theme::bold(14.0)));
+                                ui.label(RichText::new(name)
+                                    .font(font::body_strong()));
                             });
                     });
                 if ctx.input(|i| i.pointer.any_released()) {
@@ -879,6 +1092,11 @@ impl App {
             Dialog::AddPrinter(mut dlg) => {
                 let (result, close) =
                     dialogs::show_add_printer(ctx, &mut dlg);
+                if let dialogs::AddResult::Remove(index) = result {
+                    // the confirmation of 5.4 still asks, and it says
+                    // what a running download would lose (O13)
+                    self.dialog = Dialog::ConfirmRemove(index);
+                }
                 if let dialogs::AddResult::Save(new_cfg, editing) = result {
                     match editing {
                         Some(index) if index < self.printers.len() => {
@@ -967,7 +1185,12 @@ impl App {
             }
             Dialog::Skip(mut dlg) => {
                 let printer = &self.printers[self.selected];
+                // a new job cleared the bundle while the dialog was open:
+                // it says so and waits for Close instead of vanishing (D12)
                 let Some(bundle) = printer.job_bundle.clone() else {
+                    if !dialogs::show_skip_gone(ctx) {
+                        self.dialog = Dialog::Skip(dlg);
+                    }
                     return;
                 };
                 let live: HashSet<i64> = {
@@ -1033,13 +1256,14 @@ impl App {
                     self.dialog = Dialog::ConfirmStop;
                 }
             }
-            Dialog::ConfirmRemove => {
-                let name =
-                    self.printers[self.selected].cfg.name.clone();
+            Dialog::ConfirmRemove(index) => {
+                if index >= self.printers.len() {
+                    return;
+                }
+                let name = self.printers[index].cfg.name.clone();
                 // removing a printer stops its worker, so a running
                 // download is discarded and the question says so (5.4)
-                let running =
-                    active_transfers(&self.printers[self.selected]);
+                let running = active_transfers(&self.printers[index]);
                 let mut text = format!("Remove {name} from the app?");
                 if let Some(note) =
                     files_view::active_transfer_note(running)
@@ -1050,17 +1274,17 @@ impl App {
                 let (close, yes) = dialogs::show_confirm(
                     ctx, "confirm-remove", &text, "Remove");
                 if yes {
-                    let mut printer = self.printers.remove(self.selected);
+                    let mut printer = self.printers.remove(index);
                     printer.shutdown();
                     self.save_config();
                     if !self.printers.is_empty() {
-                        let index =
+                        let next =
                             self.selected.min(self.printers.len() - 1);
-                        self.select(index, ctx);
+                        self.select(next, ctx);
                     }
                 }
                 if !close {
-                    self.dialog = Dialog::ConfirmRemove;
+                    self.dialog = Dialog::ConfirmRemove(index);
                 }
             }
         }
@@ -1215,6 +1439,7 @@ impl App {
             }
             PanelAction::SetLight(on) => {
                 printer.light_pending = Some((on, Instant::now()));
+                printer.light_unconfirmed = false;
                 printer.client.set_light(on);
             }
             PanelAction::OpenFiles => self.open_files(),
@@ -1226,6 +1451,8 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.started {
             self.started = true;
+            // the zoom the window was left at (decision O7)
+            ctx.set_zoom_factor(self.cfg.ui.zoom_factor());
             if !self.printers.is_empty() {
                 self.select(0, ctx);
             }
@@ -1238,6 +1465,7 @@ impl eframe::App for App {
         if self.selected >= self.printers.len() {
             self.selected = 0;
         }
+        self.save_zoom(ctx);
         #[cfg(debug_assertions)]
         self.start_debug_play();
     }
@@ -1259,31 +1487,46 @@ impl eframe::App for App {
         egui::Panel::top("bar")
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(theme::BG)
-                .inner_margin(egui::Margin::symmetric(10, 8)))
+                .inner_margin(pad::BAR))
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    self.chips_bar(ui, ctx);
-                    ui.with_layout(egui::Layout::right_to_left(
-                        egui::Align::Center), |ui| {
-                        if Self::tool_button(ui, ToolIcon::Trash,
-                                             "Remove current printer")
-                            && !self.printers.is_empty()
-                        {
-                            self.dialog = Dialog::ConfirmRemove;
-                        }
-                        if Self::tool_button(ui, ToolIcon::Add,
-                                             "Add printer")
-                        {
-                            self.dialog = Dialog::AddPrinter(
-                                dialogs::AddPrinterDlg {
-                                    draft: PrinterCfg::default(),
-                                    editing: None,
-                                    error: String::new(),
-                                });
-                        }
+                // the bar is a chip tall; the tool buttons take the right
+                // end of it first and the chips get what is left, so a
+                // long chip row is cut off rather than pushing Edit, Add
+                // and Remove out of the window (C4, D09)
+                let gap = ui.spacing().item_spacing.x;
+                let chip_h = size::CONTROL_H + pad::CHIP.sum().y
+                    + 2.0 * stroke::HAIRLINE;
+                let (bar, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), chip_h), Sense::hover());
+                // Edit and Add; Remove moved into the Edit dialog (O13)
+                let tools_w = 2.0 * size::ICON_BUTTON.x + gap;
+                let chips = egui::Rect::from_min_max(
+                    bar.min,
+                    egui::pos2((bar.max.x - tools_w - gap).max(bar.min.x),
+                               bar.max.y));
+                let mut chips_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(chips)
+                    .layout(egui::Layout::left_to_right(egui::Align::Min)));
+                chips_ui.set_clip_rect(chips.intersect(ui.clip_rect()));
+                self.chips_bar(&mut chips_ui, ctx);
+                // the tools sit at the right end, laid out left to right
+                // inside it, so the keyboard walks them in the order the
+                // eye reads them (A8)
+                let tools = egui::Rect::from_min_max(
+                    egui::pos2((bar.max.x - tools_w).max(bar.min.x),
+                               bar.min.y),
+                    bar.max);
+                let mut tools_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(tools)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                {
+                    let ui = &mut tools_ui;
+                        // with no printers there is nothing to edit or
+                        // remove, and the buttons say so (D11)
+                        let none = self.printers.is_empty()
+                            .then_some("No printers yet");
                         if Self::tool_button(ui, ToolIcon::Edit,
-                                             "Edit current printer")
-                            && !self.printers.is_empty()
+                                             "Edit current printer", none)
                         {
                             self.dialog = Dialog::AddPrinter(
                                 dialogs::AddPrinterDlg {
@@ -1293,16 +1536,28 @@ impl eframe::App for App {
                                     error: String::new(),
                                 });
                         }
-                    });
-                });
+                        if Self::tool_button(ui, ToolIcon::Add,
+                                             "Add printer", None)
+                        {
+                            self.dialog = Dialog::AddPrinter(
+                                dialogs::AddPrinterDlg {
+                                    draft: PrinterCfg::default(),
+                                    editing: None,
+                                    error: String::new(),
+                                });
+                        }
+                }
             });
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG)
-                .inner_margin(10))
+                .inner_margin(pad::PAGE))
             .show(root, |ui| {
                 if let Some(error) = &self.config_error {
-                    ui.label(RichText::new(error).color(theme::DANGER));
+                    ui.push_id("settings-error", |ui| {
+                        ui::widgets::banner(ui, ui::widgets::Tone::Danger,
+                                            None, error);
+                    });
                 }
                 // the files view is a full page, outside the panel's
                 // ScrollArea: a nested show_rows inside it would break the
@@ -1311,13 +1566,17 @@ impl eframe::App for App {
                     self.show_files(ui, ctx);
                     return;
                 }
-                egui::ScrollArea::vertical().auto_shrink(false)
+                // one scroll offset per printer (E1, D06)
+                let panel_salt = ("panel", self.printers.get(self.selected)
+                    .map(|printer| printer.cfg.serial.clone()));
+                egui::ScrollArea::vertical().id_salt(panel_salt)
+                    .auto_shrink(false)
                     .show(ui, |ui| {
                 if self.printers.is_empty() {
                     ui.centered_and_justified(|ui| {
                         ui.label(RichText::new(
                             "Add a printer to get started")
-                            .color(theme::TEXT_DIM).size(15.0));
+                            .color(theme::TEXT_DIM).font(font::title()));
                     });
                     return;
                 }
@@ -1330,12 +1589,20 @@ impl eframe::App for App {
                 let mut shown_on =
                     panel::light_on(&state).unwrap_or(false);
                 if let Some((desired, ts)) = printer.light_pending {
-                    if shown_on == desired
-                        || ts.elapsed().as_secs() > 6
-                    {
+                    if shown_on == desired {
                         printer.light_pending = None;
+                        printer.light_unconfirmed = false;
+                    } else if ts.elapsed() > LIGHT_PENDING {
+                        // the command went and telemetry never agreed: say
+                        // so rather than snapping the switch back (C18, D40)
+                        printer.light_pending = None;
+                        printer.light_unconfirmed = true;
                     } else {
                         shown_on = desired;
+                        // the timeout is a deadline: without it nothing
+                        // would repaint to notice it passed (E32)
+                        ctx.request_repaint_after(
+                            LIGHT_PENDING.saturating_sub(ts.elapsed()));
                     }
                 }
 
@@ -1365,7 +1632,10 @@ impl eframe::App for App {
                     fw_latest: printer.fw_latest.clone(),
                     show_humidity: !model.contains("A1"),
                     model,
+                    hms: &printer.hms_lines,
                     light_shown_on: shown_on,
+                    light_pending: printer.light_pending.is_some(),
+                    light_unconfirmed: printer.light_unconfirmed,
                     files_summary,
                 };
                 let actions = panel::show(ui, &view);
@@ -1414,8 +1684,8 @@ fn main() -> eframe::Result {
         };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 780.0])
-            .with_min_inner_size([700.0, 480.0])
+            .with_inner_size(size::WINDOW)
+            .with_min_inner_size(size::WINDOW_MIN)
             .with_title("Bambu Control")
             .with_icon(load_icon()),
         ..Default::default()

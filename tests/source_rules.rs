@@ -144,6 +144,324 @@ fn production_mqtt_sites_pass_the_port_constant() {
                 {literals} outside comments");
 }
 
+/// The literals docs/gui-polish-guidelines.md 1.11 keeps out of the UI code:
+/// every colour, font size, radius, margin, spacing, stroke and widget size
+/// is a `theme` token (T1, T2).
+const TOKEN_RULES: &[(&str, &str)] = &[
+    ("colour", r"Color32::from_(rgb|rgba_unmultiplied|rgba_premultiplied|gray|black_alpha|white_alpha)\("),
+    ("colour", r"Color32::(BLACK|WHITE)\b"),
+    ("font", r"\.size\(\s*[0-9]"),
+    ("font", r"FontId::(new|proportional|monospace)\("),
+    ("font", r"bold\(\s*[0-9]"),
+    ("radius", r"CornerRadius::same\(\s*[0-9]"),
+    ("radius", r"corner_radius\(\s*[0-9]"),
+    ("margin", r"Margin::(same|symmetric)\(\s*[0-9]"),
+    ("margin", r"inner_margin\(\s*[0-9]"),
+    ("spacing", r"add_space\(\s*[0-9]"),
+    ("spacing", r"item_spacing(\.[xy])?\s*="),
+    ("stroke", r"Stroke::new\(\s*[0-9]"),
+    ("size", r"vec2\(\s*[0-9.]+\s*,\s*[0-9]"),
+    ("size", r"desired_(width|height)\(\s*[0-9]"),
+    ("size", r"\.width\(\s*[0-9]"),
+    ("size", r"max_height\(\s*[0-9]"),
+];
+
+/// `src/ui/*.rs` and `src/main.rs`, each up to its unit-test module. The cut
+/// is `#[cfg(test)]` followed by `mod tests`, not the first `#[cfg(test)]`:
+/// main.rs declares the test-only `snapshots` module near its top.
+fn ui_production_sources() -> Vec<(PathBuf, String)> {
+    let ui = root().join("src").join("ui");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(ui)
+        .expect("readable src/ui")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "rs"))
+        .collect();
+    files.push(root().join("src").join("main.rs"));
+    files.sort();
+    files.into_iter()
+        .map(|file| {
+            let text = std::fs::read_to_string(&file).expect("utf-8 source");
+            let production = text.split("#[cfg(test)]\nmod tests")
+                .next().unwrap_or(&text).to_string();
+            (file, production)
+        })
+        .collect()
+}
+
+/// Every line matching a rule, skipping named consts and comments (1.11).
+fn token_hits(file: &Path, text: &str) -> Vec<String> {
+    let rules: Vec<(&str, regex_lite::Regex)> = TOKEN_RULES.iter()
+        .map(|(kind, pattern)| (*kind, regex_lite::Regex::new(pattern)
+            .expect("a valid pattern")))
+        .collect();
+    let mut found = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("const ") || trimmed.starts_with("pub const ")
+            || trimmed.starts_with("//")
+        {
+            continue;
+        }
+        for (kind, rule) in &rules {
+            if rule.is_match(line) {
+                found.push(format!("{}:{}: {kind}: {}", file.display(), i + 1,
+                                   line.trim()));
+            }
+        }
+    }
+    found
+}
+
+/// T2: the UI code takes every visual value from `theme` (1.11).
+#[test]
+fn ui_code_uses_theme_tokens_only() {
+    let sources = ui_production_sources();
+    // the scan read what it claims to: every UI file, with its code in it
+    for needle in ["main.rs", "panel.rs", "files_view.rs", "dialogs.rs",
+                   "widgets.rs"] {
+        let (_, text) = sources.iter()
+            .find(|(file, _)| file.ends_with(needle))
+            .unwrap_or_else(|| panic!("{needle} was not scanned"));
+        assert!(text.lines().count() > 100,
+                "{needle}: only {} lines scanned", text.lines().count());
+    }
+    let main = &sources.iter().find(|(f, _)| f.ends_with("main.rs"))
+        .expect("main.rs").1;
+    assert!(main.contains("fn chips_bar("), "main.rs was cut short");
+    let found: Vec<String> = sources.iter()
+        .flat_map(|(file, text)| token_hits(file, text))
+        .collect();
+    assert!(found.is_empty(), "literals outside theme.rs:\n{}",
+            found.join("\n"));
+}
+
+/// The control for the scan above: each rule finds the literal it names, and
+/// a named const or a comment is left alone.
+#[test]
+fn the_token_scan_finds_each_kind_of_literal() {
+    let sample = "\
+        let a = Color32::from_rgb(1, 2, 3);\n\
+        let b = Color32::WHITE;\n\
+        text.size(11.0);\n\
+        FontId::proportional(13.0);\n\
+        theme::bold(12.0);\n\
+        CornerRadius::same(10);\n\
+        frame.corner_radius(12);\n\
+        egui::Margin::symmetric(10, 4);\n\
+        frame.inner_margin(8);\n\
+        ui.add_space(6.0);\n\
+        ui.spacing_mut().item_spacing.y = 3.0;\n\
+        Stroke::new(1.0, theme::BORDER);\n\
+        egui::vec2(36.0, 30.0);\n\
+        edit.desired_width(180.0);\n\
+        combo.width(72.0);\n\
+        area.max_height(150.0);\n\
+        const NAMED: Vec2 = vec2(16.0, 12.0);\n\
+        // add_space(4.0) in prose\n\
+        ui.add_space(space::M);\n";
+    let found = token_hits(Path::new("sample.rs"), sample);
+    let lines: Vec<usize> = found.iter()
+        .map(|hit| hit.split(':').nth(1).expect("a line number").parse()
+            .expect("a number"))
+        .collect();
+    assert_eq!(lines, (1..=16).collect::<Vec<_>>(), "{found:#?}");
+}
+
+/// Every `ScrollArea` statement names its state with `id_salt` before it is
+/// shown (E1), and no `push_id` is keyed by a row index (E2). Returns what
+/// breaks either rule.
+fn identity_hits(file: &Path, text: &str) -> Vec<String> {
+    let scroll = regex_lite::Regex::new(
+        r"ScrollArea::(vertical|horizontal|both)\(\)").expect("pattern");
+    let show = regex_lite::Regex::new(r"\.show(_viewport|_rows)?\(")
+        .expect("pattern");
+    let by_index = regex_lite::Regex::new(r"push_id\(\s*(row|index|i)\s*,")
+        .expect("pattern");
+    let line_of = |at: usize| text[..at].lines().count();
+    let mut found = Vec::new();
+    for start in scroll.find_iter(text) {
+        let statement = match show.find(&text[start.end()..]) {
+            Some(end) => &text[start.end()..start.end() + end.start()],
+            None => &text[start.end()..],
+        };
+        if !statement.contains(".id_salt(") {
+            found.push(format!("{}:{}: ScrollArea without id_salt",
+                               file.display(), line_of(start.start())));
+        }
+    }
+    for hit in by_index.find_iter(text) {
+        found.push(format!("{}:{}: push_id keyed by an index",
+                           file.display(), line_of(hit.start())));
+    }
+    found
+}
+
+/// E1, E2: scroll state and row ids have names of their own.
+#[test]
+fn ui_state_is_keyed_by_identity() {
+    let sources = ui_production_sources();
+    let scrolls = sources.iter()
+        .map(|(_, text)| text.matches("ScrollArea::vertical()").count())
+        .sum::<usize>();
+    assert!(scrolls >= 8, "only {scrolls} scroll areas scanned");
+    let found: Vec<String> = sources.iter()
+        .flat_map(|(file, text)| identity_hits(file, text))
+        .collect();
+    assert!(found.is_empty(), "unnamed state:\n{}", found.join("\n"));
+}
+
+/// The control for the scan above.
+#[test]
+fn the_identity_scan_finds_unnamed_state() {
+    let sample = "\
+        egui::ScrollArea::vertical().max_height(9.0).show(ui, |ui| {});\n\
+        egui::ScrollArea::vertical().id_salt(\"x\").show(ui, |ui| {});\n\
+        ui.push_id(row, |ui| {});\n\
+        ui.push_id(transfer.id, |ui| {});\n";
+    let found = identity_hits(Path::new("sample.rs"), sample);
+    assert_eq!(found, ["sample.rs:1: ScrollArea without id_salt",
+                       "sample.rs:3: push_id keyed by an index"]);
+}
+
+/// Every line that reaches for a pattern the rules name instead of the
+/// helper that replaces it (E23, E24, E44).
+fn state_hits(file: &Path, text: &str) -> Vec<String> {
+    let rules: [(&str, &str); 3] = [
+        (r"cursor_icon\s*=", "cursor set through output_mut"),
+        (r"\.interact\(\s*(egui::)?Sense::click",
+         "container made clickable after the fact"),
+        (r"\{[a-z_.]*:\?\}", "Debug formatting in text a user sees"),
+    ];
+    let line_of = |at: usize| text[..at].lines().count();
+    let mut found = Vec::new();
+    for (pattern, why) in rules {
+        let rule = regex_lite::Regex::new(pattern).expect("pattern");
+        for hit in rule.find_iter(text) {
+            found.push(format!("{}:{}: {why}",
+                               file.display(), line_of(hit.start())));
+        }
+    }
+    found.sort_by_key(|line| line.split(':').nth(1)
+        .and_then(|number| number.parse::<usize>().ok()).unwrap_or(0));
+    found
+}
+
+/// The body of every `std::thread::spawn(…)` in `text`, as byte ranges.
+fn spawned_blocks(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut blocks = Vec::new();
+    for (at, _) in text.match_indices("std::thread::spawn") {
+        let Some(open) = text[at..].find('{').map(|off| at + off) else {
+            continue;
+        };
+        let mut depth = 0_i32;
+        for (off, ch) in text[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => continue,
+            }
+            if depth == 0 {
+                blocks.push(open..open + off);
+                break;
+            }
+        }
+    }
+    blocks
+}
+
+/// Every call that can block the UI thread, outside a spawned thread (E30).
+fn blocking_hits(file: &Path, text: &str) -> Vec<String> {
+    let calls = ["MjpegPlayer::open", "cache.clear()", "usage_bytes",
+                 "std::fs::"];
+    let threads = spawned_blocks(text);
+    let line_of = |at: usize| text[..at].lines().count();
+    let mut found = Vec::new();
+    for call in calls {
+        for (at, _) in text.match_indices(call) {
+            // the doc comments that name these calls are not calls
+            let line_start = text[..at].rfind('\n').map_or(0, |nl| nl + 1);
+            if text[line_start..at].trim_start().starts_with("//") {
+                continue;
+            }
+            if threads.iter().any(|block| block.contains(&at)) {
+                continue;
+            }
+            found.push(format!("{}:{}: {call} on the UI thread",
+                               file.display(), line_of(at)));
+        }
+    }
+    found
+}
+
+/// E30: what can block runs on a thread, not inside a frame.
+#[test]
+fn blocking_work_runs_off_the_ui_thread() {
+    let main = root().join("src").join("main.rs");
+    let text = std::fs::read_to_string(&main).expect("utf-8 source");
+    let production = text.split("#[cfg(test)]\nmod tests")
+        .next().unwrap_or(&text);
+    // the scan is worth nothing if it found no spawned thread at all
+    let threads = spawned_blocks(production).len();
+    assert!(threads >= 3, "only {threads} spawned threads in main.rs");
+    let found = blocking_hits(&main, production);
+    assert!(found.is_empty(), "blocking calls:\n{}", found.join("\n"));
+}
+
+/// The control for the scan above.
+#[test]
+fn the_blocking_scan_finds_a_call_left_in_a_frame() {
+    let sample = "\
+        fn logic() {\n\
+            let bytes = cache.usage_bytes();\n\
+            std::thread::spawn(move || {\n\
+                let opened = MjpegPlayer::open(path, cache, ctx);\n\
+                cache.clear();\n\
+            });\n\
+            std::fs::remove_file(path).ok();\n\
+        }\n";
+    let found = blocking_hits(Path::new("sample.rs"), sample);
+    // the two outside the thread are found; the two inside it are not
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.iter().any(|hit| hit.contains("usage_bytes")), "{found:?}");
+    assert!(found.iter().any(|hit| hit.contains("std::fs::")), "{found:?}");
+    assert!(!found.iter().any(|hit| hit.contains("MjpegPlayer")
+                              || hit.contains("cache.clear")),
+            "a call inside the thread was reported: {found:?}");
+}
+
+/// E23, E24, E44: cursors, clickable containers and user-visible text.
+#[test]
+fn ui_code_states_are_built_from_the_helpers() {
+    let sources = ui_production_sources();
+    // the scan is worth nothing if it is reading no interaction at all
+    let senses = sources.iter()
+        .map(|(_, text)| text.matches("Sense::click").count())
+        .sum::<usize>();
+    assert!(senses >= 5, "only {senses} click senses scanned");
+    let found: Vec<String> = sources.iter()
+        .flat_map(|(file, text)| state_hits(file, text))
+        .collect();
+    assert!(found.is_empty(), "hand-rolled states:\n{}", found.join("\n"));
+}
+
+/// The control for the scan above.
+#[test]
+fn the_state_scan_finds_each_hand_rolled_state() {
+    let sample = "\
+        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);\n\
+        response.on_hover_cursor(egui::CursorIcon::PointingHand);\n\
+        let response = frame.response.interact(Sense::click());\n\
+        let response = ui.response();\n\
+        format!(\"offline: {why:?}\")\n\
+        format!(\"offline: {}\", why.text())\n";
+    let found = state_hits(Path::new("sample.rs"), sample);
+    assert_eq!(found,
+               ["sample.rs:1: cursor set through output_mut",
+                "sample.rs:3: container made clickable after the fact",
+                "sample.rs:5: Debug formatting in text a user sees"]);
+}
+
 /// T24 (the CI grep, locally): no certificate checks disabled anywhere.
 ///
 /// Every path to a printer verifies now -- FTPS on 990, the camera on 6000
