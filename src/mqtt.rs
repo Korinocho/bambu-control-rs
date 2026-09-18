@@ -117,6 +117,27 @@ pub enum ProbeOutcome {
     Failed(String),
 }
 
+impl ProbeOutcome {
+    /// What the connection state says to the user, in the wording of design
+    /// doc 5.10. A pure mapping, and deliberately without the inner text of
+    /// any variant: those carry Debug output of TLS records and MQTT
+    /// packets, which never reaches a user (E44, D10).
+    pub fn text(&self) -> &'static str {
+        match self {
+            Self::Subscribed => "connected",
+            Self::NoSerial => "no serial configured",
+            Self::Tls(_) => "the printer's security check failed",
+            Self::ConnectRefused(_) => "access code rejected",
+            Self::NoSubAck => "the printer didn't answer",
+            Self::SubAckPkidMismatch =>
+                "the printer answered a subscription this app never sent",
+            Self::SubscriptionRefused =>
+                "the printer refused the subscription",
+            Self::Failed(_) => "the connection failed",
+        }
+    }
+}
+
 /// The TLS outcome of a session, as its own connection records tell it.
 fn refusal(conns: &SessionConns) -> ProbeOutcome {
     match conns.failure_since(0) {
@@ -515,7 +536,7 @@ impl PrinterClient {
                     break;
                 }
                 *handle.conn.lock().unwrap() =
-                    (false, format!("offline ({why:?})"));
+                    (false, format!("offline: {}", why.text()));
                 egui_ctx.request_repaint();
                 // every reconnect runs the whole verification again, since
                 // resumption is disabled for this port (design doc 5.3)
