@@ -35,9 +35,9 @@ verify printers, and is not covered by this project's license.
 
 | | |
 |---|---|
-| ![The printer panel: camera, job card with progress, temperature and light cards, and the AMS trays](docs/screenshots/panel.png) | ![The files view on Timelapses: a grid of thumbnails with the selected one's details and its download actions](docs/screenshots/files-timelapses.png) |
+| ![The printer panel: camera, job card with progress, temperature and light cards, and the AMS trays](assets/screenshots/panel.png) | ![The files view on Timelapses: a grid of thumbnails with the selected one's details and its download actions](assets/screenshots/files-timelapses.png) |
 | The printer panel while a job runs | Timelapses, with a file's details and actions |
-| ![The files view on Print files: sliced jobs in rows, with the selected 3mf's facts and its plate preview](docs/screenshots/files-print-files.png) | ![The Skip objects dialog: the plate drawn as a map, with one object selected and one already skipped](docs/screenshots/skip-objects.png) |
+| ![The files view on Print files: sliced jobs in rows, with the selected 3mf's facts and its plate preview](assets/screenshots/files-print-files.png) | ![The Skip objects dialog: the plate drawn as a map, with one object selected and one already skipped](assets/screenshots/skip-objects.png) |
 | Print files, with a sliced `.3mf` and its plate | Skipping objects on the plate map |
 
 These are rendered from the app's own test fixtures — a made-up printer at a
@@ -52,7 +52,7 @@ BAMBU_SNAPSHOT_ONLY=panel-printing,files-timelapses,files-3mf,dlg-skip \
 ```
 
 and copy `shots/<scene>-1080x780@1.0.png` over the four files in
-`docs/screenshots/`.
+`assets/screenshots/`.
 
 ## Requirements
 
