@@ -270,8 +270,10 @@ fn raw_input(points: Vec2, time: f64, events: Vec<egui::Event>)
         events,
         ..Default::default()
     };
-    raw.viewports.entry(egui::ViewportId::ROOT).or_default()
-        .native_pixels_per_point = Some(1.0);
+    let root = raw.viewports.entry(egui::ViewportId::ROOT).or_default();
+    root.native_pixels_per_point = Some(1.0);
+    root.inner_rect = Some(Rect::from_min_size(Pos2::ZERO, points));
+    root.monitor_size = Some(vec2(1440.0, 900.0));
     raw
 }
 
@@ -642,6 +644,8 @@ fn app(ctx: &egui::Context, printers: &[PrinterFixture], dir: &TempDir)
         pending_close: false,
         closing: false,
         pending_edit: None,
+        camera_only: false,
+        window_before: None,
         #[cfg(debug_assertions)]
         debug_play: None,
     }
@@ -696,7 +700,7 @@ const MATRIX: [&str; 13] = [
 ];
 
 /// States the stages look at beyond the matrix, at the two smaller sizes.
-const EXTRAS: [&str; 26] = [
+const EXTRAS: [&str; 27] = [
     "chips-six", "panel-firmware", "files-loading", "files-empty",
     "files-error", "files-refusal", "files-folders", "files-gcode",
     "dlg-add", "dlg-temp", "dlg-speed", "dlg-fans", "dlg-confirm-stop",
@@ -704,6 +708,7 @@ const EXTRAS: [&str; 26] = [
     "dlg-skip-confirm", "files-failed-four", "files-long-name",
     "files-printing", "files-open-error", "files-companion",
     "panel-light-unconfirmed", "dlg-temp-invalid", "dlg-edit",
+    "panel-camera-only",
 ];
 
 fn files_scene(app: &mut App, tab: Tab) -> &mut PrinterUi {
@@ -737,6 +742,12 @@ fn scene(name: &str, ctx: &egui::Context) -> Scene {
         }
         "panel-firmware" =>
             app.printers[0].fw_latest = "01.09.00.00".to_string(),
+        // the camera button was pressed: the stream alone, with the bar,
+        // the job card and the control cards off screen (C8)
+        "panel-camera-only" => {
+            app.selected = 1;
+            app.camera_only = true;
+        }
         // the light command went and telemetry never agreed (C18, D40)
         "panel-light-unconfirmed" =>
             app.printers[0].light_unconfirmed = true,
@@ -1541,4 +1552,189 @@ fn skip_objects_explains_a_bundle_that_went() {
             "{painted:?}");
     assert!(matches!(scene.app.dialog, Dialog::Skip(_)),
             "the dialog closed");
+}
+
+/// C8: the button on the stream takes the panel to the video alone, and
+/// nothing else is left on screen; Escape brings the rest back. While a
+/// modal is up it owns the keyboard, so Escape is the dialog's then.
+#[test]
+fn the_camera_button_leaves_the_video_alone_and_escape_comes_back() {
+    use egui::accesskit::Action;
+
+    /// The middle of the clickable node called `name`, if it is there.
+    fn spot(full: &egui::FullOutput, name: &str) -> Option<egui::Pos2> {
+        let update = full.platform_output.accesskit_update.as_ref()?;
+        update.nodes.iter()
+            .find(|(_, node)| node.supports_action(Action::Click)
+                  && node.label() == Some(name))
+            .and_then(|(_, node)| node.bounds())
+            .map(|at| egui::pos2(((at.x0 + at.x1) / 2.0) as f32,
+                                 ((at.y0 + at.y1) / 2.0) as f32))
+    }
+
+    /// What the frame can be clicked on, and what it painted.
+    fn shown(full: &egui::FullOutput) -> (Vec<String>, Vec<String>) {
+        let update = full.platform_output.accesskit_update.clone()
+            .expect("an AccessKit tree");
+        let named = update.nodes.iter()
+            .filter(|(_, node)| node.supports_action(Action::Click))
+            .filter_map(|(_, node)| node.label().map(|l| l.to_string()))
+            .collect();
+        fn walk(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) =>
+                    found.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) =>
+                    shapes.iter().for_each(|shape| walk(shape, found)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &full.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        (named, texts)
+    }
+
+    let escape = || egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    };
+
+    let ctx = context(1.0);
+    ctx.enable_accesskit();
+    let dir = TempDir::new("camera-only");
+    let mut app = app(&ctx, &PRINTERS, &dir);
+    camera_frame(&mut app.printers[0], &ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    let points = vec2(1080.0, 780.0);
+    // a click is a press and a release inside egui's click window, so the
+    // frames are 50 ms apart
+    let mut clock = 0.0;
+    let mut run = |app: &mut App, events: Vec<egui::Event>| {
+        clock += 0.05;
+        ctx.run_ui(raw_input(points, clock, events), |ui| {
+            eframe::App::logic(app, ui.ctx(), &mut frame);
+            app.ui(ui, &mut frame);
+        })
+    };
+    fn click(run: &mut impl FnMut(&mut App, Vec<egui::Event>)
+                 -> egui::FullOutput,
+             app: &mut App, name: &str,
+             spot: impl Fn(&egui::FullOutput, &str) -> Option<egui::Pos2>)
+             -> egui::FullOutput {
+        run(app, Vec::new());
+        let at = spot(&run(app, Vec::new()), name)
+            .unwrap_or_else(|| panic!("{name} was not on screen"));
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at, button: egui::PointerButton::Primary, pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let moved = egui::Event::PointerMoved(at);
+        run(app, vec![moved.clone()]);
+        run(app, vec![moved.clone(), button(true)]);
+        run(app, vec![moved, button(false)])
+    }
+
+    /// What the frame asked of the window.
+    fn sent(full: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        full.viewport_output.get(&egui::ViewportId::ROOT)
+            .map(|out| out.commands.clone()).unwrap_or_default()
+    }
+
+    /// The size the frame left the window at: the last such command it
+    /// sent, because that is the one the window ends on. A pass that sends
+    /// two of them is a defect, so this says how many there were.
+    fn asked(full: &egui::FullOutput,
+             pick: impl Fn(&egui::ViewportCommand) -> Option<Vec2>)
+             -> (Option<Vec2>, usize) {
+        let sizes: Vec<Vec2> = sent(full).iter().filter_map(pick).collect();
+        (sizes.last().copied(), sizes.len())
+    }
+
+    let min_size = |cmd: &egui::ViewportCommand| match cmd {
+        egui::ViewportCommand::MinInnerSize(size) => Some(*size),
+        _ => None,
+    };
+    let inner_size = |cmd: &egui::ViewportCommand| match cmd {
+        egui::ViewportCommand::InnerSize(size) => Some(*size),
+        _ => None,
+    };
+
+    // the control: the whole panel, with the bar, the cards and the job
+    // card on it, and the button saying which way it goes
+    assert!(!app.camera_only);
+    let (named, texts) = shown(&run(&mut app, Vec::new()));
+    for wanted in ["Show the video only", "Edit current printer",
+                   "Add printer"] {
+        assert!(named.iter().any(|name| name == wanted),
+                "{wanted} is missing: {named:?}");
+    }
+    assert!(texts.iter().any(|text| text == "DEVICE CONTROL"), "{texts:?}");
+
+    let entered = click(&mut run, &mut app, "Show the video only", spot);
+    assert!(app.camera_only, "the button did not hide the rest");
+
+    // the window may now be taken down to the well's own minimum, in the
+    // stream's shape: 1280 x 720 at a 240 point width (C8, O2)
+    assert_eq!(asked(&entered, min_size).0, Some(vec2(240.0, 135.0)),
+               "the window's minimum did not go with the mode");
+    // and the window goes to the stream's own size, one screen pixel per
+    // video pixel: 1280 x 720, not the 1080 x 780 it was entered from
+    // and the window goes to the size the well already had on screen, not
+    // to the window it was entered from and not to the stream's own
+    // pixels: a 1080 point page leaves the left column 612 wide, and
+    // 1280 x 720 fitted in 612 x CAMERA_MAX_H is 612 x 344.25
+    assert_eq!(asked(&entered, inner_size),
+               (Some(vec2(612.0, 344.25)), 1),
+               "the window was not left at the size of the video box");
+
+    // the stream alone: the button on it is the only thing left to click
+    let (named, texts) = shown(&run(&mut app, Vec::new()));
+    assert_eq!(named, ["Show the whole panel"], "more than the stream");
+    for gone in ["DEVICE CONTROL", "Skip objects", "Stop"] {
+        assert!(!texts.iter().any(|text| text == gone),
+                "{gone} is still on screen: {texts:?}");
+    }
+
+    // a modal owns the keyboard while it is up (design doc 5.4)
+    app.pending_close = true;
+    run(&mut app, vec![escape()]);
+    assert!(app.camera_only, "a modal's Escape left camera-only");
+    app.pending_close = false;
+
+    let left = run(&mut app, vec![escape()]);
+    assert!(!app.camera_only, "Escape did not bring the panel back");
+    // the panel's minimum and the window it was entered from come back
+    assert_eq!(asked(&left, min_size).0,
+               Some(Vec2::from(crate::theme::size::WINDOW_MIN)),
+               "the panel's minimum did not come back");
+    assert_eq!(asked(&left, inner_size), (Some(vec2(1080.0, 780.0)), 1),
+               "the window it was entered from did not come back");
+    // and the panel is on screen again, whole
+    let (named, texts) = shown(&run(&mut app, Vec::new()));
+    assert!(named.iter().any(|name| name == "Show the video only"),
+            "{named:?}");
+    assert!(texts.iter().any(|text| text == "DEVICE CONTROL"), "{texts:?}");
+
+    // a window the user resized afterwards keeps the stream's shape: the
+    // pass after the mode is entered takes the band back off. The window
+    // here never really moves, so 1080 x 780 is what it keeps reporting.
+    click(&mut run, &mut app, "Show the video only", spot);
+    let settled = run(&mut app, Vec::new());
+    assert_eq!(asked(&settled, inner_size), (Some(vec2(1080.0, 607.5)), 1),
+               "a band was left around the picture");
+
+    // the size is the box's, so what caps the box caps the window: a
+    // stream taller than it is wide is held to CAMERA_MAX_H, and 720 x
+    // 1280 fitted in 612 x 420 is 236.25 x 420
+    app.camera_only = false;
+    app.printers[0].cam_texture = Some(ctx.load_texture(
+        "cam-tall", picture(720, 1280, 3), Default::default()));
+    let entered = click(&mut run, &mut app, "Show the video only", spot);
+    assert_eq!(asked(&entered, inner_size), (Some(vec2(236.25, 420.0)), 1),
+               "the window was not held to the box's own cap");
 }
