@@ -481,6 +481,13 @@ struct App {
     /// a connection edit waiting for its confirmation, because that
     /// printer still has transfers running (section 6)
     pending_edit: Option<(usize, PrinterCfg)>,
+    /// the camera button was pressed: the selected printer's stream is the
+    /// whole window, with the bar, the job card and the control cards all
+    /// off screen (C8)
+    camera_only: bool,
+    /// the window camera-only was entered from, in logical points: leaving
+    /// gives it back, because the mode sized the window to the stream (O2)
+    window_before: Option<egui::Vec2>,
     /// `BAMBU_CONTROL_PLAY="<remote path>"` starts "Download & play" on
     /// that file as soon as the listing naming it arrives. Debug builds
     /// only, like `BAMBU_CONTROL_OPEN_FILES`: it exists so the stage's
@@ -527,6 +534,7 @@ impl App {
             cache_asked_at: None,
             clearing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_close: false, closing: false, pending_edit: None,
+            camera_only: false, window_before: None,
             #[cfg(debug_assertions)]
             debug_play: std::env::var("BAMBU_CONTROL_PLAY").ok(),
         };
@@ -847,6 +855,152 @@ impl App {
             .position(|p| p.cfg.serial == active_serial)
             .unwrap_or(0);
         self.select(new_index, ctx);
+    }
+
+    /// The selected printer's panel. It runs inside the page's scroll
+    /// area, and in camera-only on the page itself, where the picture
+    /// takes the height the scroll area would have measured away (C8).
+    fn show_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.printers.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new(
+                    "Add a printer to get started")
+                    .color(theme::TEXT_DIM).font(font::title()));
+            });
+            return;
+        }
+        let printer = &mut self.printers[self.selected];
+        let state = printer.client.state.lock().unwrap().clone();
+        let device_info =
+            printer.client.device_info.lock().unwrap().clone();
+
+        // resolve pending light toggle vs telemetry
+        let mut shown_on =
+            panel::light_on(&state).unwrap_or(false);
+        if let Some((desired, ts)) = printer.light_pending {
+            if shown_on == desired {
+                printer.light_pending = None;
+                printer.light_unconfirmed = false;
+            } else if ts.elapsed() > LIGHT_PENDING {
+                // the command went and telemetry never agreed: say
+                // so rather than snapping the switch back (C18, D40)
+                printer.light_pending = None;
+                printer.light_unconfirmed = true;
+            } else {
+                shown_on = desired;
+                // the timeout is a deadline: without it nothing
+                // would repaint to notice it passed (E32)
+                ctx.request_repaint_after(
+                    LIGHT_PENDING.saturating_sub(ts.elapsed()));
+            }
+        }
+
+        let model = model_from_serial(&printer.cfg.serial);
+        // FILES card: counts from the listing taken this session
+        let (timelapses, _, print_files) = printer.browser.counts();
+        let files_summary = match printer.browser.updated_at() {
+            Some(_) => format!(
+                "{timelapses} timelapses  ·  {print_files} files"),
+            None =>
+                "Timelapses · Recordings · Print files".to_string(),
+        };
+        let view = PanelView {
+            state: &state,
+            connected: printer.client.conn.lock().unwrap()
+                .clone(),
+            cam_texture: printer.cam_texture.as_ref(),
+            cam_status: printer.camera.as_ref()
+                .map(|c| c.status.lock().unwrap().clone())
+                .unwrap_or_else(|| "camera paused".into()),
+            plate_texture: printer.plate_texture.as_ref(),
+            fetch_progress: printer.ftp
+                .job_progress(&printer.current_job),
+            object_count: printer.job_bundle.as_ref()
+                .map(|b| b.objects.len()).unwrap_or(0),
+            fw_current: panel::ota_version(&device_info),
+            fw_latest: printer.fw_latest.clone(),
+            show_humidity: !model.contains("A1"),
+            model,
+            hms: &printer.hms_lines,
+            light_shown_on: shown_on,
+            light_pending: printer.light_pending.is_some(),
+            light_unconfirmed: printer.light_unconfirmed,
+            files_summary,
+            camera_only: self.camera_only,
+        };
+        let actions = panel::show(ui, &view);
+        for action in actions {
+            self.handle_action(action, ctx);
+        }
+    }
+
+    /// The top bar: the printer chips, then Edit and Add. Camera-only
+    /// does not call it at all (C8).
+    fn show_bar(&mut self, root: &mut egui::Ui, ctx: &egui::Context) {
+        egui::Panel::top("bar")
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(theme::BG)
+                .inner_margin(pad::BAR))
+            .show(root, |ui| {
+                // the bar is a chip tall; the tool buttons take the right
+                // end of it first and the chips get what is left, so a
+                // long chip row is cut off rather than pushing Edit, Add
+                // and Remove out of the window (C4, D09)
+                let gap = ui.spacing().item_spacing.x;
+                let chip_h = size::CONTROL_H + pad::CHIP.sum().y
+                    + 2.0 * stroke::HAIRLINE;
+                let (bar, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), chip_h), Sense::hover());
+                // Edit and Add; Remove moved into the Edit dialog (O13)
+                let tools_w = 2.0 * size::ICON_BUTTON.x + gap;
+                let chips = egui::Rect::from_min_max(
+                    bar.min,
+                    egui::pos2((bar.max.x - tools_w - gap).max(bar.min.x),
+                               bar.max.y));
+                let mut chips_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(chips)
+                    .layout(egui::Layout::left_to_right(egui::Align::Min)));
+                chips_ui.set_clip_rect(chips.intersect(ui.clip_rect()));
+                self.chips_bar(&mut chips_ui, ctx);
+                // the tools sit at the right end, laid out left to right
+                // inside it, so the keyboard walks them in the order the
+                // eye reads them (A8)
+                let tools = egui::Rect::from_min_max(
+                    egui::pos2((bar.max.x - tools_w).max(bar.min.x),
+                               bar.min.y),
+                    bar.max);
+                let mut tools_ui = ui.new_child(egui::UiBuilder::new()
+                    .max_rect(tools)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)));
+                {
+                    let ui = &mut tools_ui;
+                        // with no printers there is nothing to edit or
+                        // remove, and the buttons say so (D11)
+                        let none = self.printers.is_empty()
+                            .then_some("No printers yet");
+                        if Self::tool_button(ui, ToolIcon::Edit,
+                                             "Edit current printer", none)
+                        {
+                            self.dialog = Dialog::AddPrinter(
+                                dialogs::AddPrinterDlg {
+                                    draft: self.printers[self.selected]
+                                        .cfg.clone(),
+                                    editing: Some(self.selected),
+                                    error: String::new(),
+                                });
+                        }
+                        if Self::tool_button(ui, ToolIcon::Add,
+                                             "Add printer", None)
+                        {
+                            self.dialog = Dialog::AddPrinter(
+                                dialogs::AddPrinterDlg {
+                                    draft: PrinterCfg::default(),
+                                    editing: None,
+                                    error: String::new(),
+                                });
+                        }
+                }
+            });
     }
 
     // ------------------------------------------------------------ chips
@@ -1373,7 +1527,68 @@ impl App {
         }
     }
 
-    fn handle_action(&mut self, action: PanelAction) {
+    /// Camera-only takes the window with it. The window may be shrunk to
+    /// the well's own minimum, so the stream can be left as a small
+    /// picture in a corner, and leaving gives back the window the mode was
+    /// entered from (C8, O2).
+    fn toggle_camera_only(&mut self, ctx: &egui::Context,
+                          well: Option<egui::Vec2>) {
+        self.camera_only = !self.camera_only;
+        if !self.camera_only {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+                size::WINDOW_MIN.into()));
+            if let Some(before) = self.window_before.take() {
+                ctx.send_viewport_cmd(
+                    egui::ViewportCommand::InnerSize(before));
+            }
+            return;
+        }
+        self.window_before = ctx.input(|i| i.viewport().inner_rect)
+            .map(|rect| rect.size());
+        // nothing below the well's own minimum, in the stream's shape
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+            ui::widgets::fit(self.stream_aspect(),
+                             egui::Vec2::splat(size::CAMERA_MIN_W))));
+        // and the window goes to the size the well was painted at: the
+        // picture keeps the size it already had on screen, and the rest of
+        // the panel is what goes away. Sizing to the window instead leaves
+        // a window already at the stream's shape where it was, and sizing
+        // to the stream's own pixels opens a window larger than either.
+        if let Some(well) = well {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(well));
+        }
+    }
+
+    /// The selected printer's stream, as a shape: its picture's, or 16:9
+    /// until the first frame arrives (C8).
+    fn stream_aspect(&self) -> egui::Vec2 {
+        self.printers.get(self.selected)
+            .and_then(|printer| printer.cam_texture.as_ref())
+            .map_or(size::VIDEO_ASPECT, egui::TextureHandle::size_vec2)
+    }
+
+    /// In camera-only the frame is the picture, so the window takes the
+    /// stream's shape rather than letterboxing it: a resize that would
+    /// leave a band takes the window in to the largest box the stream
+    /// fills (C8). Nothing else resizes the window.
+    fn fit_window_to_stream(&self, ctx: &egui::Context) {
+        /// Under a point of difference is the window manager's rounding,
+        /// not a band: acting on it would send a command every frame.
+        const SNAP: f32 = 1.0;
+
+        let Some(window) = ctx.input(|i| i.viewport().inner_rect)
+            .map(|rect| rect.size())
+        else {
+            return;
+        };
+        let well = ui::widgets::fit(self.stream_aspect(), window);
+        if (window - well).abs().max_elem() < SNAP {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(well));
+    }
+
+    fn handle_action(&mut self, action: PanelAction, ctx: &egui::Context) {
         let printer = &mut self.printers[self.selected];
         let state = printer.client.state.lock().unwrap().clone();
         match action {
@@ -1443,6 +1658,8 @@ impl App {
                 printer.client.set_light(on);
             }
             PanelAction::OpenFiles => self.open_files(),
+            PanelAction::ToggleCameraOnly(well) =>
+                self.toggle_camera_only(ctx, Some(well)),
         }
     }
 }
@@ -1473,6 +1690,11 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
+        // the pass that enters camera-only puts the window at the stream's
+        // own size, and the pass that leaves puts back the one it came
+        // from: neither may then be overruled by the fit below, which
+        // works off an inner rect those commands have not reached yet
+        let was_camera_only = self.camera_only;
 
         // closing with a transfer running asks first: the close is
         // cancelled and the question goes on screen (design doc 5.4)
@@ -1484,75 +1706,37 @@ impl eframe::App for App {
             self.pending_close = true;
         }
 
-        egui::Panel::top("bar")
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(theme::BG)
-                .inner_margin(pad::BAR))
-            .show(root, |ui| {
-                // the bar is a chip tall; the tool buttons take the right
-                // end of it first and the chips get what is left, so a
-                // long chip row is cut off rather than pushing Edit, Add
-                // and Remove out of the window (C4, D09)
-                let gap = ui.spacing().item_spacing.x;
-                let chip_h = size::CONTROL_H + pad::CHIP.sum().y
-                    + 2.0 * stroke::HAIRLINE;
-                let (bar, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), chip_h), Sense::hover());
-                // Edit and Add; Remove moved into the Edit dialog (O13)
-                let tools_w = 2.0 * size::ICON_BUTTON.x + gap;
-                let chips = egui::Rect::from_min_max(
-                    bar.min,
-                    egui::pos2((bar.max.x - tools_w - gap).max(bar.min.x),
-                               bar.max.y));
-                let mut chips_ui = ui.new_child(egui::UiBuilder::new()
-                    .max_rect(chips)
-                    .layout(egui::Layout::left_to_right(egui::Align::Min)));
-                chips_ui.set_clip_rect(chips.intersect(ui.clip_rect()));
-                self.chips_bar(&mut chips_ui, ctx);
-                // the tools sit at the right end, laid out left to right
-                // inside it, so the keyboard walks them in the order the
-                // eye reads them (A8)
-                let tools = egui::Rect::from_min_max(
-                    egui::pos2((bar.max.x - tools_w).max(bar.min.x),
-                               bar.min.y),
-                    bar.max);
-                let mut tools_ui = ui.new_child(egui::UiBuilder::new()
-                    .max_rect(tools)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)));
-                {
-                    let ui = &mut tools_ui;
-                        // with no printers there is nothing to edit or
-                        // remove, and the buttons say so (D11)
-                        let none = self.printers.is_empty()
-                            .then_some("No printers yet");
-                        if Self::tool_button(ui, ToolIcon::Edit,
-                                             "Edit current printer", none)
-                        {
-                            self.dialog = Dialog::AddPrinter(
-                                dialogs::AddPrinterDlg {
-                                    draft: self.printers[self.selected]
-                                        .cfg.clone(),
-                                    editing: Some(self.selected),
-                                    error: String::new(),
-                                });
-                        }
-                        if Self::tool_button(ui, ToolIcon::Add,
-                                             "Add printer", None)
-                        {
-                            self.dialog = Dialog::AddPrinter(
-                                dialogs::AddPrinterDlg {
-                                    draft: PrinterCfg::default(),
-                                    editing: None,
-                                    error: String::new(),
-                                });
-                        }
-                }
-            });
+        // camera only leaves one control on screen, so Escape is the
+        // keyboard's way out of it. A modal owns the keyboard while it is
+        // up, so Escape belongs to it and not to the mode (C8, A8)
+        let modal = !matches!(self.dialog, Dialog::None)
+            || self.pending_close
+            || self.pending_edit.is_some();
+        if self.camera_only && !modal
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.toggle_camera_only(ctx, None);
+        }
 
+        // camera only: the bar goes off screen with everything else, and
+        // the button on the stream is what brings it back (C8)
+        if !self.camera_only {
+            self.show_bar(root, ctx);
+        }
+
+        // camera only: the picture runs out to the window's edge
+        let page = match self.camera_only {
+            true => egui::Margin::ZERO,
+            false => pad::PAGE,
+        };
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG)
-                .inner_margin(pad::PAGE))
+                .inner_margin(page))
             .show(root, |ui| {
+                if self.camera_only {
+                    self.show_panel(ui, ctx);
+                    return;
+                }
                 if let Some(error) = &self.config_error {
                     ui.push_id("settings-error", |ui| {
                         ui::widgets::banner(ui, ui::widgets::Tone::Danger,
@@ -1571,82 +1755,16 @@ impl eframe::App for App {
                     .map(|printer| printer.cfg.serial.clone()));
                 egui::ScrollArea::vertical().id_salt(panel_salt)
                     .auto_shrink(false)
-                    .show(ui, |ui| {
-                if self.printers.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new(
-                            "Add a printer to get started")
-                            .color(theme::TEXT_DIM).font(font::title()));
-                    });
-                    return;
-                }
-                let printer = &mut self.printers[self.selected];
-                let state = printer.client.state.lock().unwrap().clone();
-                let device_info =
-                    printer.client.device_info.lock().unwrap().clone();
-
-                // resolve pending light toggle vs telemetry
-                let mut shown_on =
-                    panel::light_on(&state).unwrap_or(false);
-                if let Some((desired, ts)) = printer.light_pending {
-                    if shown_on == desired {
-                        printer.light_pending = None;
-                        printer.light_unconfirmed = false;
-                    } else if ts.elapsed() > LIGHT_PENDING {
-                        // the command went and telemetry never agreed: say
-                        // so rather than snapping the switch back (C18, D40)
-                        printer.light_pending = None;
-                        printer.light_unconfirmed = true;
-                    } else {
-                        shown_on = desired;
-                        // the timeout is a deadline: without it nothing
-                        // would repaint to notice it passed (E32)
-                        ctx.request_repaint_after(
-                            LIGHT_PENDING.saturating_sub(ts.elapsed()));
-                    }
-                }
-
-                let model = model_from_serial(&printer.cfg.serial);
-                // FILES card: counts from the listing taken this session
-                let (timelapses, _, print_files) = printer.browser.counts();
-                let files_summary = match printer.browser.updated_at() {
-                    Some(_) => format!(
-                        "{timelapses} timelapses  ·  {print_files} files"),
-                    None =>
-                        "Timelapses · Recordings · Print files".to_string(),
-                };
-                let view = PanelView {
-                    state: &state,
-                    connected: printer.client.conn.lock().unwrap()
-                        .clone(),
-                    cam_texture: printer.cam_texture.as_ref(),
-                    cam_status: printer.camera.as_ref()
-                        .map(|c| c.status.lock().unwrap().clone())
-                        .unwrap_or_else(|| "camera paused".into()),
-                    plate_texture: printer.plate_texture.as_ref(),
-                    fetch_progress: printer.ftp
-                        .job_progress(&printer.current_job),
-                    object_count: printer.job_bundle.as_ref()
-                        .map(|b| b.objects.len()).unwrap_or(0),
-                    fw_current: panel::ota_version(&device_info),
-                    fw_latest: printer.fw_latest.clone(),
-                    show_humidity: !model.contains("A1"),
-                    model,
-                    hms: &printer.hms_lines,
-                    light_shown_on: shown_on,
-                    light_pending: printer.light_pending.is_some(),
-                    light_unconfirmed: printer.light_unconfirmed,
-                    files_summary,
-                };
-                let actions = panel::show(ui, &view);
-                for action in actions {
-                    self.handle_action(action);
-                }
-                    });
+                    .show(ui, |ui| self.show_panel(ui, ctx));
             });
 
         self.show_dialog(ctx);
         self.show_confirmations(ctx);
+        // last of the pass: a window the user resized takes the stream's
+        // shape again, so no band is ever left around the picture (C8)
+        if self.camera_only && was_camera_only {
+            self.fit_window_to_stream(ctx);
+        }
     }
 
     fn on_exit(&mut self) {

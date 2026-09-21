@@ -65,6 +65,11 @@ pub enum PanelAction {
     OpenMaintenance,
     /// the FILES card: the files view of design doc 6
     OpenFiles,
+    /// the button in the camera well's corner: the stream on its own, and
+    /// back to the whole panel. It carries the size the well was painted
+    /// at, because that is the size the window goes to: the picture keeps
+    /// the size it already had on screen (C8).
+    ToggleCameraOnly(Vec2),
 }
 
 pub struct PanelView<'a> {
@@ -91,6 +96,9 @@ pub struct PanelView<'a> {
     /// FILES card value: counts from the listing taken this session, else
     /// the tab names (design doc 6)
     pub files_summary: String,
+    /// the camera button was pressed: the stream is the whole page and
+    /// nothing else is drawn (C8)
+    pub camera_only: bool,
 }
 
 pub(crate) fn card_frame(ui: &mut Ui, add: impl FnOnce(&mut Ui))
@@ -339,10 +347,99 @@ fn ams_card(ui: &mut Ui, state: &Map<String, Value>, show_humidity: bool) {
     });
 }
 
+/// The camera button's glyph, in points from the button's centre: four
+/// corner brackets, out at the corners to go to the stream on its own and
+/// in by the centre to come back. Geometry private to that one painter.
+mod camera_icon {
+    use egui::{Painter, Pos2, Stroke, vec2};
+
+    pub const STROKE: f32 = 1.7;
+    /// How far a bracket's corner sits from the centre.
+    pub const REACH: f32 = 6.5;
+    /// How long each of a bracket's two arms is.
+    pub const ARM: f32 = 4.5;
+
+    pub fn paint(painter: &Painter, center: Pos2, camera_only: bool) {
+        let s = Stroke::new(STROKE, super::theme::TEXT);
+        let near = REACH - ARM;
+        let (corner, arm) = match camera_only {
+            true => (near, REACH),
+            false => (REACH, near),
+        };
+        for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]
+        {
+            let at = center + vec2(sx * corner, sy * corner);
+            painter.line_segment(
+                [at, center + vec2(sx * arm, sy * corner)], s);
+            painter.line_segment(
+                [at, center + vec2(sx * corner, sy * arm)], s);
+        }
+    }
+}
+
+/// The camera well: the picture or the status text, and over it the button
+/// in its top-right corner that leaves the stream alone on the page and
+/// brings the rest back (C8). Returns whether that button was clicked.
+fn camera_well(ui: &mut Ui, view: &PanelView, rect: egui::Rect) -> bool {
+    ui.painter().rect_filled(rect, radius::CARD, theme::MEDIA_WELL);
+    if let Some(tex) = view.cam_texture {
+        egui::Image::new((tex.id(), tex.size_vec2()))
+            .corner_radius(radius::CARD)
+            .paint_at(ui, rect);
+    } else {
+        // a widget, truncated to the well, rather than painter text
+        // that spills past it on a narrow window (E7, D41)
+        ui.place(rect, egui::Label::new(RichText::new(&view.cam_status)
+            .font(font::body()).color(theme::TEXT_DIM)).truncate());
+    }
+    // the button acts on the stream, so it sits on it: inside the well's
+    // top-right corner, over the picture. In camera-only it is the one
+    // control left on screen, so it is never anywhere else (C8)
+    let corner = egui::Rect::from_min_size(
+        egui::pos2(rect.max.x - size::ICON_BUTTON.x - space::M,
+                   rect.min.y + space::M),
+        size::ICON_BUTTON);
+    let mut overlay = ui.new_child(egui::UiBuilder::new()
+        .max_rect(corner)
+        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+    // an icon button has no text, so its name is the one it is given (A9)
+    let name = match view.camera_only {
+        true => "Show the whole panel",
+        false => "Show the video only",
+    };
+    widgets::clickable(
+        &mut overlay, "camera-only", name,
+        widgets::Surface::card().radius(radius::CONTROL)
+            .padding(egui::Margin::ZERO),
+        |ui| {
+            let (glyph, _) = ui.allocate_exact_size(size::ICON_BUTTON,
+                                                    Sense::hover());
+            camera_icon::paint(ui.painter(), glyph.center(),
+                               view.camera_only);
+        }).response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(name)
+        .clicked()
+}
+
 /// Renders the panel; returns requested actions.
 pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
     let mut actions = Vec::new();
     let state = view.state;
+    // camera only: the stream is the whole page and nothing else is drawn,
+    // so the button in its corner is the way back (C8)
+    if view.camera_only {
+        let page = vec2(ui.available_width(), ui.available_height());
+        let aspect = view.cam_texture.map_or(size::VIDEO_ASPECT,
+                                             |tex| tex.size_vec2());
+        let (row, _) = ui.allocate_exact_size(page, Sense::hover());
+        let rect = egui::Rect::from_center_size(
+            row.center(), widgets::fit(aspect, page));
+        if camera_well(ui, view, rect) {
+            actions.push(PanelAction::ToggleCameraOnly(rect.size()));
+        }
+        return actions;
+    }
     let gcode_state = s_str(state, "gcode_state").to_string();
     let running = gcode_state == "RUNNING";
     let paused = gcode_state == "PAUSE";
@@ -385,16 +482,8 @@ pub fn show(ui: &mut Ui, view: &PanelView) -> Vec<PanelAction> {
         let (row, _) = ui.allocate_exact_size(vec2(column, well.y),
                                               Sense::hover());
         let rect = egui::Rect::from_center_size(row.center(), well);
-        ui.painter().rect_filled(rect, radius::CARD, theme::MEDIA_WELL);
-        if let Some(tex) = view.cam_texture {
-            egui::Image::new((tex.id(), tex.size_vec2()))
-                .corner_radius(radius::CARD)
-                .paint_at(ui, rect);
-        } else {
-            // a widget, truncated to the well, rather than painter text
-            // that spills past it on a narrow window (E7, D41)
-            ui.place(rect, egui::Label::new(RichText::new(&view.cam_status)
-                .font(font::body()).color(theme::TEXT_DIM)).truncate());
+        if camera_well(ui, view, rect) {
+            actions.push(PanelAction::ToggleCameraOnly(well));
         }
         ui.add_space(space::M);
 
@@ -786,6 +875,7 @@ mod tests {
             light_pending: false,
             light_unconfirmed: false,
             files_summary: "Timelapses · Recordings · Print files".to_string(),
+            camera_only: false,
         };
         tweak(&mut view);
         let at = match pointer {
@@ -927,6 +1017,7 @@ mod tests {
             light_unconfirmed: false,
             files_summary: "Timelapses · Recordings · Print files"
                 .to_string(),
+            camera_only: false,
         };
         let input = || egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO,

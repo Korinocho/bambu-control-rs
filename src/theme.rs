@@ -298,6 +298,10 @@ pub mod size {
     /// What the panel's right column keeps, however narrow the window.
     pub const RIGHT_COLUMN_MIN: f32 = 280.0;
     pub const CAMERA_MAX_H: f32 = 420.0;
+    /// The narrowest the camera well may be, and with it the window in
+    /// camera-only: the stream keeps its shape all the way down to it, so
+    /// the window can be left as a small picture in a corner (C8, O2).
+    pub const CAMERA_MIN_W: f32 = 240.0;
     /// A picture well's shape until its first frame arrives (C8).
     pub const VIDEO_ASPECT: Vec2 = vec2(16.0, 9.0);
     /// A chip's name is truncated past this.
